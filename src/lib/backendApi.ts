@@ -1,4 +1,4 @@
-import type { AppSettings, AuthSession, BillingLedgerEntry, BillingLedgerType, BillingUsageSource, ManagedUser, UserGroup, UserPlan } from '../types'
+import type { AppSettings, AuthSession, BillingLedgerEntry, BillingLedgerType, BillingUsageSource, ManagedUser, RewardCode, RewardState, UserGroup, UserPlan } from '../types'
 
 export interface BackendState {
   groups: UserGroup[]
@@ -9,6 +9,7 @@ export interface BackendState {
   setupRequired: boolean
   apiSettings: AppSettings | null
   adminApiSettings: AppSettings | null
+  rewardState: RewardState
 }
 
 export interface LedgerQuery {
@@ -30,6 +31,8 @@ export interface LedgerPage {
   pageSize: number
   totalPages: number
 }
+
+export type RewardCodeInput = Omit<RewardCode, 'id' | 'redeemedCount' | 'createdAt' | 'updatedAt'>
 
 async function request<T>(path: string, options: RequestInit & { session?: AuthSession | null } = {}): Promise<T> {
   const headers = new Headers(options.headers)
@@ -115,6 +118,30 @@ export function backendUpdatePlan(planId: string, patch: Partial<Omit<UserPlan, 
 
 export function backendDeletePlan(planId: string, session?: AuthSession | null) {
   return request<BackendState>(`/plans/${encodeURIComponent(planId)}`, { method: 'DELETE', session })
+}
+
+export function backendCreateRewardCode(input: RewardCodeInput, session?: AuthSession | null) {
+  return request<BackendState>('/rewards/codes', { method: 'POST', body: JSON.stringify(input), session })
+}
+
+export function backendUpdateRewardCode(codeId: string, patch: Partial<RewardCodeInput>, session?: AuthSession | null) {
+  return request<BackendState>(`/rewards/codes/${encodeURIComponent(codeId)}`, { method: 'PATCH', body: JSON.stringify(patch), session })
+}
+
+export function backendDeleteRewardCode(codeId: string, session?: AuthSession | null) {
+  return request<BackendState>(`/rewards/codes/${encodeURIComponent(codeId)}`, { method: 'DELETE', session })
+}
+
+export function backendUpdateCheckinSettings(input: Partial<RewardState['checkin']>, session?: AuthSession | null) {
+  return request<BackendState>('/rewards/checkin-settings', { method: 'PATCH', body: JSON.stringify(input), session })
+}
+
+export function backendRedeemRewardCode(code: string, session?: AuthSession | null) {
+  return request<BackendState>('/rewards/redeem', { method: 'POST', body: JSON.stringify({ code }), session })
+}
+
+export function backendCheckIn(session?: AuthSession | null) {
+  return request<BackendState>('/rewards/checkin', { method: 'POST', session })
 }
 
 export function backendChargeQuota(input: { source: 'gallery' | 'agent'; units: number; note: string }, session?: AuthSession | null) {

@@ -27,6 +27,7 @@ const BACKEND_UPSTREAM_BASE_URL = '/backend-api/upstream'
 const LEDGER_PAGE_SIZES = new Set([10, 20, 50, 100])
 const LEDGER_TYPES = new Set(['credit', 'debit', 'payment', 'adjustment'])
 const LEDGER_SOURCES = new Set(['gallery', 'agent', 'admin'])
+const DEFAULT_CHECKIN_SETTINGS_ID = 'default'
 
 mkdirSync(dirname(dbPath), { recursive: true })
 const db = new DatabaseSync(dbPath)
@@ -100,6 +101,52 @@ CREATE TABLE IF NOT EXISTS app_settings (
   value TEXT NOT NULL,
   updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS reward_codes (
+  id TEXT PRIMARY KEY,
+  code TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  quota_amount INTEGER NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1,
+  total_limit INTEGER NOT NULL DEFAULT 1,
+  per_user_limit INTEGER NOT NULL DEFAULT 1,
+  per_ip_limit INTEGER NOT NULL DEFAULT 0,
+  starts_at INTEGER,
+  expires_at INTEGER,
+  deleted_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reward_redemptions (
+  id TEXT PRIMARY KEY,
+  code_id TEXT NOT NULL REFERENCES reward_codes(id),
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  ip_address TEXT NOT NULL DEFAULT '',
+  quota_amount INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS checkin_settings (
+  id TEXT PRIMARY KEY,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  quota_amount INTEGER NOT NULL DEFAULT 5,
+  cooldown_hours INTEGER NOT NULL DEFAULT 24,
+  per_ip_daily_limit INTEGER NOT NULL DEFAULT 0,
+  brand_title TEXT NOT NULL DEFAULT '每日补给站',
+  brand_description TEXT NOT NULL DEFAULT '每天领取一份创作额度。',
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS checkin_records (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  ip_address TEXT NOT NULL DEFAULT '',
+  quota_amount INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reward_redemptions_code ON reward_redemptions(code_id);
+CREATE INDEX IF NOT EXISTS idx_reward_redemptions_user ON reward_redemptions(user_id);
+CREATE INDEX IF NOT EXISTS idx_reward_redemptions_ip ON reward_redemptions(ip_address);
+CREATE INDEX IF NOT EXISTS idx_checkin_records_user ON checkin_records(user_id);
+CREATE INDEX IF NOT EXISTS idx_checkin_records_ip_created ON checkin_records(ip_address, created_at);
 `)
 
 ensureDefaultGroup()
@@ -117,6 +164,7 @@ ensureColumn('billing_ledger', 'api_provider', "api_provider TEXT NOT NULL DEFAU
 ensureColumn('billing_ledger', 'api_mode', "api_mode TEXT NOT NULL DEFAULT ''")
 ensureColumn('billing_ledger', 'api_model', "api_model TEXT NOT NULL DEFAULT ''")
 ensureColumn('billing_ledger', 'api_base_url', "api_base_url TEXT NOT NULL DEFAULT ''")
+ensureColumn('reward_codes', 'deleted_at', 'deleted_at INTEGER')
 
 const planCount = db.prepare('SELECT COUNT(*) AS count FROM plans').get().count
 if (planCount === 0) {
@@ -125,10 +173,34 @@ if (planCount === 0) {
 }
 
 ensureApiSettings()
+ensureCheckinSettings()
 repairMissingAdmin()
 
 function genId() {
   return `${Date.now().toString(36)}${randomBytes(4).toString('hex')}`
+}
+
+class ApiError extends Error {
+  constructor(status, message) {
+    super(message)
+    this.status = status
+  }
+}
+
+function fail(status, message) {
+  throw new ApiError(status, message)
+}
+
+function withImmediateTransaction(callback) {
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    const result = callback()
+    db.exec('COMMIT')
+    return result
+  } catch (error) {
+    db.exec('ROLLBACK')
+    throw error
+  }
 }
 
 function hashPassword(password, salt) {
@@ -256,6 +328,15 @@ function ensureApiSettings() {
     return
   }
   setApiSettings(createDefaultApiSettings())
+}
+
+function ensureCheckinSettings() {
+  const now = Date.now()
+  db.prepare(`
+    INSERT INTO checkin_settings (id, enabled, quota_amount, cooldown_hours, per_ip_daily_limit, brand_title, brand_description, updated_at)
+    VALUES (?, 0, 5, 24, 0, '每日补给站', '每天领取一份创作额度。', ?)
+    ON CONFLICT(id) DO NOTHING
+  `).run(DEFAULT_CHECKIN_SETTINGS_ID, now)
 }
 
 function getApiSettings() {
@@ -510,6 +591,58 @@ function rowToLedger(row) {
   }
 }
 
+function rowToRewardCode(row) {
+  return {
+    id: row.id,
+    code: row.code,
+    name: row.name,
+    description: row.description,
+    quotaAmount: row.quota_amount,
+    active: row.active !== 0,
+    totalLimit: row.total_limit,
+    perUserLimit: row.per_user_limit,
+    perIpLimit: row.per_ip_limit,
+    startsAt: row.starts_at ?? null,
+    expiresAt: row.expires_at ?? null,
+    redeemedCount: Number(row.redeemed_count ?? 0),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }
+}
+
+function rowToRewardRedemption(row) {
+  return {
+    id: row.id,
+    codeId: row.code_id,
+    code: row.code ?? '',
+    name: row.name ?? '',
+    userId: row.user_id,
+    quotaAmount: row.quota_amount,
+    createdAt: row.created_at,
+  }
+}
+
+function rowToCheckinSettings(row) {
+  return {
+    enabled: row.enabled !== 0,
+    quotaAmount: row.quota_amount,
+    cooldownHours: row.cooldown_hours,
+    perIpDailyLimit: row.per_ip_daily_limit,
+    brandTitle: row.brand_title,
+    brandDescription: row.brand_description,
+    updatedAt: row.updated_at,
+  }
+}
+
+function rowToCheckinRecord(row) {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    quotaAmount: row.quota_amount,
+    createdAt: row.created_at,
+  }
+}
+
 function getGroups() {
   return db.prepare('SELECT * FROM groups ORDER BY created_at, name').all().map(rowToGroup)
 }
@@ -543,6 +676,68 @@ function getFirstPlanForGroup(groupId) {
 function getUser(userId) {
   const row = db.prepare('SELECT * FROM users WHERE id = ?').get(userId)
   return row ? rowToUser(row) : null
+}
+
+function getCheckinSettings() {
+  ensureCheckinSettings()
+  const row = db.prepare('SELECT * FROM checkin_settings WHERE id = ?').get(DEFAULT_CHECKIN_SETTINGS_ID)
+  return rowToCheckinSettings(row)
+}
+
+function getRewardCodes() {
+  return db.prepare(`
+    SELECT reward_codes.*, COUNT(reward_redemptions.id) AS redeemed_count
+    FROM reward_codes
+    LEFT JOIN reward_redemptions ON reward_redemptions.code_id = reward_codes.id
+    WHERE reward_codes.deleted_at IS NULL
+    GROUP BY reward_codes.id
+    ORDER BY reward_codes.updated_at DESC, reward_codes.created_at DESC
+  `).all().map(rowToRewardCode)
+}
+
+function getRecentRewardRedemptions(userId) {
+  return db.prepare(`
+    SELECT reward_redemptions.*, reward_codes.code, reward_codes.name
+    FROM reward_redemptions
+    LEFT JOIN reward_codes ON reward_codes.id = reward_redemptions.code_id
+    WHERE reward_redemptions.user_id = ?
+    ORDER BY reward_redemptions.created_at DESC
+    LIMIT 8
+  `).all(userId).map(rowToRewardRedemption)
+}
+
+function getRecentCheckinRecords(userId) {
+  return db.prepare(`
+    SELECT *
+    FROM checkin_records
+    WHERE user_id = ?
+    ORDER BY created_at DESC
+    LIMIT 8
+  `).all(userId).map(rowToCheckinRecord)
+}
+
+function getLastCheckinAt(userId) {
+  const row = db.prepare('SELECT MAX(created_at) AS last_checkin_at FROM checkin_records WHERE user_id = ?').get(userId)
+  return row?.last_checkin_at ?? null
+}
+
+function getRewardState(actor) {
+  const settings = getCheckinSettings()
+  const lastCheckinAt = actor ? getLastCheckinAt(actor.id) : null
+  const cooldownMs = Math.max(1, settings.cooldownHours) * 60 * 60 * 1000
+  const nextAvailableAt = lastCheckinAt ? lastCheckinAt + cooldownMs : null
+  const now = Date.now()
+  return {
+    checkin: {
+      ...settings,
+      lastCheckinAt,
+      nextAvailableAt,
+      canCheckIn: Boolean(settings.enabled && actor && (!nextAvailableAt || now >= nextAvailableAt)),
+    },
+    rewardCodes: canManage(actor) ? getRewardCodes() : [],
+    myRedemptions: actor ? getRecentRewardRedemptions(actor.id) : [],
+    myCheckins: actor ? getRecentCheckinRecords(actor.id) : [],
+  }
 }
 
 function getLedgerSnapshot({ user, plan, group, profile }) {
@@ -774,6 +969,7 @@ function getState(actor, authSession = null) {
     setupRequired,
     apiSettings: createRuntimeApiSettings(adminApiSettings, authSession),
     adminApiSettings: admin ? adminApiSettings : null,
+    rewardState: getRewardState(actor),
   }
 }
 
@@ -816,6 +1012,87 @@ function normalizePositiveInteger(value, fallback = 1) {
 function normalizeNonNegativeNumber(value, fallback = 0) {
   const next = Number(value)
   return Number.isFinite(next) && next >= 0 ? next : fallback
+}
+
+function normalizeNonNegativeInteger(value, fallback = 0) {
+  return Math.floor(normalizeNonNegativeNumber(value, fallback))
+}
+
+function normalizeBoolean(value, fallback = false) {
+  if (typeof value === 'boolean') return value
+  if (value === 1 || value === '1' || value === 'true') return true
+  if (value === 0 || value === '0' || value === 'false') return false
+  return fallback
+}
+
+function normalizeOptionalTimestamp(value, fallback = null) {
+  if (value == null || value === '') return null
+  const next = Math.floor(Number(value))
+  if (!Number.isFinite(next) || next <= 0) return fallback
+  return next
+}
+
+function normalizeRewardCodeValue(value) {
+  return String(value || '')
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, '')
+    .replace(/[^A-Z0-9_-]/g, '')
+    .slice(0, 32)
+}
+
+function createRewardCodeValue() {
+  const exists = db.prepare('SELECT 1 FROM reward_codes WHERE code = ?')
+  let code = ''
+  do {
+    code = `GIFT-${randomBytes(3).toString('hex').toUpperCase()}`
+  } while (exists.get(code))
+  return code
+}
+
+function normalizeRewardCodeInput(input, fallback = {}) {
+  return {
+    code: normalizeRewardCodeValue(input.code ?? fallback.code),
+    name: String(input.name || fallback.name || '创作补给券').trim().slice(0, 48) || '创作补给券',
+    description: String(input.description ?? fallback.description ?? '').trim().slice(0, 160),
+    quotaAmount: normalizePositiveInteger(input.quotaAmount ?? fallback.quotaAmount, 100),
+    active: normalizeBoolean(input.active, fallback.active ?? true),
+    totalLimit: normalizeNonNegativeInteger(input.totalLimit ?? fallback.totalLimit, 1),
+    perUserLimit: normalizeNonNegativeInteger(input.perUserLimit ?? fallback.perUserLimit, 1),
+    perIpLimit: normalizeNonNegativeInteger(input.perIpLimit ?? fallback.perIpLimit, 0),
+    startsAt: normalizeOptionalTimestamp(input.startsAt, fallback.startsAt ?? null),
+    expiresAt: normalizeOptionalTimestamp(input.expiresAt, fallback.expiresAt ?? null),
+  }
+}
+
+function normalizeCheckinSettingsInput(input, fallback = getCheckinSettings()) {
+  return {
+    enabled: normalizeBoolean(input.enabled, fallback.enabled),
+    quotaAmount: normalizePositiveInteger(input.quotaAmount ?? fallback.quotaAmount, 5),
+    cooldownHours: normalizePositiveInteger(input.cooldownHours ?? fallback.cooldownHours, 24),
+    perIpDailyLimit: normalizeNonNegativeInteger(input.perIpDailyLimit ?? fallback.perIpDailyLimit, 0),
+    brandTitle: String(input.brandTitle || fallback.brandTitle || '每日补给站').trim().slice(0, 40) || '每日补给站',
+    brandDescription: String(input.brandDescription ?? fallback.brandDescription ?? '').trim().slice(0, 160),
+  }
+}
+
+function getClientIp(req) {
+  const forwarded = req.headers['x-forwarded-for']
+  if (typeof forwarded === 'string' && forwarded.trim()) return forwarded.split(',')[0].trim().slice(0, 80)
+  if (Array.isArray(forwarded) && forwarded[0]) return forwarded[0].split(',')[0].trim().slice(0, 80)
+  return String(req.socket.remoteAddress || '').slice(0, 80)
+}
+
+function getLocalDayStart(time) {
+  const date = new Date(time)
+  date.setHours(0, 0, 0, 0)
+  return date.getTime()
+}
+
+function assertRewardWindow(input) {
+  if (input.startsAt && input.expiresAt && input.expiresAt <= input.startsAt) {
+    fail(400, '兑换码结束时间必须晚于开始时间')
+  }
 }
 
 function normalizePlanInput(input, fallback = {}) {
@@ -867,6 +1144,194 @@ function getExistingGroupId(value) {
   const groupId = typeof value === 'string' && value.trim() ? value.trim() : ''
   if (!groupId) return null
   return db.prepare('SELECT 1 FROM groups WHERE id = ?').get(groupId) ? groupId : null
+}
+
+function getRewardCodeById(codeId) {
+  const row = db.prepare('SELECT * FROM reward_codes WHERE id = ? AND deleted_at IS NULL').get(codeId)
+  return row ? rowToRewardCode(row) : null
+}
+
+function createRewardCode(input) {
+  const body = normalizeRewardCodeInput({
+    ...input,
+    code: input.code || createRewardCodeValue(),
+  })
+  if (!body.code) fail(400, '请输入兑换码')
+  assertRewardWindow(body)
+  if (db.prepare('SELECT 1 FROM reward_codes WHERE code = ?').get(body.code)) {
+    fail(409, '兑换码已存在')
+  }
+  const now = Date.now()
+  db.prepare(`
+    INSERT INTO reward_codes (
+      id, code, name, description, quota_amount, active, total_limit, per_user_limit, per_ip_limit, starts_at, expires_at, created_at, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    genId(),
+    body.code,
+    body.name,
+    body.description,
+    body.quotaAmount,
+    body.active ? 1 : 0,
+    body.totalLimit,
+    body.perUserLimit,
+    body.perIpLimit,
+    body.startsAt,
+    body.expiresAt,
+    now,
+    now,
+  )
+}
+
+function updateRewardCode(codeId, input) {
+  const existing = getRewardCodeById(codeId)
+  if (!existing) fail(404, '找不到兑换码')
+  const body = normalizeRewardCodeInput(input, existing)
+  if (!body.code) fail(400, '请输入兑换码')
+  assertRewardWindow(body)
+  const duplicate = db.prepare('SELECT id FROM reward_codes WHERE code = ? AND id <> ?').get(body.code, codeId)
+  if (duplicate) fail(409, '兑换码已存在')
+  db.prepare(`
+    UPDATE reward_codes
+    SET code = ?, name = ?, description = ?, quota_amount = ?, active = ?, total_limit = ?, per_user_limit = ?, per_ip_limit = ?, starts_at = ?, expires_at = ?, updated_at = ?
+    WHERE id = ?
+  `).run(
+    body.code,
+    body.name,
+    body.description,
+    body.quotaAmount,
+    body.active ? 1 : 0,
+    body.totalLimit,
+    body.perUserLimit,
+    body.perIpLimit,
+    body.startsAt,
+    body.expiresAt,
+    Date.now(),
+    codeId,
+  )
+}
+
+function deleteRewardCode(codeId) {
+  const existing = getRewardCodeById(codeId)
+  if (!existing) fail(404, '找不到兑换码')
+  const now = Date.now()
+  db.prepare('UPDATE reward_codes SET active = 0, deleted_at = ?, updated_at = ? WHERE id = ?').run(now, now, codeId)
+}
+
+function updateCheckinSettings(input) {
+  const body = normalizeCheckinSettingsInput(input)
+  const now = Date.now()
+  db.prepare(`
+    INSERT INTO checkin_settings (id, enabled, quota_amount, cooldown_hours, per_ip_daily_limit, brand_title, brand_description, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      enabled = excluded.enabled,
+      quota_amount = excluded.quota_amount,
+      cooldown_hours = excluded.cooldown_hours,
+      per_ip_daily_limit = excluded.per_ip_daily_limit,
+      brand_title = excluded.brand_title,
+      brand_description = excluded.brand_description,
+      updated_at = excluded.updated_at
+  `).run(
+    DEFAULT_CHECKIN_SETTINGS_ID,
+    body.enabled ? 1 : 0,
+    body.quotaAmount,
+    body.cooldownHours,
+    body.perIpDailyLimit,
+    body.brandTitle,
+    body.brandDescription,
+    now,
+  )
+}
+
+function redeemRewardCode(actor, rawCode, ipAddress) {
+  const now = Date.now()
+  const codeValue = normalizeRewardCodeValue(rawCode)
+  if (!codeValue) fail(400, '请输入兑换码')
+
+  withImmediateTransaction(() => {
+    const codeRow = db.prepare('SELECT * FROM reward_codes WHERE code = ? AND deleted_at IS NULL').get(codeValue)
+    if (!codeRow) fail(404, '兑换码不存在或已失效')
+    const code = rowToRewardCode(codeRow)
+    if (!code.active) fail(403, '这个兑换码已关闭')
+    if (code.startsAt && now < code.startsAt) fail(403, '这个兑换码还未开始')
+    if (code.expiresAt && now > code.expiresAt) fail(403, '这个兑换码已过期')
+
+    const totalUsed = db.prepare('SELECT COUNT(*) AS count FROM reward_redemptions WHERE code_id = ?').get(code.id).count
+    if (code.totalLimit > 0 && totalUsed >= code.totalLimit) fail(409, '这个兑换码已被兑换完')
+
+    const userUsed = db.prepare('SELECT COUNT(*) AS count FROM reward_redemptions WHERE code_id = ? AND user_id = ?').get(code.id, actor.id).count
+    if (code.perUserLimit > 0 && userUsed >= code.perUserLimit) fail(409, '当前账号已达到这个兑换码的兑换上限')
+
+    const ipUsed = db.prepare('SELECT COUNT(*) AS count FROM reward_redemptions WHERE code_id = ? AND ip_address = ?').get(code.id, ipAddress).count
+    if (code.perIpLimit > 0 && ipUsed >= code.perIpLimit) fail(409, '当前 IP 已达到这个兑换码的兑换上限')
+
+    const user = getUser(actor.id)
+    if (!user) fail(401, '请重新登录')
+    const balanceAfter = user.quotaBalance + code.quotaAmount
+    db.prepare('UPDATE users SET quota_balance = ?, updated_at = ? WHERE id = ?').run(balanceAfter, now, user.id)
+    db.prepare('INSERT INTO reward_redemptions (id, code_id, user_id, ip_address, quota_amount, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(genId(), code.id, user.id, ipAddress, code.quotaAmount, now)
+    insertLedgerEntry({
+      userId: user.id,
+      user,
+      type: 'credit',
+      source: 'admin',
+      amount: code.quotaAmount,
+      units: 1,
+      unitCost: code.quotaAmount,
+      balanceBefore: user.quotaBalance,
+      balanceAfter,
+      plan: getPlan(user.planId),
+      group: getGroup(user.groupId),
+      note: `兑换码 ${code.code}：${code.name}`,
+      createdAt: now,
+    })
+  })
+}
+
+function checkInUser(actor, ipAddress) {
+  const now = Date.now()
+  withImmediateTransaction(() => {
+    const settings = getCheckinSettings()
+    if (!settings.enabled) fail(403, '今日签到暂未开启')
+
+    const lastCheckinAt = getLastCheckinAt(actor.id)
+    const cooldownMs = Math.max(1, settings.cooldownHours) * 60 * 60 * 1000
+    if (lastCheckinAt && now < lastCheckinAt + cooldownMs) {
+      fail(409, '还没到下一次签到时间')
+    }
+
+    if (settings.perIpDailyLimit > 0) {
+      const dayStart = getLocalDayStart(now)
+      const ipCount = db.prepare('SELECT COUNT(*) AS count FROM checkin_records WHERE ip_address = ? AND created_at >= ?')
+        .get(ipAddress, dayStart).count
+      if (ipCount >= settings.perIpDailyLimit) fail(409, '当前 IP 今天的签到次数已达上限')
+    }
+
+    const user = getUser(actor.id)
+    if (!user) fail(401, '请重新登录')
+    const balanceAfter = user.quotaBalance + settings.quotaAmount
+    db.prepare('UPDATE users SET quota_balance = ?, updated_at = ? WHERE id = ?').run(balanceAfter, now, user.id)
+    db.prepare('INSERT INTO checkin_records (id, user_id, ip_address, quota_amount, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run(genId(), user.id, ipAddress, settings.quotaAmount, now)
+    insertLedgerEntry({
+      userId: user.id,
+      user,
+      type: 'credit',
+      source: 'admin',
+      amount: settings.quotaAmount,
+      units: 1,
+      unitCost: settings.quotaAmount,
+      balanceBefore: user.quotaBalance,
+      balanceAfter,
+      plan: getPlan(user.planId),
+      group: getGroup(user.groupId),
+      note: `${settings.brandTitle} 签到奖励`,
+      createdAt: now,
+    })
+  })
 }
 
 const server = http.createServer(async (req, res) => {
@@ -954,6 +1419,21 @@ const server = http.createServer(async (req, res) => {
       }))
     }
 
+    if (req.method === 'GET' && path === '/rewards/state') {
+      return json(res, 200, getRewardState(actor))
+    }
+
+    if (req.method === 'POST' && path === '/rewards/redeem') {
+      const body = await readJson(req)
+      redeemRewardCode(actor, body.code, getClientIp(req))
+      return json(res, 200, getState(getUser(actor.id), authSession))
+    }
+
+    if (req.method === 'POST' && path === '/rewards/checkin') {
+      checkInUser(actor, getClientIp(req))
+      return json(res, 200, getState(getUser(actor.id), authSession))
+    }
+
     if (req.method === 'POST' && path === '/usage/charge') {
       const body = await readJson(req)
       const source = body.source === 'agent' ? 'agent' : 'gallery'
@@ -993,6 +1473,27 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (!canManage(actor)) return json(res, 403, { error: '需要管理员权限' })
+
+    const rewardCodeMatch = path.match(/^\/rewards\/codes\/([^/]+)$/)
+    if (req.method === 'POST' && path === '/rewards/codes') {
+      createRewardCode(await readJson(req))
+      return json(res, 200, getState(getUser(actor.id), authSession))
+    }
+
+    if (rewardCodeMatch && req.method === 'PATCH') {
+      updateRewardCode(rewardCodeMatch[1], await readJson(req))
+      return json(res, 200, getState(getUser(actor.id), authSession))
+    }
+
+    if (rewardCodeMatch && req.method === 'DELETE') {
+      deleteRewardCode(rewardCodeMatch[1])
+      return json(res, 200, getState(getUser(actor.id), authSession))
+    }
+
+    if (req.method === 'PATCH' && path === '/rewards/checkin-settings') {
+      updateCheckinSettings(await readJson(req))
+      return json(res, 200, getState(getUser(actor.id), authSession))
+    }
 
     const userMatch = path.match(/^\/users\/([^/]+)(?:\/(grant-quota|quota))?$/)
     if (userMatch && req.method === 'PATCH' && !userMatch[2]) {
@@ -1143,6 +1644,9 @@ const server = http.createServer(async (req, res) => {
 
     return json(res, 404, { error: 'Not found' })
   } catch (error) {
+    if (error instanceof ApiError) {
+      return json(res, error.status, { error: error.message })
+    }
     console.error(error)
     return json(res, 500, { error: error instanceof Error ? error.message : String(error) })
   }

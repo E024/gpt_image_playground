@@ -19,6 +19,8 @@ import type {
   AuthSession,
   BillingLedgerEntry,
   ManagedUser,
+  RewardCode,
+  RewardState,
   UserGroup,
   UserPlan,
 } from './types'
@@ -59,20 +61,27 @@ import { getChangedParams, normalizeParamsForSettings } from './lib/paramCompati
 import { createTransparentOutputMeta, getTransparentRequestParams, removeKeyedBackgroundFromDataUrl } from './lib/transparentImage'
 import {
   backendChargeQuota,
+  backendCheckIn,
   backendCreateGroup,
   backendCreatePlan,
+  backendCreateRewardCode,
   backendDeleteGroup,
   backendDeletePlan,
+  backendDeleteRewardCode,
   backendGrantUserQuota,
   backendLogin,
   backendLogout,
   backendRegister,
+  backendRedeemRewardCode,
   backendSetUserQuota,
+  backendUpdateCheckinSettings,
   backendUpdateApiSettings,
   backendUpdateGroup,
   backendUpdatePlan,
+  backendUpdateRewardCode,
   backendUpdateUser,
   fetchBackendState,
+  type RewardCodeInput,
   type BackendState,
 } from './lib/backendApi'
 import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate'
@@ -155,6 +164,23 @@ const DEFAULT_PLANS: UserPlan[] = [
     accent: 'amber',
   },
 ]
+const DEFAULT_REWARD_STATE: RewardState = {
+  checkin: {
+    enabled: false,
+    quotaAmount: 5,
+    cooldownHours: 24,
+    perIpDailyLimit: 0,
+    brandTitle: '每日补给站',
+    brandDescription: '每天领取一份创作额度。',
+    lastCheckinAt: null,
+    nextAvailableAt: null,
+    canCheckIn: false,
+    updatedAt: 1,
+  },
+  rewardCodes: [],
+  myRedemptions: [],
+  myCheckins: [],
+}
 const BACKEND_MANAGED_SETTING_KEYS: Array<keyof AppSettings> = [
   'baseUrl',
   'apiKey',
@@ -890,6 +916,7 @@ function mergePersistedState(persistedState: unknown, currentState: AppState): A
     authReady: !authSession,
     setupRequired: currentState.setupRequired,
     billingLedger: [],
+    rewardState: DEFAULT_REWARD_STATE,
     activeFavoriteCollectionId: null,
     favoritePickerTaskIds: null,
     supportPromptDismissed: Boolean(persisted.supportPromptDismissed),
@@ -922,6 +949,7 @@ interface AppState {
   users: ManagedUser[]
   plans: UserPlan[]
   billingLedger: BillingLedgerEntry[]
+  rewardState: RewardState
   authSession: AuthSession | null
   authReady: boolean
   setupRequired: boolean
@@ -938,6 +966,12 @@ interface AppState {
   createPlan: (input: Omit<UserPlan, 'id'>) => void
   updatePlan: (planId: string, patch: Partial<Omit<UserPlan, 'id'>>) => void
   deletePlan: (planId: string) => void
+  createRewardCode: (input: RewardCodeInput) => Promise<void>
+  updateRewardCode: (codeId: string, patch: Partial<RewardCodeInput>) => Promise<void>
+  deleteRewardCode: (codeId: string) => Promise<void>
+  updateCheckinSettings: (settings: Partial<RewardState['checkin']>) => Promise<void>
+  redeemRewardCode: (code: string) => Promise<boolean>
+  checkIn: () => Promise<boolean>
   chargeCurrentUserQuota: (source: 'gallery' | 'agent', units: number, note: string) => Promise<boolean>
 
   // 输入
@@ -1244,6 +1278,93 @@ function normalizeBillingLedger(value: unknown, users: ManagedUser[]): BillingLe
     .filter((entry): entry is BillingLedgerEntry => entry != null)
 }
 
+function normalizeRewardCode(item: unknown): RewardCode | null {
+  if (!isRecord(item)) return null
+  const id = typeof item.id === 'string' && item.id.trim() ? item.id : ''
+  const code = typeof item.code === 'string' && item.code.trim() ? item.code.trim() : ''
+  if (!id || !code) return null
+  return {
+    id,
+    code,
+    name: typeof item.name === 'string' && item.name.trim() ? item.name.trim().slice(0, 48) : '创作补给券',
+    description: typeof item.description === 'string' ? item.description.slice(0, 160) : '',
+    quotaAmount: normalizeNonNegativeInteger(item.quotaAmount, 0),
+    active: typeof item.active === 'boolean' ? item.active : true,
+    totalLimit: normalizeNonNegativeInteger(item.totalLimit, 1),
+    perUserLimit: normalizeNonNegativeInteger(item.perUserLimit, 1),
+    perIpLimit: normalizeNonNegativeInteger(item.perIpLimit, 0),
+    startsAt: typeof item.startsAt === 'number' ? item.startsAt : null,
+    expiresAt: typeof item.expiresAt === 'number' ? item.expiresAt : null,
+    redeemedCount: normalizeNonNegativeInteger(item.redeemedCount, 0),
+    createdAt: normalizeTimestamp(item.createdAt),
+    updatedAt: normalizeTimestamp(item.updatedAt),
+  }
+}
+
+function normalizeRewardRedemptions(value: unknown): RewardState['myRedemptions'] {
+  if (!Array.isArray(value)) return []
+  return value
+    .map((item): RewardState['myRedemptions'][number] | null => {
+      if (!isRecord(item)) return null
+      const id = typeof item.id === 'string' && item.id.trim() ? item.id : ''
+      const codeId = typeof item.codeId === 'string' ? item.codeId : ''
+      const userId = typeof item.userId === 'string' ? item.userId : ''
+      if (!id || !userId) return null
+      return {
+        id,
+        codeId,
+        code: typeof item.code === 'string' ? item.code : '',
+        name: typeof item.name === 'string' ? item.name : '',
+        userId,
+        quotaAmount: normalizeNonNegativeInteger(item.quotaAmount, 0),
+        createdAt: normalizeTimestamp(item.createdAt),
+      }
+    })
+    .filter((item): item is RewardState['myRedemptions'][number] => item != null)
+}
+
+function normalizeCheckinRecords(value: unknown): RewardState['myCheckins'] {
+  if (!Array.isArray(value)) return []
+  return value
+    .map((item): RewardState['myCheckins'][number] | null => {
+      if (!isRecord(item)) return null
+      const id = typeof item.id === 'string' && item.id.trim() ? item.id : ''
+      const userId = typeof item.userId === 'string' ? item.userId : ''
+      if (!id || !userId) return null
+      return {
+        id,
+        userId,
+        quotaAmount: normalizeNonNegativeInteger(item.quotaAmount, 0),
+        createdAt: normalizeTimestamp(item.createdAt),
+      }
+    })
+    .filter((item): item is RewardState['myCheckins'][number] => item != null)
+}
+
+function normalizeRewardState(value: unknown): RewardState {
+  if (!isRecord(value)) return DEFAULT_REWARD_STATE
+  const rawCheckin = isRecord(value.checkin) ? value.checkin : {}
+  return {
+    checkin: {
+      enabled: typeof rawCheckin.enabled === 'boolean' ? rawCheckin.enabled : false,
+      quotaAmount: normalizeNonNegativeInteger(rawCheckin.quotaAmount, DEFAULT_REWARD_STATE.checkin.quotaAmount),
+      cooldownHours: Math.max(1, normalizeNonNegativeInteger(rawCheckin.cooldownHours, DEFAULT_REWARD_STATE.checkin.cooldownHours)),
+      perIpDailyLimit: normalizeNonNegativeInteger(rawCheckin.perIpDailyLimit, 0),
+      brandTitle: typeof rawCheckin.brandTitle === 'string' && rawCheckin.brandTitle.trim() ? rawCheckin.brandTitle.trim().slice(0, 40) : DEFAULT_REWARD_STATE.checkin.brandTitle,
+      brandDescription: typeof rawCheckin.brandDescription === 'string' ? rawCheckin.brandDescription.slice(0, 160) : DEFAULT_REWARD_STATE.checkin.brandDescription,
+      lastCheckinAt: typeof rawCheckin.lastCheckinAt === 'number' ? rawCheckin.lastCheckinAt : null,
+      nextAvailableAt: typeof rawCheckin.nextAvailableAt === 'number' ? rawCheckin.nextAvailableAt : null,
+      canCheckIn: typeof rawCheckin.canCheckIn === 'boolean' ? rawCheckin.canCheckIn : false,
+      updatedAt: normalizeTimestamp(rawCheckin.updatedAt),
+    },
+    rewardCodes: Array.isArray(value.rewardCodes)
+      ? value.rewardCodes.map(normalizeRewardCode).filter((item): item is RewardCode => item != null)
+      : [],
+    myRedemptions: normalizeRewardRedemptions(value.myRedemptions),
+    myCheckins: normalizeCheckinRecords(value.myCheckins),
+  }
+}
+
 function normalizeAuthSession(value: unknown): AuthSession | null {
   if (!isRecord(value) || typeof value.userId !== 'string') return null
   if (typeof value.token !== 'string' || !value.token) return null
@@ -1278,6 +1399,7 @@ function applyBackendStatePatch(state: BackendState) {
     users,
     plans,
     billingLedger: normalizeBillingLedger(state.billingLedger, users),
+    rewardState: normalizeRewardState(state.rewardState),
     authSession: state.authSession ? normalizeAuthSession(state.authSession) : null,
     authReady: true,
     setupRequired: Boolean(state.setupRequired),
@@ -1625,6 +1747,7 @@ export const useStore = create<AppState>()(
       users: [],
       plans: DEFAULT_PLANS,
       billingLedger: [],
+      rewardState: DEFAULT_REWARD_STATE,
       authSession: null,
       authReady: true,
       setupRequired: true,
@@ -1661,6 +1784,7 @@ export const useStore = create<AppState>()(
             groups: DEFAULT_GROUPS,
             users: [],
             billingLedger: [],
+            rewardState: DEFAULT_REWARD_STATE,
             authSession: null,
             adminApiSettings: null,
             settings: getPersistableSettings(get().settings),
@@ -1676,6 +1800,7 @@ export const useStore = create<AppState>()(
           groups: DEFAULT_GROUPS,
           users: [],
           billingLedger: [],
+          rewardState: DEFAULT_REWARD_STATE,
           appMode: 'gallery',
           adminApiSettings: null,
           settings: getPersistableSettings(get().settings),
@@ -1751,6 +1876,58 @@ export const useStore = create<AppState>()(
           get().showToast('套餐已删除', 'success')
         } catch (error) {
           get().showToast(error instanceof Error ? error.message : '删除套餐失败', 'error')
+        }
+      },
+      createRewardCode: async (input) => {
+        try {
+          applyBackendStatePatch(await backendCreateRewardCode(input, get().authSession))
+          get().showToast('兑换码已放入权益补给站', 'success')
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '创建兑换码失败', 'error')
+        }
+      },
+      updateRewardCode: async (codeId, patch) => {
+        try {
+          applyBackendStatePatch(await backendUpdateRewardCode(codeId, patch, get().authSession))
+          get().showToast('兑换码已更新', 'success')
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '更新兑换码失败', 'error')
+        }
+      },
+      deleteRewardCode: async (codeId) => {
+        try {
+          applyBackendStatePatch(await backendDeleteRewardCode(codeId, get().authSession))
+          get().showToast('兑换码已移除', 'success')
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '删除兑换码失败', 'error')
+        }
+      },
+      updateCheckinSettings: async (settings) => {
+        try {
+          applyBackendStatePatch(await backendUpdateCheckinSettings(settings, get().authSession))
+          get().showToast('签到配置已保存', 'success')
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '保存签到配置失败', 'error')
+        }
+      },
+      redeemRewardCode: async (code) => {
+        try {
+          applyBackendStatePatch(await backendRedeemRewardCode(code, get().authSession))
+          get().showToast('兑换成功，额度已入账', 'success')
+          return true
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '兑换失败', 'error')
+          return false
+        }
+      },
+      checkIn: async () => {
+        try {
+          applyBackendStatePatch(await backendCheckIn(get().authSession))
+          get().showToast('签到完成，额度已入账', 'success')
+          return true
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '签到失败', 'error')
+          return false
         }
       },
       chargeCurrentUserQuota: async (source, units, note) => {

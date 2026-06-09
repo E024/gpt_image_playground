@@ -219,6 +219,60 @@ export interface BillingLedgerEntry {
   createdAt: number
 }
 
+export interface RewardCode {
+  id: string
+  code: string
+  name: string
+  description: string
+  quotaAmount: number
+  active: boolean
+  totalLimit: number
+  perUserLimit: number
+  perIpLimit: number
+  startsAt: number | null
+  expiresAt: number | null
+  redeemedCount: number
+  createdAt: number
+  updatedAt: number
+}
+
+export interface RewardRedemption {
+  id: string
+  codeId: string
+  code: string
+  name: string
+  userId: string
+  quotaAmount: number
+  createdAt: number
+}
+
+export interface CheckinSettings {
+  enabled: boolean
+  quotaAmount: number
+  cooldownHours: number
+  perIpDailyLimit: number
+  brandTitle: string
+  brandDescription: string
+  lastCheckinAt: number | null
+  nextAvailableAt: number | null
+  canCheckIn: boolean
+  updatedAt: number
+}
+
+export interface CheckinRecord {
+  id: string
+  userId: string
+  quotaAmount: number
+  createdAt: number
+}
+
+export interface RewardState {
+  checkin: CheckinSettings
+  rewardCodes: RewardCode[]
+  myRedemptions: RewardRedemption[]
+  myCheckins: CheckinRecord[]
+}
+
 // ===== 任务记录 =====
 
 export type TaskStatus = 'running' | 'done' | 'error'

@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useStore } from '../store'
 import { getActiveApiProfile, normalizeSettings } from '../lib/apiProfiles'
-import { backendFetchLedger, type LedgerPage } from '../lib/backendApi'
-import type { ApiMode, ApiProfile, AppSettings, BillingLedgerEntry, BillingLedgerType, BillingUsageSource, ManagedUser, UserGroup, UserPlan } from '../types'
+import { backendFetchLedger, type LedgerPage, type RewardCodeInput } from '../lib/backendApi'
+import type { ApiMode, ApiProfile, AppSettings, BillingLedgerEntry, BillingLedgerType, BillingUsageSource, ManagedUser, RewardCode, RewardState, UserGroup, UserPlan } from '../types'
 
-type AdminSection = 'overview' | 'groups' | 'plans' | 'users' | 'ledger' | 'settings'
+type AdminSection = 'overview' | 'groups' | 'plans' | 'users' | 'rewards' | 'ledger' | 'settings'
 type NavItem = { id: AdminSection; label: string; description: string; adminOnly?: boolean }
 const DEFAULT_GROUP_ID = 'default'
 const LEDGER_PAGE_SIZES = [10, 20, 50, 100]
@@ -55,6 +55,37 @@ function fromDateTimeLocal(value: string) {
   return Number.isFinite(time) ? time : null
 }
 
+function formatLimit(value: number, unit = '次') {
+  return value > 0 ? `${value}${unit}` : '不限'
+}
+
+function formatNextCheckin(value: number | null) {
+  if (!value) return '现在可领取'
+  if (value <= Date.now()) return '现在可领取'
+  return formatFullDate(value)
+}
+
+function toRewardCodeDraft(code?: RewardCode | null): RewardCodeInput {
+  return {
+    code: code?.code ?? '',
+    name: code?.name ?? '创作补给券',
+    description: code?.description ?? '给用户发放一份可追踪的创作额度。',
+    quotaAmount: code?.quotaAmount ?? 100,
+    active: code?.active ?? true,
+    totalLimit: code?.totalLimit ?? 1,
+    perUserLimit: code?.perUserLimit ?? 1,
+    perIpLimit: code?.perIpLimit ?? 0,
+    startsAt: code?.startsAt ?? null,
+    expiresAt: code?.expiresAt ?? null,
+  }
+}
+
+function getCheckinStatusLabel(checkin: RewardState['checkin']) {
+  if (!checkin.enabled) return '签到未开启'
+  if (checkin.canCheckIn) return `可领取 ${checkin.quotaAmount} 点`
+  return `下次 ${formatNextCheckin(checkin.nextAvailableAt)}`
+}
+
 function getLedgerAmountLabel(entry: BillingLedgerEntry) {
   return `${entry.type === 'debit' ? '-' : '+'}${entry.amount} 点`
 }
@@ -95,6 +126,7 @@ export default function AdminDashboard() {
   const users = useStore((s) => s.users)
   const plans = useStore((s) => s.plans)
   const ledger = useStore((s) => s.billingLedger)
+  const rewardState = useStore((s) => s.rewardState)
   const settings = useStore((s) => s.settings)
   const adminApiSettings = useStore((s) => s.adminApiSettings)
   const session = useStore((s) => s.authSession)
@@ -109,6 +141,12 @@ export default function AdminDashboard() {
   const updatePlan = useStore((s) => s.updatePlan)
   const deletePlan = useStore((s) => s.deletePlan)
   const updateApiSettings = useStore((s) => s.updateApiSettings)
+  const createRewardCode = useStore((s) => s.createRewardCode)
+  const updateRewardCode = useStore((s) => s.updateRewardCode)
+  const deleteRewardCode = useStore((s) => s.deleteRewardCode)
+  const updateCheckinSettings = useStore((s) => s.updateCheckinSettings)
+  const redeemRewardCode = useStore((s) => s.redeemRewardCode)
+  const checkIn = useStore((s) => s.checkIn)
 
   const currentUser = users.find((user) => user.id === session?.userId) ?? null
   const isAdmin = currentUser?.role === 'admin'
@@ -122,6 +160,12 @@ export default function AdminDashboard() {
   const [quotaDrafts, setQuotaDrafts] = useState<Record<string, string>>({})
   const [groupDrafts, setGroupDrafts] = useState<Record<string, UserGroup>>({})
   const [planDrafts, setPlanDrafts] = useState<Record<string, UserPlan>>({})
+  const [selectedRewardCodeId, setSelectedRewardCodeId] = useState(rewardState.rewardCodes[0]?.id ?? '')
+  const [rewardCodeDrafts, setRewardCodeDrafts] = useState<Record<string, RewardCodeInput>>({})
+  const [checkinDraft, setCheckinDraft] = useState<RewardState['checkin']>(rewardState.checkin)
+  const [redeemCode, setRedeemCode] = useState('')
+  const [redeemBusy, setRedeemBusy] = useState(false)
+  const [checkinBusy, setCheckinBusy] = useState(false)
   const [apiDraft, setApiDraft] = useState<AppSettings>(() => normalizeSettings(adminApiSettings ?? settings))
   const [ledgerQuery, setLedgerQuery] = useState('')
   const [ledgerSource, setLedgerSource] = useState<BillingUsageSource | 'all'>('all')
@@ -149,6 +193,8 @@ export default function AdminDashboard() {
   const selectedPlanUserCount = selectedPlan ? users.filter((user) => user.planId === selectedPlan.id).length : 0
   const selectedGroupUserCount = selectedGroup ? usersForSelectedGroup.length : 0
   const selectedGroupPlanCount = selectedGroup ? plansForSelectedGroup.length : 0
+  const selectedRewardCode = rewardState.rewardCodes.find((code) => code.id === selectedRewardCodeId) ?? rewardState.rewardCodes[0] ?? null
+  const selectedRewardDraft = selectedRewardCode ? rewardCodeDrafts[selectedRewardCode.id] ?? toRewardCodeDraft(selectedRewardCode) : null
   const canEditPlans = isAdmin
   const activeApiProfile = getActiveApiProfile(apiDraft)
   const getGroupName = (groupId: string) => groups.find((group) => group.id === groupId)?.name ?? '未知分组'
@@ -162,6 +208,15 @@ export default function AdminDashboard() {
   useEffect(() => {
     setApiDraft(normalizeSettings(adminApiSettings ?? settings))
   }, [adminApiSettings, settings])
+
+  useEffect(() => {
+    setCheckinDraft(rewardState.checkin)
+  }, [rewardState.checkin])
+
+  useEffect(() => {
+    if (rewardState.rewardCodes.some((code) => code.id === selectedRewardCodeId)) return
+    setSelectedRewardCodeId(rewardState.rewardCodes[0]?.id ?? '')
+  }, [rewardState.rewardCodes, selectedRewardCodeId])
 
   useEffect(() => {
     if (!isAdmin && (section === 'groups' || section === 'users' || section === 'settings')) setSection('overview')
@@ -246,6 +301,7 @@ export default function AdminDashboard() {
     { id: 'groups', label: '分组', description: '用户与套餐分层', adminOnly: true },
     { id: 'plans', label: '套餐', description: isAdmin ? '列表与详情编辑' : '当前套餐详情' },
     { id: 'users', label: '用户', description: '角色、套餐、额度', adminOnly: true },
+    { id: 'rewards', label: '权益', description: isAdmin ? '兑换码与签到' : '兑换、签到、领取记录' },
     { id: 'settings', label: 'API 配置', description: '统一接口与 Agent', adminOnly: true },
     { id: 'ledger', label: '流水', description: isAdmin ? '全部消费与调整' : '我的消费记录' },
   ] satisfies NavItem[]).filter((item) => isAdmin || !item.adminOnly)
@@ -338,6 +394,63 @@ export default function AdminDashboard() {
     })
   }
 
+  const handleCreateRewardCode = () => {
+    createRewardCode({
+      ...toRewardCodeDraft(null),
+      code: '',
+      name: '星尘补给券',
+      description: '用于活动、手动补偿或邀请奖励。',
+      quotaAmount: 100,
+      totalLimit: 20,
+      perUserLimit: 1,
+      perIpLimit: 0,
+    })
+  }
+
+  const updateSelectedRewardDraft = (patch: Partial<RewardCodeInput>) => {
+    if (!selectedRewardCode) return
+    setRewardCodeDrafts((drafts) => ({
+      ...drafts,
+      [selectedRewardCode.id]: { ...(drafts[selectedRewardCode.id] ?? toRewardCodeDraft(selectedRewardCode)), ...patch },
+    }))
+  }
+
+  const commitSelectedRewardDraft = () => {
+    if (!selectedRewardCode || !selectedRewardDraft) return
+    updateRewardCode(selectedRewardCode.id, selectedRewardDraft)
+    setRewardCodeDrafts((drafts) => {
+      const next = { ...drafts }
+      delete next[selectedRewardCode.id]
+      return next
+    })
+  }
+
+  const toggleSelectedRewardCode = () => {
+    if (!selectedRewardCode || !selectedRewardDraft) return
+    const nextDraft = { ...selectedRewardDraft, active: !selectedRewardDraft.active }
+    setRewardCodeDrafts((drafts) => ({ ...drafts, [selectedRewardCode.id]: nextDraft }))
+    updateRewardCode(selectedRewardCode.id, nextDraft)
+  }
+
+  const commitCheckinDraft = () => {
+    updateCheckinSettings(checkinDraft)
+  }
+
+  const handleRedeem = async () => {
+    const code = redeemCode.trim()
+    if (!code) return
+    setRedeemBusy(true)
+    const ok = await redeemRewardCode(code)
+    if (ok) setRedeemCode('')
+    setRedeemBusy(false)
+  }
+
+  const handleCheckin = async () => {
+    setCheckinBusy(true)
+    await checkIn()
+    setCheckinBusy(false)
+  }
+
   const handleQuotaCommit = (user: ManagedUser) => {
     const raw = quotaDrafts[user.id]
     if (raw == null || raw.trim() === '') return
@@ -428,7 +541,7 @@ export default function AdminDashboard() {
               <span>/</span>
               <span className="font-bold text-gray-900 dark:text-gray-100">{navItems.find((item) => item.id === section)?.label}</span>
             </div>
-            <h1 className="mt-1 text-2xl font-black">{section === 'groups' ? '分组管理' : section === 'plans' ? '套餐列表与详情' : section === 'users' ? '用户管理' : section === 'settings' ? 'API 与 Agent 配置' : section === 'ledger' ? '消费流水' : isAdmin ? '运营总览' : '我的账户'}</h1>
+            <h1 className="mt-1 text-2xl font-black">{section === 'groups' ? '分组管理' : section === 'plans' ? '套餐列表与详情' : section === 'users' ? '用户管理' : section === 'rewards' ? '权益补给站' : section === 'settings' ? 'API 与 Agent 配置' : section === 'ledger' ? '消费流水' : isAdmin ? '运营总览' : '我的账户'}</h1>
           </header>
 
           <div className="p-4">
@@ -686,6 +799,289 @@ export default function AdminDashboard() {
                     <div className="p-6 text-sm text-gray-500">暂无套餐。</div>
                   )}
                 </div>
+              </div>
+            )}
+
+            {section === 'rewards' && (
+              <div className="space-y-4">
+                <div className="grid gap-4 xl:grid-cols-[1fr_0.9fr]">
+                  <div className="overflow-hidden rounded-lg border border-cyan-200 bg-white shadow-sm dark:border-cyan-500/20 dark:bg-white/[0.04]">
+                    <div className="border-b border-cyan-100 bg-cyan-50 px-4 py-4 dark:border-cyan-500/20 dark:bg-cyan-500/10">
+                      <div className="text-xs font-black uppercase tracking-[0.18em] text-cyan-700 dark:text-cyan-300">Credit Dock</div>
+                      <h2 className="mt-1 text-lg font-black">兑换舱</h2>
+                      <p className="mt-1 text-sm text-cyan-800/70 dark:text-cyan-100/70">输入后台发放的礼品卡或兑换码，成功后额度会写入流水。</p>
+                    </div>
+                    <div className="grid gap-3 p-4 sm:grid-cols-[1fr_auto]">
+                      <input
+                        value={redeemCode}
+                        onChange={(event) => setRedeemCode(event.target.value.toUpperCase())}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter') void handleRedeem()
+                        }}
+                        placeholder="GIFT-XXXXXX"
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 font-mono text-sm font-bold tracking-wide outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => void handleRedeem()}
+                        disabled={!redeemCode.trim() || redeemBusy}
+                        className="rounded-md bg-cyan-600 px-4 py-2 text-sm font-black text-white transition hover:bg-cyan-500 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {redeemBusy ? '兑换中' : '立即兑换'}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="overflow-hidden rounded-lg border border-amber-200 bg-white shadow-sm dark:border-amber-500/20 dark:bg-white/[0.04]">
+                    <div className="border-b border-amber-100 bg-amber-50 px-4 py-4 dark:border-amber-500/20 dark:bg-amber-500/10">
+                      <div className="text-xs font-black uppercase tracking-[0.18em] text-amber-700 dark:text-amber-300">Daily Stamp</div>
+                      <h2 className="mt-1 text-lg font-black">{rewardState.checkin.brandTitle}</h2>
+                      <p className="mt-1 text-sm text-amber-900/70 dark:text-amber-100/70">{rewardState.checkin.brandDescription || '管理员开启后可领取每日额度。'}</p>
+                    </div>
+                    <div className="p-4">
+                      <div className="flex items-center justify-between gap-3 rounded-md bg-gray-50 p-3 dark:bg-white/[0.04]">
+                        <div>
+                          <div className="text-xs font-semibold text-gray-500">状态</div>
+                          <div className="mt-1 text-sm font-black">{getCheckinStatusLabel(rewardState.checkin)}</div>
+                        </div>
+                        {rewardState.checkin.enabled ? (
+                          <button
+                            type="button"
+                            onClick={() => void handleCheckin()}
+                            disabled={!rewardState.checkin.canCheckIn || checkinBusy}
+                            className="rounded-md bg-amber-500 px-4 py-2 text-sm font-black text-white transition hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {checkinBusy ? '盖章中' : '签到领取'}
+                          </button>
+                        ) : (
+                          <span className="rounded-md bg-gray-200 px-3 py-2 text-xs font-bold text-gray-500 dark:bg-white/[0.08]">暂未开放</span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid gap-4 xl:grid-cols-2">
+                  <div className="rounded-lg border border-gray-200 bg-white shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
+                    <div className="border-b border-gray-200 px-4 py-3 dark:border-white/[0.08]">
+                      <h2 className="text-sm font-black">兑换记录</h2>
+                      <p className="mt-1 text-xs text-gray-500">最近 8 次兑换，完整入账信息可在流水里搜索。</p>
+                    </div>
+                    <div className="divide-y divide-gray-100 dark:divide-white/[0.06]">
+                      {rewardState.myRedemptions.length === 0 ? (
+                        <div className="p-4 text-sm text-gray-500">还没有兑换记录。</div>
+                      ) : rewardState.myRedemptions.map((item) => (
+                        <div key={item.id} className="flex items-center justify-between gap-3 px-4 py-3 text-sm">
+                          <div className="min-w-0">
+                            <div className="truncate font-black">{item.name || item.code || '兑换码'}</div>
+                            <div className="mt-0.5 font-mono text-xs text-gray-400">{item.code || item.codeId} · {formatFullDate(item.createdAt)}</div>
+                          </div>
+                          <div className="shrink-0 text-base font-black text-emerald-600 dark:text-emerald-400">+{item.quotaAmount} 点</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border border-gray-200 bg-white shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
+                    <div className="border-b border-gray-200 px-4 py-3 dark:border-white/[0.08]">
+                      <h2 className="text-sm font-black">签到记录</h2>
+                      <p className="mt-1 text-xs text-gray-500">最近 8 次签到奖励，冷却和 IP 限制由后端判断。</p>
+                    </div>
+                    <div className="divide-y divide-gray-100 dark:divide-white/[0.06]">
+                      {rewardState.myCheckins.length === 0 ? (
+                        <div className="p-4 text-sm text-gray-500">还没有签到记录。</div>
+                      ) : rewardState.myCheckins.map((item) => (
+                        <div key={item.id} className="flex items-center justify-between gap-3 px-4 py-3 text-sm">
+                          <div>
+                            <div className="font-black">每日签到</div>
+                            <div className="mt-0.5 text-xs text-gray-400">{formatFullDate(item.createdAt)}</div>
+                          </div>
+                          <div className="text-base font-black text-emerald-600 dark:text-emerald-400">+{item.quotaAmount} 点</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                {isAdmin && (
+                  <div className="grid gap-4 xl:grid-cols-[390px_1fr]">
+                    <div className="rounded-lg border border-gray-200 bg-white shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
+                      <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3 dark:border-white/[0.08]">
+                        <div>
+                          <h2 className="text-sm font-black">兑换码列表</h2>
+                          <p className="mt-1 text-xs text-gray-500">删除会关闭并隐藏兑换码，历史限制仍保留。</p>
+                        </div>
+                        <button onClick={handleCreateRewardCode} className="rounded-md bg-gray-900 px-2.5 py-1.5 text-xs font-bold text-white transition hover:bg-gray-700 dark:bg-white dark:text-gray-950">
+                          新增
+                        </button>
+                      </div>
+                      <div className="max-h-[520px] overflow-auto p-2">
+                        {rewardState.rewardCodes.length === 0 ? (
+                          <div className="rounded-lg border border-dashed border-gray-200 p-6 text-sm text-gray-500 dark:border-white/[0.08]">
+                            还没有兑换码。
+                          </div>
+                        ) : rewardState.rewardCodes.map((code) => {
+                          const isSelected = selectedRewardCode?.id === code.id
+                          return (
+                            <button
+                              key={code.id}
+                              type="button"
+                              onClick={() => setSelectedRewardCodeId(code.id)}
+                              className={`mb-2 w-full rounded-lg border p-3 text-left transition ${isSelected ? 'border-cyan-400 bg-cyan-50 dark:border-cyan-500/60 dark:bg-cyan-500/10' : 'border-gray-200 bg-white hover:bg-gray-50 dark:border-white/[0.08] dark:bg-transparent dark:hover:bg-white/[0.04]'}`}
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                <div className="min-w-0">
+                                  <div className="truncate text-sm font-black">{code.name}</div>
+                                  <div className="mt-0.5 font-mono text-xs text-gray-400">{code.code}</div>
+                                </div>
+                                <span className={`shrink-0 rounded-md px-2 py-1 text-xs font-bold ${code.active ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300' : 'bg-gray-100 text-gray-500 dark:bg-white/[0.06] dark:text-gray-400'}`}>
+                                  {code.active ? '启用' : '关闭'}
+                                </span>
+                              </div>
+                              <div className="mt-2 flex items-center justify-between text-xs text-gray-500">
+                                <span>+{code.quotaAmount} 点</span>
+                                <span>{code.redeemedCount} / {formatLimit(code.totalLimit)}</span>
+                              </div>
+                            </button>
+                          )
+                        })}
+                      </div>
+                    </div>
+
+                    <div className="space-y-4">
+                      <div className="rounded-lg border border-gray-200 bg-white shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
+                        <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3 dark:border-white/[0.08]">
+                          <div>
+                            <h2 className="text-sm font-black">兑换码详情</h2>
+                            <p className="mt-1 text-xs text-gray-500">次数限制为 0 时表示不限；所有限制都由后端校验。</p>
+                          </div>
+                          {selectedRewardCode && (
+                            <div className="flex gap-2">
+                              <button onClick={toggleSelectedRewardCode} className="rounded-md border border-gray-200 px-2.5 py-1.5 text-xs font-bold text-gray-600 transition hover:bg-gray-50 dark:border-white/[0.08] dark:text-gray-300 dark:hover:bg-white/[0.06]">
+                                {selectedRewardDraft?.active ? '关闭' : '启用'}
+                              </button>
+                              <button onClick={() => deleteRewardCode(selectedRewardCode.id)} className="rounded-md px-2.5 py-1.5 text-xs font-bold text-rose-500 transition hover:bg-rose-50 dark:hover:bg-rose-500/10">
+                                删除
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                        {selectedRewardCode && selectedRewardDraft ? (
+                          <div className="grid gap-4 p-4 lg:grid-cols-2">
+                            <label className="block">
+                              <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">兑换码</span>
+                              <input
+                                value={selectedRewardDraft.code}
+                                onChange={(event) => updateSelectedRewardDraft({ code: event.target.value.toUpperCase() })}
+                                onBlur={commitSelectedRewardDraft}
+                                className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 font-mono text-sm font-black outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                              />
+                            </label>
+                            <NumberField label="发放额度" value={selectedRewardDraft.quotaAmount} min={1} onChange={(value) => updateSelectedRewardDraft({ quotaAmount: value })} onBlur={commitSelectedRewardDraft} />
+                            <label className="block lg:col-span-2">
+                              <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">名称</span>
+                              <input
+                                value={selectedRewardDraft.name}
+                                onChange={(event) => updateSelectedRewardDraft({ name: event.target.value })}
+                                onBlur={commitSelectedRewardDraft}
+                                className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm font-black outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                              />
+                            </label>
+                            <label className="block lg:col-span-2">
+                              <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">说明</span>
+                              <textarea
+                                value={selectedRewardDraft.description}
+                                onChange={(event) => updateSelectedRewardDraft({ description: event.target.value })}
+                                onBlur={commitSelectedRewardDraft}
+                                rows={3}
+                                className="w-full resize-none rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                              />
+                            </label>
+                            <NumberField label="总兑换上限" value={selectedRewardDraft.totalLimit} min={0} onChange={(value) => updateSelectedRewardDraft({ totalLimit: value })} onBlur={commitSelectedRewardDraft} />
+                            <NumberField label="每账号上限" value={selectedRewardDraft.perUserLimit} min={0} onChange={(value) => updateSelectedRewardDraft({ perUserLimit: value })} onBlur={commitSelectedRewardDraft} />
+                            <NumberField label="每 IP 上限" value={selectedRewardDraft.perIpLimit} min={0} onChange={(value) => updateSelectedRewardDraft({ perIpLimit: value })} onBlur={commitSelectedRewardDraft} />
+                            <div className="rounded-md bg-gray-50 p-3 text-xs text-gray-500 dark:bg-white/[0.04]">
+                              已兑换 <span className="font-black text-gray-900 dark:text-gray-100">{selectedRewardCode.redeemedCount}</span> 次
+                            </div>
+                            <label className="block">
+                              <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">开始时间</span>
+                              <input
+                                type="datetime-local"
+                                value={selectedRewardDraft.startsAt ? toDateTimeLocal(selectedRewardDraft.startsAt) : ''}
+                                onChange={(event) => updateSelectedRewardDraft({ startsAt: fromDateTimeLocal(event.target.value) })}
+                                onBlur={commitSelectedRewardDraft}
+                                className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                              />
+                            </label>
+                            <label className="block">
+                              <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">结束时间</span>
+                              <input
+                                type="datetime-local"
+                                value={selectedRewardDraft.expiresAt ? toDateTimeLocal(selectedRewardDraft.expiresAt) : ''}
+                                onChange={(event) => updateSelectedRewardDraft({ expiresAt: fromDateTimeLocal(event.target.value) })}
+                                onBlur={commitSelectedRewardDraft}
+                                className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                              />
+                            </label>
+                          </div>
+                        ) : (
+                          <div className="p-6 text-sm text-gray-500">选择或新增一个兑换码。</div>
+                        )}
+                      </div>
+
+                      <div className="rounded-lg border border-gray-200 bg-white shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
+                        <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3 dark:border-white/[0.08]">
+                          <div>
+                            <h2 className="text-sm font-black">签到配置</h2>
+                            <p className="mt-1 text-xs text-gray-500">开启后普通用户会看到签到按钮。</p>
+                          </div>
+                          <button onClick={commitCheckinDraft} className="rounded-md bg-gray-900 px-3 py-2 text-xs font-bold text-white transition hover:bg-gray-700 dark:bg-white dark:text-gray-950">
+                            保存
+                          </button>
+                        </div>
+                        <div className="grid gap-4 p-4 lg:grid-cols-2">
+                          <label className="flex items-center justify-between gap-3 rounded-md border border-gray-200 px-3 py-2 dark:border-white/[0.08] lg:col-span-2">
+                            <span>
+                              <span className="block text-xs font-semibold text-gray-500 dark:text-gray-400">启用签到</span>
+                              <span className="mt-1 block text-xs text-gray-400">关闭后普通用户只会看到暂未开放状态。</span>
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => setCheckinDraft((draft) => ({ ...draft, enabled: !draft.enabled }))}
+                              className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${checkinDraft.enabled ? 'bg-amber-500' : 'bg-gray-300 dark:bg-gray-600'}`}
+                              aria-pressed={checkinDraft.enabled}
+                            >
+                              <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${checkinDraft.enabled ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                            </button>
+                          </label>
+                          <label className="block lg:col-span-2">
+                            <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">展示标题</span>
+                            <input
+                              value={checkinDraft.brandTitle}
+                              onChange={(event) => setCheckinDraft((draft) => ({ ...draft, brandTitle: event.target.value }))}
+                              className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm font-black outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                            />
+                          </label>
+                          <label className="block lg:col-span-2">
+                            <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">展示说明</span>
+                            <textarea
+                              value={checkinDraft.brandDescription}
+                              onChange={(event) => setCheckinDraft((draft) => ({ ...draft, brandDescription: event.target.value }))}
+                              rows={2}
+                              className="w-full resize-none rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                            />
+                          </label>
+                          <NumberField label="签到额度" value={checkinDraft.quotaAmount} min={1} onChange={(value) => setCheckinDraft((draft) => ({ ...draft, quotaAmount: value }))} />
+                          <NumberField label="冷却小时" value={checkinDraft.cooldownHours} min={1} onChange={(value) => setCheckinDraft((draft) => ({ ...draft, cooldownHours: value }))} />
+                          <NumberField label="单 IP 每日上限" value={checkinDraft.perIpDailyLimit} min={0} onChange={(value) => setCheckinDraft((draft) => ({ ...draft, perIpDailyLimit: value }))} />
+                          <div className="rounded-md bg-gray-50 p-3 text-xs leading-5 text-gray-500 dark:bg-white/[0.04]">
+                            当前状态：{getCheckinStatusLabel(rewardState.checkin)}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 
