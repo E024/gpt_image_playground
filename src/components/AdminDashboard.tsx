@@ -1449,7 +1449,7 @@ export default function AdminDashboard() {
                             </div>
                           </div>
 
-                          <div className="mt-4 grid gap-2 text-xs sm:grid-cols-2 xl:grid-cols-4">
+                          <div className={`mt-4 grid gap-2 text-xs sm:grid-cols-2 ${isAdmin ? 'xl:grid-cols-4' : 'xl:grid-cols-2'}`}>
                             <div className="rounded-md bg-gray-50 p-3 dark:bg-white/[0.04]">
                               <div className="font-semibold text-gray-500 dark:text-gray-400">扣费公式</div>
                               <div className="mt-1 font-black">{entry.units > 0 ? `${entry.units} × ${entry.unitCost} = ${entry.amount} 点` : `${entry.amount} 点`}</div>
@@ -1458,16 +1458,20 @@ export default function AdminDashboard() {
                               <div className="font-semibold text-gray-500 dark:text-gray-400">套餐 / 分组</div>
                               <div className="mt-1 truncate font-black">{entry.planName || '未记录套餐'} / {entry.groupName || '未记录分组'}</div>
                             </div>
-                            <div className="rounded-md bg-gray-50 p-3 dark:bg-white/[0.04]">
-                              <div className="font-semibold text-gray-500 dark:text-gray-400">模型</div>
-                              <div className="mt-1 truncate font-black">{entry.apiModel || '无模型快照'}</div>
-                            </div>
-                            <div className="rounded-md bg-gray-50 p-3 dark:bg-white/[0.04]">
-                              <div className="font-semibold text-gray-500 dark:text-gray-400">接口</div>
-                              <div className="mt-1 truncate font-black">{entry.apiProvider || 'admin'}{entry.apiMode ? ` · ${entry.apiMode}` : ''}</div>
-                            </div>
+                            {isAdmin && (
+                              <>
+                                <div className="rounded-md bg-gray-50 p-3 dark:bg-white/[0.04]">
+                                  <div className="font-semibold text-gray-500 dark:text-gray-400">模型</div>
+                                  <div className="mt-1 truncate font-black">{entry.apiModel || '无模型快照'}</div>
+                                </div>
+                                <div className="rounded-md bg-gray-50 p-3 dark:bg-white/[0.04]">
+                                  <div className="font-semibold text-gray-500 dark:text-gray-400">接口</div>
+                                  <div className="mt-1 truncate font-black">{entry.apiProvider || 'admin'}{entry.apiMode ? ` · ${entry.apiMode}` : ''}</div>
+                                </div>
+                              </>
+                            )}
                           </div>
-                          {entry.apiBaseUrl && (
+                          {isAdmin && entry.apiBaseUrl && (
                             <div className="mt-2 truncate rounded-md border border-gray-100 px-3 py-2 font-mono text-xs text-gray-500 dark:border-white/[0.06] dark:text-gray-400">
                               {entry.apiBaseUrl}
                             </div>

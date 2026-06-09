@@ -376,17 +376,33 @@ function getActiveProfile(settings) {
   return profiles.find((profile) => profile.id === activeProfileId) ?? profiles[0] ?? createDefaultApiSettings().profiles[0]
 }
 
+function getRuntimeCustomProviders(settings, profile) {
+  if (profile.provider === 'openai' || profile.provider === 'fal') return []
+  return Array.isArray(settings.customProviders)
+    ? settings.customProviders.filter((provider) => isRecord(provider) && provider.id === profile.provider)
+    : []
+}
+
 function createRuntimeApiSettings(settings, authSession) {
   const profile = getActiveProfile(settings)
+  const provider = typeof profile.provider === 'string' ? profile.provider : 'openai'
   const runtimeProfile = {
-    ...profile,
+    id: typeof profile.id === 'string' ? profile.id : 'backend-openai-default',
+    name: typeof profile.name === 'string' ? profile.name : 'Backend OpenAI',
+    provider,
     baseUrl: BACKEND_UPSTREAM_BASE_URL,
     apiKey: authSession?.token ?? '',
+    model: typeof profile.model === 'string' ? profile.model : DEFAULT_IMAGE_MODEL,
+    timeout: Number.isFinite(Number(profile.timeout)) ? Number(profile.timeout) : DEFAULT_API_TIMEOUT,
+    apiMode: profile.apiMode === 'responses' ? 'responses' : 'images',
+    codexCli: Boolean(profile.codexCli),
     apiProxy: false,
+    responseFormatB64Json: Boolean(profile.responseFormatB64Json),
+    streamImages: Boolean(profile.streamImages),
+    streamPartialImages: Number.isFinite(Number(profile.streamPartialImages)) ? Number(profile.streamPartialImages) : DEFAULT_STREAM_PARTIAL_IMAGES,
   }
 
   return {
-    ...settings,
     baseUrl: runtimeProfile.baseUrl,
     apiKey: runtimeProfile.apiKey,
     model: runtimeProfile.model,
@@ -396,9 +412,21 @@ function createRuntimeApiSettings(settings, authSession) {
     apiProxy: false,
     streamImages: runtimeProfile.streamImages,
     streamPartialImages: runtimeProfile.streamPartialImages,
-    customProviders: Array.isArray(settings.customProviders) ? settings.customProviders : [],
-    providerOrder: Array.isArray(settings.providerOrder) ? settings.providerOrder : [],
+    customProviders: getRuntimeCustomProviders(settings, runtimeProfile),
+    providerOrder: [runtimeProfile.provider],
+    clearInputAfterSubmit: Boolean(settings.clearInputAfterSubmit),
+    persistInputOnRestart: settings.persistInputOnRestart !== false,
     reuseTaskApiProfileTemporarily: false,
+    alwaysShowRetryButton: Boolean(settings.alwaysShowRetryButton),
+    taskCompletionNotification: Boolean(settings.taskCompletionNotification),
+    enterSubmit: Boolean(settings.enterSubmit),
+    referenceImageEditAction: settings.referenceImageEditAction === 'replace-reference' || settings.referenceImageEditAction === 'add-mask'
+      ? settings.referenceImageEditAction
+      : 'ask',
+    zipDownloadRoutes: Array.isArray(settings.zipDownloadRoutes) ? settings.zipDownloadRoutes.map(String) : [],
+    agentScrollToBottomAfterSubmit: settings.agentScrollToBottomAfterSubmit !== false,
+    agentMaxToolRounds: Number.isFinite(Number(settings.agentMaxToolRounds)) ? Number(settings.agentMaxToolRounds) : DEFAULT_AGENT_MAX_TOOL_ROUNDS,
+    agentWebSearch: Boolean(settings.agentWebSearch),
     profiles: [runtimeProfile],
     activeProfileId: runtimeProfile.id,
   }
@@ -430,11 +458,16 @@ function getHeaderValue(headers, name) {
   return typeof value === 'string' ? value : Array.isArray(value) ? value.join(', ') : ''
 }
 
-function getProxyResponseHeaders(response) {
+function getProxyResponseHeaders(response, includeUpstreamHeaders) {
   const headers = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-User-Id, X-Session-Token',
     'Access-Control-Allow-Methods': 'GET, POST, PATCH, PUT, DELETE, OPTIONS',
+  }
+  if (!includeUpstreamHeaders) {
+    const contentType = response.headers.get('content-type')
+    if (contentType) headers['Content-Type'] = contentType
+    return headers
   }
   for (const [key, value] of response.headers.entries()) {
     const lower = key.toLowerCase()
@@ -470,7 +503,13 @@ function getJsonErrorMessage(value) {
   return ''
 }
 
-async function getUpstreamErrorPayload(response, upstreamUrl) {
+async function getUpstreamErrorPayload(response, upstreamUrl, includeDiagnostics) {
+  if (!includeDiagnostics) {
+    return {
+      error: `生成接口返回 HTTP ${response.status}，请联系管理员检查后台 API 配置。`,
+      upstreamStatus: response.status,
+    }
+  }
   const text = await response.text().catch(() => '')
   let message = ''
   if (text.trim()) {
@@ -492,13 +531,14 @@ async function getUpstreamErrorPayload(response, upstreamUrl) {
 async function proxyUpstream(req, res, actor, upstreamPath, search) {
   const settings = getApiSettings()
   const profile = getActiveProfile(settings)
+  const admin = canManage(actor)
   const endpointPath = upstreamPath.replace(/^\/+/, '').replace(/^v1\//, '')
-  if (profile.provider === 'fal') return json(res, 400, { error: '后台统一代理暂不支持 fal.ai 配置，请在管理员后台切换为 OpenAI 或兼容接口。' })
+  if (profile.provider === 'fal') return json(res, 400, { error: admin ? '后台统一代理暂不支持 fal.ai 配置，请在管理员后台切换为 OpenAI 或兼容接口。' : '当前后台接口配置不可用，请联系管理员检查。' })
   if (endpointPath.startsWith('responses') && actor.canUseAgent === false) {
     return json(res, 403, { error: '当前账号未开通 Agent 权限' })
   }
-  if (typeof profile.apiKey !== 'string' || !profile.apiKey.trim()) return json(res, 400, { error: '管理员尚未配置 API Key' })
-  if (typeof profile.baseUrl !== 'string' || !profile.baseUrl.trim()) return json(res, 400, { error: '管理员尚未配置 API Base URL' })
+  if (typeof profile.apiKey !== 'string' || !profile.apiKey.trim()) return json(res, 400, { error: admin ? '管理员尚未配置 API Key' : '当前后台接口配置不可用，请联系管理员检查。' })
+  if (typeof profile.baseUrl !== 'string' || !profile.baseUrl.trim()) return json(res, 400, { error: admin ? '管理员尚未配置 API Base URL' : '当前后台接口配置不可用，请联系管理员检查。' })
 
   const headers = new Headers()
   const contentType = getHeaderValue(req.headers, 'content-type')
@@ -516,12 +556,12 @@ async function proxyUpstream(req, res, actor, upstreamPath, search) {
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error)
     console.error('Upstream API request failed:', detail)
-    return json(res, 502, { error: `上游 API 请求失败：${detail}` })
+    return json(res, 502, { error: admin ? `上游 API 请求失败：${detail}` : '生成接口暂时不可用，请联系管理员检查后台 API 配置。' })
   }
   if (!upstreamResponse.ok) {
-    return json(res, upstreamResponse.status, await getUpstreamErrorPayload(upstreamResponse, upstreamUrl))
+    return json(res, upstreamResponse.status, await getUpstreamErrorPayload(upstreamResponse, upstreamUrl, admin))
   }
-  res.writeHead(upstreamResponse.status, getProxyResponseHeaders(upstreamResponse))
+  res.writeHead(upstreamResponse.status, getProxyResponseHeaders(upstreamResponse, admin))
   res.end(Buffer.from(await upstreamResponse.arrayBuffer()))
 }
 
@@ -588,6 +628,16 @@ function rowToLedger(row) {
     apiBaseUrl: row.api_base_url,
     note: row.note,
     createdAt: row.created_at,
+  }
+}
+
+function redactLedgerEntry(entry) {
+  return {
+    ...entry,
+    apiProvider: '',
+    apiMode: '',
+    apiModel: '',
+    apiBaseUrl: '',
   }
 }
 
@@ -860,18 +910,29 @@ function getLedgerPage(actor, filters = {}) {
   const query = typeof filters.query === 'string' ? filters.query.trim() : ''
   if (query) {
     const like = `%${query}%`
-    clauses.push(`(
-      billing_ledger.id LIKE ?
-      OR billing_ledger.note LIKE ?
-      OR billing_ledger.plan_name LIKE ?
-      OR billing_ledger.group_name LIKE ?
-      OR billing_ledger.api_provider LIKE ?
-      OR billing_ledger.api_mode LIKE ?
-      OR billing_ledger.api_model LIKE ?
-      OR users.display_name LIKE ?
-      OR users.email LIKE ?
-    )`)
-    values.push(like, like, like, like, like, like, like, like, like)
+    if (admin) {
+      clauses.push(`(
+        billing_ledger.id LIKE ?
+        OR billing_ledger.note LIKE ?
+        OR billing_ledger.plan_name LIKE ?
+        OR billing_ledger.group_name LIKE ?
+        OR billing_ledger.api_provider LIKE ?
+        OR billing_ledger.api_mode LIKE ?
+        OR billing_ledger.api_model LIKE ?
+        OR billing_ledger.api_base_url LIKE ?
+        OR users.display_name LIKE ?
+        OR users.email LIKE ?
+      )`)
+      values.push(like, like, like, like, like, like, like, like, like, like)
+    } else {
+      clauses.push(`(
+        billing_ledger.id LIKE ?
+        OR billing_ledger.note LIKE ?
+        OR billing_ledger.plan_name LIKE ?
+        OR billing_ledger.group_name LIKE ?
+      )`)
+      values.push(like, like, like, like)
+    }
   }
 
   const fromClause = 'FROM billing_ledger LEFT JOIN users ON users.id = billing_ledger.user_id'
@@ -889,7 +950,10 @@ function getLedgerPage(actor, filters = {}) {
   `).all(...values, pageSize, offset)
 
   return {
-    entries: rows.map(rowToLedger),
+    entries: rows.map((row) => {
+      const entry = rowToLedger(row)
+      return admin ? entry : redactLedgerEntry(entry)
+    }),
     total,
     page,
     pageSize,
@@ -967,7 +1031,7 @@ function getState(actor, authSession = null) {
     billingLedger: ledger,
     authSession,
     setupRequired,
-    apiSettings: createRuntimeApiSettings(adminApiSettings, authSession),
+    apiSettings: actor ? createRuntimeApiSettings(adminApiSettings, authSession) : null,
     adminApiSettings: admin ? adminApiSettings : null,
     rewardState: getRewardState(actor),
   }
@@ -1441,9 +1505,10 @@ const server = http.createServer(async (req, res) => {
       if (!user) return json(res, 401, { error: '请重新登录' })
       if (source === 'agent' && user.canUseAgent === false) return json(res, 403, { error: '当前账号未开通 Agent 权限' })
       const activeProfile = getActiveProfile(getApiSettings())
-      if (typeof activeProfile.apiKey !== 'string' || !activeProfile.apiKey.trim()) return json(res, 400, { error: '管理员尚未配置 API Key' })
-      if (typeof activeProfile.baseUrl !== 'string' || !activeProfile.baseUrl.trim()) return json(res, 400, { error: '管理员尚未配置 API Base URL' })
-      if (source === 'agent' && (activeProfile.provider !== 'openai' || activeProfile.apiMode !== 'responses')) return json(res, 400, { error: '管理员尚未配置可用的 OpenAI Responses API' })
+      const admin = canManage(actor)
+      if (typeof activeProfile.apiKey !== 'string' || !activeProfile.apiKey.trim()) return json(res, 400, { error: admin ? '管理员尚未配置 API Key' : '当前后台接口配置不可用，请联系管理员检查。' })
+      if (typeof activeProfile.baseUrl !== 'string' || !activeProfile.baseUrl.trim()) return json(res, 400, { error: admin ? '管理员尚未配置 API Base URL' : '当前后台接口配置不可用，请联系管理员检查。' })
+      if (source === 'agent' && (activeProfile.provider !== 'openai' || activeProfile.apiMode !== 'responses')) return json(res, 400, { error: admin ? '管理员尚未配置可用的 OpenAI Responses API' : '当前 Agent 接口配置不可用，请联系管理员检查。' })
       const plan = db.prepare('SELECT * FROM plans WHERE id = ? AND group_id = ?').get(user.planId, user.groupId)
       if (!plan) return json(res, 400, { error: '当前套餐不属于用户分组，请联系管理员重新分配套餐。' })
       const unitCost = source === 'agent' ? plan.agent_turn_cost : plan.gallery_unit_cost
