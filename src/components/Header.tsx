@@ -42,11 +42,15 @@ export default function Header() {
   const historyButtonRef = useRef<HTMLButtonElement>(null)
   const createConversation = useStore((s) => s.createAgentConversation)
   const users = useStore((s) => s.users)
+  const groups = useStore((s) => s.groups)
   const plans = useStore((s) => s.plans)
   const authSession = useStore((s) => s.authSession)
   const logout = useStore((s) => s.logout)
   const currentUser = users.find((user) => user.id === authSession?.userId) ?? null
+  const currentGroup = groups.find((group) => group.id === currentUser?.groupId) ?? null
   const currentPlan = plans.find((plan) => plan.id === currentUser?.planId) ?? plans[0]
+  const currentGroupQuotaBalance = currentGroup?.quotaBalance ?? 0
+  const currentTotalQuotaBalance = (currentUser?.quotaBalance ?? 0) + currentGroupQuotaBalance
   const canOpenBackend = Boolean(currentUser)
   const canOpenAgent = canManagedUserUseAgent(currentUser)
 
@@ -278,7 +282,7 @@ export default function Header() {
                   <div className="text-gray-400">{currentPlan?.name ?? '未分配套餐'}</div>
                 </div>
                 <div className="rounded-md bg-cyan-50 px-2 py-1 font-black text-cyan-700 dark:bg-cyan-500/10 dark:text-cyan-300">
-                  {currentUser.quotaBalance} 点
+                  <span title={`分组 ${currentGroupQuotaBalance} 点 / 个人 ${currentUser.quotaBalance} 点`}>{currentTotalQuotaBalance} 点</span>
                 </div>
               </div>
             )}

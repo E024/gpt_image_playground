@@ -18,7 +18,10 @@ import type {
   ResponsesOutputItem,
   AuthSession,
   BillingLedgerEntry,
+  EmailSettings,
+  EmailVerificationState,
   ManagedUser,
+  QuotaDeductionPriority,
   RewardCode,
   RewardState,
   UserGroup,
@@ -74,9 +77,12 @@ import {
   backendRegister,
   backendRedeemRewardCode,
   backendSetUserQuota,
+  backendSyncManagementApiConfig,
   backendUpdateCheckinSettings,
   backendUpdateApiSettings,
+  backendUpdateEmailSettings,
   backendUpdateGroup,
+  backendUpdateMyQuotaPriority,
   backendUpdatePlan,
   backendUpdateRewardCode,
   backendUpdateUser,
@@ -84,6 +90,7 @@ import {
   type RewardCodeInput,
   type BackendState,
 } from './lib/backendApi'
+import { DEFAULT_EMAIL_SETTINGS } from './lib/emailSettings'
 import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate'
 
 export const ALL_FAVORITES_COLLECTION_ID = '__all_favorites__'
@@ -125,6 +132,7 @@ const DEFAULT_GROUPS: UserGroup[] = [
     name: '默认分组',
     description: '现有用户和套餐的默认分组。',
     accent: 'cyan',
+    quotaBalance: 0,
     createdAt: 1,
     updatedAt: 1,
   },
@@ -191,6 +199,9 @@ const BACKEND_MANAGED_SETTING_KEYS: Array<keyof AppSettings> = [
   'apiProxy',
   'streamImages',
   'streamPartialImages',
+  'managementConfigUrl',
+  'managementConfigAuthToken',
+  'managementConfigUpdatedAt',
   'customProviders',
   'providerOrder',
   'reuseTaskApiProfileTemporarily',
@@ -917,6 +928,8 @@ function mergePersistedState(persistedState: unknown, currentState: AppState): A
     setupRequired: currentState.setupRequired,
     billingLedger: [],
     rewardState: DEFAULT_REWARD_STATE,
+    emailSettings: null,
+    emailVerification: null,
     activeFavoriteCollectionId: null,
     favoritePickerTaskIds: null,
     supportPromptDismissed: Boolean(persisted.supportPromptDismissed),
@@ -941,6 +954,9 @@ interface AppState {
   setSettings: (s: Partial<AppSettings>) => void
   adminApiSettings: AppSettings | null
   updateApiSettings: (settings: AppSettings) => Promise<void>
+  syncManagementApiConfig: (input: { url?: string; authToken?: string }) => Promise<boolean>
+  emailSettings: EmailSettings | null
+  updateEmailSettings: (settings: EmailSettings) => Promise<void>
   dismissedCodexCliPrompts: string[]
   dismissCodexCliPrompt: (key: string) => void
 
@@ -953,6 +969,7 @@ interface AppState {
   authSession: AuthSession | null
   authReady: boolean
   setupRequired: boolean
+  emailVerification: EmailVerificationState | null
   login: (email: string, password: string) => Promise<boolean>
   register: (input: { email: string; password: string; displayName: string }) => Promise<boolean>
   syncBackendState: () => Promise<void>
@@ -960,7 +977,8 @@ interface AppState {
   createGroup: (input: Omit<UserGroup, 'id' | 'createdAt' | 'updatedAt'>) => void
   updateGroup: (groupId: string, patch: Partial<Omit<UserGroup, 'id' | 'createdAt' | 'updatedAt'>>) => void
   deleteGroup: (groupId: string) => void
-  updateManagedUser: (userId: string, patch: Partial<Pick<ManagedUser, 'displayName' | 'role' | 'groupId' | 'planId' | 'canUseAgent'>>) => void
+  updateManagedUser: (userId: string, patch: Partial<Pick<ManagedUser, 'displayName' | 'role' | 'groupId' | 'planId' | 'canUseAgent' | 'quotaDeductionPriority'>>) => void
+  updateMyQuotaDeductionPriority: (priority: QuotaDeductionPriority) => Promise<void>
   grantUserQuota: (userId: string, amount: number, note?: string) => void
   setUserQuotaBalance: (userId: string, balance: number, note?: string) => void
   createPlan: (input: Omit<UserPlan, 'id'>) => void
@@ -1155,6 +1173,10 @@ function normalizeEmail(value: string) {
   return value.trim().toLowerCase()
 }
 
+function normalizeQuotaDeductionPriority(value: unknown): QuotaDeductionPriority {
+  return value === 'personal_first' ? 'personal_first' : 'group_first'
+}
+
 function normalizeGroups(value: unknown): UserGroup[] {
   if (!Array.isArray(value)) return DEFAULT_GROUPS
   const groups: UserGroup[] = []
@@ -1170,6 +1192,7 @@ function normalizeGroups(value: unknown): UserGroup[] {
       name: name.slice(0, 40),
       description: typeof item.description === 'string' ? item.description : '',
       accent: typeof item.accent === 'string' ? item.accent : 'cyan',
+      quotaBalance: normalizeNonNegativeInteger(item.quotaBalance, 0),
       createdAt: normalizeTimestamp(item.createdAt),
       updatedAt: normalizeTimestamp(item.updatedAt),
     })
@@ -1230,6 +1253,7 @@ function normalizeUsers(value: unknown, plans: UserPlan[], groups: UserGroup[]):
       groupId,
       planId,
       quotaBalance: normalizeNonNegativeInteger(item.quotaBalance, 0),
+      quotaDeductionPriority: normalizeQuotaDeductionPriority(item.quotaDeductionPriority),
       totalQuotaUsed: normalizeNonNegativeInteger(item.totalQuotaUsed, 0),
       canUseAgent: typeof item.canUseAgent === 'boolean' ? item.canUseAgent : true,
       createdAt: normalizeTimestamp(item.createdAt),
@@ -1263,6 +1287,13 @@ function normalizeBillingLedger(value: unknown, users: ManagedUser[]): BillingLe
         unitCost: normalizeNonNegativeInteger(item.unitCost, 0),
         balanceBefore: normalizeNonNegativeInteger(item.balanceBefore, 0),
         balanceAfter: normalizeNonNegativeInteger(item.balanceAfter, 0),
+        personalAmount: normalizeNonNegativeInteger(item.personalAmount, 0),
+        groupAmount: normalizeNonNegativeInteger(item.groupAmount, 0),
+        personalBalanceBefore: normalizeNonNegativeInteger(item.personalBalanceBefore, 0),
+        personalBalanceAfter: normalizeNonNegativeInteger(item.personalBalanceAfter, 0),
+        groupBalanceBefore: normalizeNonNegativeInteger(item.groupBalanceBefore, 0),
+        groupBalanceAfter: normalizeNonNegativeInteger(item.groupBalanceAfter, 0),
+        deductionPriority: normalizeQuotaDeductionPriority(item.deductionPriority),
         planId: typeof item.planId === 'string' ? item.planId : '',
         planName: typeof item.planName === 'string' ? item.planName : '',
         groupId: typeof item.groupId === 'string' ? item.groupId : '',
@@ -1365,6 +1396,38 @@ function normalizeRewardState(value: unknown): RewardState {
   }
 }
 
+function normalizeEmailSettings(value: unknown): EmailSettings | null {
+  if (!isRecord(value)) return null
+  return {
+    enabled: typeof value.enabled === 'boolean' ? value.enabled : false,
+    smtpHost: typeof value.smtpHost === 'string' ? value.smtpHost : '',
+    smtpPort: Math.max(1, normalizeNonNegativeInteger(value.smtpPort, DEFAULT_EMAIL_SETTINGS.smtpPort)),
+    smtpSecure: typeof value.smtpSecure === 'boolean' ? value.smtpSecure : false,
+    smtpUser: typeof value.smtpUser === 'string' ? value.smtpUser : '',
+    smtpPassword: typeof value.smtpPassword === 'string' ? value.smtpPassword : '',
+    hasSmtpPassword: typeof value.hasSmtpPassword === 'boolean' ? value.hasSmtpPassword : false,
+    fromEmail: typeof value.fromEmail === 'string' ? value.fromEmail : '',
+    fromName: typeof value.fromName === 'string' && value.fromName.trim() ? value.fromName.trim() : DEFAULT_EMAIL_SETTINGS.fromName,
+    brandName: typeof value.brandName === 'string' && value.brandName.trim() ? value.brandName.trim() : DEFAULT_EMAIL_SETTINGS.brandName,
+    appBaseUrl: typeof value.appBaseUrl === 'string' ? value.appBaseUrl : '',
+    verificationExpiresMinutes: Math.max(1, normalizeNonNegativeInteger(value.verificationExpiresMinutes, DEFAULT_EMAIL_SETTINGS.verificationExpiresMinutes)),
+    verificationSubject: typeof value.verificationSubject === 'string' && value.verificationSubject.trim() ? value.verificationSubject : DEFAULT_EMAIL_SETTINGS.verificationSubject,
+    verificationText: typeof value.verificationText === 'string' ? value.verificationText : DEFAULT_EMAIL_SETTINGS.verificationText,
+    verificationHtml: typeof value.verificationHtml === 'string' ? value.verificationHtml : DEFAULT_EMAIL_SETTINGS.verificationHtml,
+  }
+}
+
+function normalizeEmailVerification(value: unknown): EmailVerificationState | null {
+  if (!isRecord(value)) return null
+  const email = typeof value.email === 'string' ? normalizeEmail(value.email) : ''
+  if (!email) return null
+  return {
+    required: value.required !== false,
+    email,
+    expiresAt: normalizeTimestamp(value.expiresAt),
+  }
+}
+
 function normalizeAuthSession(value: unknown): AuthSession | null {
   if (!isRecord(value) || typeof value.userId !== 'string') return null
   if (typeof value.token !== 'string' || !value.token) return null
@@ -1405,6 +1468,8 @@ function applyBackendStatePatch(state: BackendState) {
     setupRequired: Boolean(state.setupRequired),
     ...(apiSettings ? { settings: apiSettings } : {}),
     adminApiSettings: state.adminApiSettings ? normalizeSettings(state.adminApiSettings) : null,
+    emailSettings: normalizeEmailSettings(state.emailSettings),
+    emailVerification: normalizeEmailVerification(state.emailVerification),
   })
 }
 
@@ -1727,12 +1792,31 @@ export const useStore = create<AppState>()(
         }
       }),
       adminApiSettings: null,
+      emailSettings: null,
       updateApiSettings: async (settings) => {
         try {
           applyBackendStatePatch(await backendUpdateApiSettings(normalizeSettings(settings), get().authSession))
           get().showToast('API 与 Agent 配置已保存', 'success')
         } catch (error) {
           get().showToast(error instanceof Error ? error.message : '保存 API 配置失败', 'error')
+        }
+      },
+      syncManagementApiConfig: async (input) => {
+        try {
+          applyBackendStatePatch(await backendSyncManagementApiConfig(input, get().authSession))
+          get().showToast('管理配置已同步', 'success')
+          return true
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '同步管理配置失败', 'error')
+          return false
+        }
+      },
+      updateEmailSettings: async (settings) => {
+        try {
+          applyBackendStatePatch(await backendUpdateEmailSettings(settings, get().authSession))
+          get().showToast('邮箱验证配置已保存', 'success')
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '保存邮箱配置失败', 'error')
         }
       },
       dismissedCodexCliPrompts: [],
@@ -1748,6 +1832,7 @@ export const useStore = create<AppState>()(
       plans: DEFAULT_PLANS,
       billingLedger: [],
       rewardState: DEFAULT_REWARD_STATE,
+      emailVerification: null,
       authSession: null,
       authReady: true,
       setupRequired: true,
@@ -1755,6 +1840,7 @@ export const useStore = create<AppState>()(
         try {
           const state = await backendLogin(email, password)
           applyBackendStatePatch(state)
+          set({ emailVerification: null })
           get().showToast('欢迎回到画廊控制台', 'success')
           return true
         } catch (error) {
@@ -1766,8 +1852,7 @@ export const useStore = create<AppState>()(
         try {
           const state = await backendRegister({ email, password, displayName })
           applyBackendStatePatch(state)
-          const current = state.users.find((user) => user.id === state.authSession?.userId)
-          get().showToast(current?.role === 'admin' ? '首位用户已设为管理员' : '账号已创建', 'success')
+          get().showToast('验证邮件已发送，请点击邮件中的专属链接完成注册', 'success')
           return true
         } catch (error) {
           get().showToast(error instanceof Error ? error.message : '注册失败', 'error')
@@ -1785,6 +1870,8 @@ export const useStore = create<AppState>()(
             users: [],
             billingLedger: [],
             rewardState: DEFAULT_REWARD_STATE,
+            emailSettings: null,
+            emailVerification: null,
             authSession: null,
             adminApiSettings: null,
             settings: getPersistableSettings(get().settings),
@@ -1801,6 +1888,8 @@ export const useStore = create<AppState>()(
           users: [],
           billingLedger: [],
           rewardState: DEFAULT_REWARD_STATE,
+          emailSettings: null,
+          emailVerification: null,
           appMode: 'gallery',
           adminApiSettings: null,
           settings: getPersistableSettings(get().settings),
@@ -1838,6 +1927,14 @@ export const useStore = create<AppState>()(
           applyBackendStatePatch(await backendUpdateUser(userId, patch, get().authSession))
         } catch (error) {
           get().showToast(error instanceof Error ? error.message : '更新用户失败', 'error')
+        }
+      },
+      updateMyQuotaDeductionPriority: async (priority) => {
+        try {
+          applyBackendStatePatch(await backendUpdateMyQuotaPriority(priority, get().authSession))
+          get().showToast('扣费顺序已保存', 'success')
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '保存扣费顺序失败', 'error')
         }
       },
       grantUserQuota: async (userId, amount, note = '管理员发放额度') => {

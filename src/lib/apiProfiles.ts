@@ -19,6 +19,7 @@ import { readRuntimeEnv } from './runtimeEnv'
 import { isImportableConfigUrl } from './customProviderConfigUrl'
 
 const OPENAI_DEFAULT_BASE_URL = 'https://api.openai.com/v1'
+const DEFAULT_MANAGEMENT_CONFIG_URL = 'https://cpajp.cloud1024.com/v0/management/config.yaml'
 const RAW_DEFAULT_API_URL = readRuntimeEnv(import.meta.env.VITE_DEFAULT_API_URL)
 const DEFAULT_OPENAI_API_PROXY = readRuntimeEnv(import.meta.env.VITE_API_PROXY_AVAILABLE) === 'true'
 const DOCKER_DEPLOYMENT = readRuntimeEnv(import.meta.env.VITE_DOCKER_DEPLOYMENT) === 'true'
@@ -515,6 +516,11 @@ export function normalizeSettings(input: Partial<AppSettings> | unknown): AppSet
     apiProxy: active.apiProxy,
     streamImages: active.streamImages,
     streamPartialImages: active.streamPartialImages,
+    managementConfigUrl: typeof record.managementConfigUrl === 'string' && record.managementConfigUrl.trim()
+      ? record.managementConfigUrl.trim()
+      : DEFAULT_MANAGEMENT_CONFIG_URL,
+    managementConfigAuthToken: typeof record.managementConfigAuthToken === 'string' ? record.managementConfigAuthToken : '',
+    managementConfigUpdatedAt: typeof record.managementConfigUpdatedAt === 'number' && Number.isFinite(record.managementConfigUpdatedAt) ? record.managementConfigUpdatedAt : undefined,
     customProviders,
     providerOrder: Array.isArray(record.providerOrder) ? record.providerOrder.map(String) : undefined,
     clearInputAfterSubmit: typeof record.clearInputAfterSubmit === 'boolean' ? record.clearInputAfterSubmit : false,

@@ -3,6 +3,8 @@ import { mkdirSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { createHash, randomBytes } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
+import nodemailer from 'nodemailer'
+import { parse as parseYaml } from 'yaml'
 
 const port = Number(process.env.BACKEND_API_PORT || 3018)
 const host = process.env.BACKEND_API_HOST || '127.0.0.1'
@@ -10,6 +12,9 @@ const dbPath = resolve(process.env.BACKEND_SQLITE_PATH || 'data/backend.sqlite')
 const AUTH_HASH_VERSION = 'sha256-v1'
 const SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1000
 const DEFAULT_GROUP_ID = 'default'
+const ACCENT_VALUES = new Set(['cyan', 'sky', 'violet', 'fuchsia', 'rose', 'amber', 'emerald', 'lime', 'indigo', 'slate'])
+const QUOTA_DEDUCTION_PRIORITIES = new Set(['group_first', 'personal_first'])
+const DEFAULT_MANAGEMENT_CONFIG_URL = 'https://cpajp.cloud1024.com/v0/management/config.yaml'
 
 const defaultPlans = [
   ['starter', 'Starter Spark', '轻量试用，适合探索提示词和少量素材。', 0, 80, 4, 6, 'sky'],
@@ -28,6 +33,23 @@ const LEDGER_PAGE_SIZES = new Set([10, 20, 50, 100])
 const LEDGER_TYPES = new Set(['credit', 'debit', 'payment', 'adjustment'])
 const LEDGER_SOURCES = new Set(['gallery', 'agent', 'admin'])
 const DEFAULT_CHECKIN_SETTINGS_ID = 'default'
+const EMAIL_SETTINGS_KEY = 'email_settings'
+const DEFAULT_EMAIL_VERIFICATION_EXPIRES_MINUTES = 30
+const EMAIL_VERIFICATION_CODE_LENGTH = 6
+const DEFAULT_EMAIL_SUBJECT = '验证你的 {brandName} 账号'
+const DEFAULT_EMAIL_TEXT = `你好，{displayName}：
+
+欢迎注册 {brandName}。请在 {expiresMinutes} 分钟内点击下面的专属链接完成邮箱验证：
+{verificationLink}
+
+安全验证码：{verificationCode}
+
+如果这不是你的操作，可以忽略这封邮件。`
+const DEFAULT_EMAIL_HTML = `<p>你好，{displayName}：</p>
+<p>欢迎注册 <strong>{brandName}</strong>。请在 {expiresMinutes} 分钟内点击下方按钮完成邮箱验证。</p>
+<p><a href="{verificationLink}" style="display:inline-block;padding:12px 18px;background:#111827;color:#ffffff;text-decoration:none;border-radius:8px;font-weight:700;">验证邮箱并完成注册</a></p>
+<p>安全验证码：<strong>{verificationCode}</strong></p>
+<p style="color:#6b7280;font-size:13px;">如果这不是你的操作，可以忽略这封邮件。</p>`
 
 mkdirSync(dirname(dbPath), { recursive: true })
 const db = new DatabaseSync(dbPath)
@@ -38,6 +60,7 @@ CREATE TABLE IF NOT EXISTS groups (
   name TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
   accent TEXT NOT NULL DEFAULT 'cyan',
+  quota_balance INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -60,6 +83,7 @@ CREATE TABLE IF NOT EXISTS users (
   group_id TEXT NOT NULL DEFAULT 'default' REFERENCES groups(id),
   plan_id TEXT NOT NULL REFERENCES plans(id),
   quota_balance INTEGER NOT NULL DEFAULT 0,
+  quota_deduction_priority TEXT NOT NULL DEFAULT 'group_first',
   total_quota_used INTEGER NOT NULL DEFAULT 0,
   can_use_agent INTEGER NOT NULL DEFAULT 1,
   password_hash TEXT NOT NULL,
@@ -78,6 +102,13 @@ CREATE TABLE IF NOT EXISTS billing_ledger (
   unit_cost INTEGER NOT NULL DEFAULT 0,
   balance_before INTEGER NOT NULL DEFAULT 0,
   balance_after INTEGER NOT NULL,
+  personal_amount INTEGER NOT NULL DEFAULT 0,
+  group_amount INTEGER NOT NULL DEFAULT 0,
+  personal_balance_before INTEGER NOT NULL DEFAULT 0,
+  personal_balance_after INTEGER NOT NULL DEFAULT 0,
+  group_balance_before INTEGER NOT NULL DEFAULT 0,
+  group_balance_after INTEGER NOT NULL DEFAULT 0,
+  deduction_priority TEXT NOT NULL DEFAULT 'group_first',
   plan_id TEXT NOT NULL DEFAULT '',
   plan_name TEXT NOT NULL DEFAULT '',
   group_id TEXT NOT NULL DEFAULT '',
@@ -95,6 +126,19 @@ CREATE TABLE IF NOT EXISTS sessions (
   token_hash TEXT NOT NULL UNIQUE,
   created_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pending_email_registrations (
+  id TEXT PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE,
+  display_name TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  password_salt TEXT NOT NULL,
+  verification_token_hash TEXT NOT NULL UNIQUE,
+  verification_code_hash TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  last_sent_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS app_settings (
   key TEXT PRIMARY KEY,
@@ -147,15 +191,25 @@ CREATE INDEX IF NOT EXISTS idx_reward_redemptions_user ON reward_redemptions(use
 CREATE INDEX IF NOT EXISTS idx_reward_redemptions_ip ON reward_redemptions(ip_address);
 CREATE INDEX IF NOT EXISTS idx_checkin_records_user ON checkin_records(user_id);
 CREATE INDEX IF NOT EXISTS idx_checkin_records_ip_created ON checkin_records(ip_address, created_at);
+CREATE INDEX IF NOT EXISTS idx_pending_email_registrations_token ON pending_email_registrations(verification_token_hash);
 `)
 
 ensureDefaultGroup()
+ensureColumn('groups', 'quota_balance', 'quota_balance INTEGER NOT NULL DEFAULT 0')
 ensureColumn('plans', 'group_id', `group_id TEXT NOT NULL DEFAULT '${DEFAULT_GROUP_ID}'`)
 ensureColumn('users', 'group_id', `group_id TEXT NOT NULL DEFAULT '${DEFAULT_GROUP_ID}'`)
 ensureColumn('users', 'can_use_agent', 'can_use_agent INTEGER NOT NULL DEFAULT 1')
+ensureColumn('users', 'quota_deduction_priority', "quota_deduction_priority TEXT NOT NULL DEFAULT 'group_first'")
 ensureColumn('billing_ledger', 'units', 'units INTEGER NOT NULL DEFAULT 0')
 ensureColumn('billing_ledger', 'unit_cost', 'unit_cost INTEGER NOT NULL DEFAULT 0')
 ensureColumn('billing_ledger', 'balance_before', 'balance_before INTEGER NOT NULL DEFAULT 0')
+ensureColumn('billing_ledger', 'personal_amount', 'personal_amount INTEGER NOT NULL DEFAULT 0')
+ensureColumn('billing_ledger', 'group_amount', 'group_amount INTEGER NOT NULL DEFAULT 0')
+ensureColumn('billing_ledger', 'personal_balance_before', 'personal_balance_before INTEGER NOT NULL DEFAULT 0')
+ensureColumn('billing_ledger', 'personal_balance_after', 'personal_balance_after INTEGER NOT NULL DEFAULT 0')
+ensureColumn('billing_ledger', 'group_balance_before', 'group_balance_before INTEGER NOT NULL DEFAULT 0')
+ensureColumn('billing_ledger', 'group_balance_after', 'group_balance_after INTEGER NOT NULL DEFAULT 0')
+ensureColumn('billing_ledger', 'deduction_priority', "deduction_priority TEXT NOT NULL DEFAULT 'group_first'")
 ensureColumn('billing_ledger', 'plan_id', "plan_id TEXT NOT NULL DEFAULT ''")
 ensureColumn('billing_ledger', 'plan_name', "plan_name TEXT NOT NULL DEFAULT ''")
 ensureColumn('billing_ledger', 'group_id', "group_id TEXT NOT NULL DEFAULT ''")
@@ -173,6 +227,7 @@ if (planCount === 0) {
 }
 
 ensureApiSettings()
+ensureEmailSettings()
 ensureCheckinSettings()
 repairMissingAdmin()
 
@@ -209,6 +264,14 @@ function hashPassword(password, salt) {
 
 function hashToken(token) {
   return createHash('sha256').update(token).digest('hex')
+}
+
+function html(res, status, body) {
+  res.writeHead(status, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Access-Control-Allow-Origin': '*',
+  })
+  res.end(body)
 }
 
 function json(res, status, payload) {
@@ -282,6 +345,9 @@ function createDefaultApiSettings() {
     apiProxy: profile.apiProxy,
     streamImages: profile.streamImages,
     streamPartialImages: profile.streamPartialImages,
+    managementConfigUrl: process.env.MANAGEMENT_CONFIG_URL || DEFAULT_MANAGEMENT_CONFIG_URL,
+    managementConfigAuthToken: process.env.MANAGEMENT_CONFIG_TOKEN || '',
+    managementConfigUpdatedAt: undefined,
     customProviders: [],
     providerOrder: ['openai', 'fal'],
     clearInputAfterSubmit: false,
@@ -297,6 +363,25 @@ function createDefaultApiSettings() {
     agentWebSearch: false,
     profiles: [profile],
     activeProfileId: profile.id,
+  }
+}
+
+function createDefaultEmailSettings() {
+  return {
+    enabled: Boolean(process.env.SMTP_HOST && process.env.SMTP_FROM_EMAIL),
+    smtpHost: process.env.SMTP_HOST || '',
+    smtpPort: Number(process.env.SMTP_PORT || 587),
+    smtpSecure: process.env.SMTP_SECURE === 'true',
+    smtpUser: process.env.SMTP_USER || '',
+    smtpPassword: process.env.SMTP_PASS || '',
+    fromEmail: process.env.SMTP_FROM_EMAIL || '',
+    fromName: process.env.SMTP_FROM_NAME || 'Pixel Foundry Console',
+    brandName: process.env.MAIL_BRAND_NAME || 'Pixel Foundry Console',
+    appBaseUrl: process.env.APP_BASE_URL || '',
+    verificationExpiresMinutes: DEFAULT_EMAIL_VERIFICATION_EXPIRES_MINUTES,
+    verificationSubject: DEFAULT_EMAIL_SUBJECT,
+    verificationText: DEFAULT_EMAIL_TEXT,
+    verificationHtml: DEFAULT_EMAIL_HTML,
   }
 }
 
@@ -319,6 +404,21 @@ function setApiSettings(settings) {
   `).run(JSON.stringify(settings), Date.now())
 }
 
+function parseEmailSettings(value) {
+  const parsed = JSON.parse(value)
+  if (!isRecord(parsed)) throw new Error('后台邮件配置已损坏：配置不是 JSON 对象')
+  return parsed
+}
+
+function setEmailSettings(settings) {
+  if (!isRecord(settings)) throw new Error('邮件配置必须是 JSON 对象')
+  db.prepare(`
+    INSERT INTO app_settings (key, value, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+  `).run(EMAIL_SETTINGS_KEY, JSON.stringify(settings), Date.now())
+}
+
 function ensureApiSettings() {
   const row = db.prepare("SELECT value FROM app_settings WHERE key = 'api_settings'").get()
   if (row) {
@@ -330,6 +430,12 @@ function ensureApiSettings() {
   setApiSettings(createDefaultApiSettings())
 }
 
+function ensureEmailSettings() {
+  const row = db.prepare('SELECT value FROM app_settings WHERE key = ?').get(EMAIL_SETTINGS_KEY)
+  if (row) return
+  setEmailSettings(createDefaultEmailSettings())
+}
+
 function ensureCheckinSettings() {
   const now = Date.now()
   db.prepare(`
@@ -337,6 +443,223 @@ function ensureCheckinSettings() {
     VALUES (?, 0, 5, 24, 0, '每日补给站', '每天领取一份创作额度。', ?)
     ON CONFLICT(id) DO NOTHING
   `).run(DEFAULT_CHECKIN_SETTINGS_ID, now)
+}
+
+function getRawEmailSettings() {
+  const row = db.prepare('SELECT value FROM app_settings WHERE key = ?').get(EMAIL_SETTINGS_KEY)
+  if (!row) {
+    const settings = createDefaultEmailSettings()
+    setEmailSettings(settings)
+    return settings
+  }
+  return parseEmailSettings(row.value)
+}
+
+function normalizeEmailSettings(settings) {
+  return {
+    enabled: Boolean(settings.enabled),
+    smtpHost: String(settings.smtpHost || '').trim(),
+    smtpPort: normalizePositiveInteger(settings.smtpPort, 587),
+    smtpSecure: Boolean(settings.smtpSecure),
+    smtpUser: String(settings.smtpUser || '').trim(),
+    smtpPassword: typeof settings.smtpPassword === 'string' ? settings.smtpPassword : '',
+    fromEmail: normalizeEmail(settings.fromEmail),
+    fromName: String(settings.fromName || 'Pixel Foundry Console').trim().slice(0, 80) || 'Pixel Foundry Console',
+    brandName: String(settings.brandName || 'Pixel Foundry Console').trim().slice(0, 80) || 'Pixel Foundry Console',
+    appBaseUrl: String(settings.appBaseUrl || '').trim().replace(/\/+$/, ''),
+    verificationExpiresMinutes: Math.min(1440, normalizePositiveInteger(settings.verificationExpiresMinutes, DEFAULT_EMAIL_VERIFICATION_EXPIRES_MINUTES)),
+    verificationSubject: String(settings.verificationSubject || DEFAULT_EMAIL_SUBJECT).trim().slice(0, 160) || DEFAULT_EMAIL_SUBJECT,
+    verificationText: String(settings.verificationText || DEFAULT_EMAIL_TEXT).slice(0, 4000),
+    verificationHtml: String(settings.verificationHtml || DEFAULT_EMAIL_HTML).slice(0, 8000),
+  }
+}
+
+function getEmailSettings() {
+  return normalizeEmailSettings(getRawEmailSettings())
+}
+
+function redactEmailSettings(settings = getEmailSettings()) {
+  const { smtpPassword, ...safe } = settings
+  return {
+    ...safe,
+    hasSmtpPassword: Boolean(smtpPassword),
+  }
+}
+
+function updateEmailSettings(input) {
+  const current = getEmailSettings()
+  const passwordInput = typeof input.smtpPassword === 'string' ? input.smtpPassword : ''
+  const next = normalizeEmailSettings({
+    ...current,
+    ...input,
+    smtpPassword: passwordInput ? passwordInput : current.smtpPassword,
+  })
+  if (next.enabled && (!next.smtpHost || !next.smtpPort || !next.fromEmail)) {
+    fail(400, '启用邮箱验证前请完整填写 SMTP Host、端口和发件邮箱')
+  }
+  setEmailSettings(next)
+}
+
+function getManagementConfigUrl(inputUrl, currentSettings) {
+  const raw = String(inputUrl || currentSettings.managementConfigUrl || DEFAULT_MANAGEMENT_CONFIG_URL).trim()
+  let url
+  try {
+    url = new URL(raw)
+  } catch {
+    fail(400, '管理配置 URL 无效')
+  }
+  if (url.protocol !== 'https:') fail(400, '管理配置 URL 必须使用 HTTPS')
+  return url.toString()
+}
+
+function getAuthorizationHeader(token) {
+  const value = String(token || '').trim()
+  if (!value) return ''
+  return /^(bearer|basic)\s+/i.test(value) ? value : `Bearer ${value}`
+}
+
+function parseManagementConfig(text) {
+  const raw = String(text || '').trim()
+  if (!raw) fail(502, '管理配置为空')
+  try {
+    return JSON.parse(raw)
+  } catch {
+    try {
+      return parseYaml(raw)
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      fail(502, `管理配置 YAML 解析失败：${detail}`)
+    }
+  }
+}
+
+function normalizeConfigKey(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '')
+}
+
+function collectConfigScalars(value, path = [], output = []) {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => collectConfigScalars(item, [...path, String(index)], output))
+    return output
+  }
+  if (isRecord(value)) {
+    for (const [key, item] of Object.entries(value)) collectConfigScalars(item, [...path, key], output)
+    return output
+  }
+  if (value == null) return output
+  output.push({
+    key: normalizeConfigKey(path[path.length - 1] || ''),
+    path: path.map(normalizeConfigKey).join('.'),
+    value,
+  })
+  return output
+}
+
+function pickConfigString(scalars, keys, pathHints = []) {
+  const normalizedKeys = keys.map(normalizeConfigKey)
+  const normalizedHints = pathHints.map(normalizeConfigKey)
+  const match = scalars.find((item) =>
+    normalizedKeys.includes(item.key) &&
+    (normalizedHints.length === 0 || normalizedHints.some((hint) => item.path.includes(hint)))
+  ) ?? scalars.find((item) => normalizedKeys.includes(item.key))
+  if (!match) return ''
+  const value = String(match.value ?? '').trim()
+  return value
+}
+
+function pickConfigNumber(scalars, keys) {
+  const value = pickConfigString(scalars, keys)
+  const number = Number(value)
+  return Number.isFinite(number) && number > 0 ? number : null
+}
+
+function getImportedApiSettingsFromManagementConfig(parsed, currentSettings, source) {
+  if (!isRecord(parsed) && !Array.isArray(parsed)) fail(502, '管理配置格式无效')
+  const scalars = collectConfigScalars(parsed)
+  const currentProfile = getActiveProfile(currentSettings)
+  const baseUrl = pickConfigString(scalars, ['baseUrl', 'base_url', 'apiBaseUrl', 'api_base_url', 'apiUrl', 'api_url', 'endpoint', 'url'], ['api', 'openai', 'upstream', 'provider'])
+  const apiKey = pickConfigString(scalars, ['apiKey', 'api_key', 'key', 'token', 'bearerToken', 'bearer_token', 'authorization'], ['api', 'openai', 'upstream', 'provider'])
+  const model = pickConfigString(scalars, ['model', 'modelId', 'model_id', 'imageModel', 'image_model', 'imagesModel', 'generationModel', 'generation_model'], ['image', 'images', 'openai', 'api'])
+  const apiModeValue = pickConfigString(scalars, ['apiMode', 'api_mode', 'mode'], ['api', 'openai', 'responses', 'images']).toLowerCase()
+  const provider = pickConfigString(scalars, ['provider', 'type'], ['api', 'openai', 'provider']).toLowerCase()
+  const timeout = pickConfigNumber(scalars, ['timeout', 'timeoutSeconds', 'timeout_seconds'])
+  const streamImagesValue = pickConfigString(scalars, ['streamImages', 'stream_images']).toLowerCase()
+  const streamPartialImages = pickConfigNumber(scalars, ['streamPartialImages', 'stream_partial_images', 'partialImages', 'partial_images'])
+
+  if (!baseUrl && !apiKey && !model) {
+    fail(502, '管理配置未包含可识别的 API Base URL、API Key 或模型字段')
+  }
+
+  const nextProfile = {
+    ...currentProfile,
+    name: pickConfigString(scalars, ['name', 'profileName', 'profile_name'], ['api', 'openai', 'profile']) || currentProfile.name || '管理配置',
+    provider: provider === 'fal' ? 'fal' : 'openai',
+    baseUrl: baseUrl || currentProfile.baseUrl,
+    apiKey: apiKey || currentProfile.apiKey,
+    model: model || currentProfile.model,
+    timeout: timeout ?? currentProfile.timeout ?? DEFAULT_API_TIMEOUT,
+    apiMode: apiModeValue === 'responses' ? 'responses' : apiModeValue === 'images' ? 'images' : currentProfile.apiMode === 'responses' ? 'responses' : 'images',
+    apiProxy: false,
+    streamImages: streamImagesValue ? streamImagesValue === 'true' || streamImagesValue === '1' : Boolean(currentProfile.streamImages),
+    streamPartialImages: streamPartialImages ?? currentProfile.streamPartialImages ?? DEFAULT_STREAM_PARTIAL_IMAGES,
+  }
+
+  const profiles = getProfiles(currentSettings)
+  const nextProfiles = profiles.length
+    ? profiles.map((profile) => profile.id === currentProfile.id ? nextProfile : profile)
+    : [nextProfile]
+
+  return {
+    ...currentSettings,
+    baseUrl: nextProfile.baseUrl,
+    apiKey: nextProfile.apiKey,
+    model: nextProfile.model,
+    timeout: nextProfile.timeout,
+    apiMode: nextProfile.apiMode,
+    apiProxy: false,
+    streamImages: nextProfile.streamImages,
+    streamPartialImages: nextProfile.streamPartialImages,
+    providerOrder: [nextProfile.provider],
+    profiles: nextProfiles,
+    activeProfileId: nextProfile.id,
+    managementConfigUrl: source.url,
+    managementConfigAuthToken: source.authToken,
+    managementConfigUpdatedAt: source.updatedAt,
+  }
+}
+
+async function syncManagementApiConfig(input = {}) {
+  const currentSettings = getApiSettings()
+  const url = getManagementConfigUrl(input.url, currentSettings)
+  const currentProfile = getActiveProfile(currentSettings)
+  const authToken = String(input.authToken || currentSettings.managementConfigAuthToken || currentProfile.apiKey || '').trim()
+  const authorization = getAuthorizationHeader(authToken)
+  if (!authorization) fail(400, '请填写管理配置授权信息')
+
+  let response
+  try {
+    response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Authorization: authorization,
+        Accept: 'application/yaml,text/yaml,text/plain,application/json',
+      },
+    })
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    fail(502, `管理配置请求失败：${detail}`)
+  }
+  if (!response.ok) fail(response.status, `管理配置请求失败：HTTP ${response.status}`)
+
+  const text = await response.text()
+  const parsed = parseManagementConfig(text)
+  const next = getImportedApiSettingsFromManagementConfig(parsed, currentSettings, {
+    url,
+    authToken,
+    updatedAt: Date.now(),
+  })
+  setApiSettings(next)
+  return next
 }
 
 function getApiSettings() {
@@ -571,6 +894,7 @@ function rowToGroup(row) {
     name: row.name,
     description: row.description,
     accent: row.accent,
+    quotaBalance: Math.max(0, Math.floor(Number(row.quota_balance ?? 0))),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }
@@ -599,6 +923,7 @@ function rowToUser(row) {
     groupId: row.group_id,
     planId: row.plan_id,
     quotaBalance: row.quota_balance,
+    quotaDeductionPriority: normalizeQuotaDeductionPriority(row.quota_deduction_priority),
     totalQuotaUsed: row.total_quota_used,
     canUseAgent: row.can_use_agent !== 0,
     createdAt: row.created_at,
@@ -618,6 +943,13 @@ function rowToLedger(row) {
     unitCost: row.unit_cost,
     balanceBefore: row.balance_before,
     balanceAfter: row.balance_after,
+    personalAmount: row.personal_amount,
+    groupAmount: row.group_amount,
+    personalBalanceBefore: row.personal_balance_before,
+    personalBalanceAfter: row.personal_balance_after,
+    groupBalanceBefore: row.group_balance_before,
+    groupBalanceAfter: row.group_balance_after,
+    deductionPriority: normalizeQuotaDeductionPriority(row.deduction_priority),
     planId: row.plan_id,
     planName: row.plan_name,
     groupId: row.group_id,
@@ -701,6 +1033,11 @@ function getGroup(groupId) {
   const row = db.prepare('SELECT * FROM groups WHERE id = ?').get(groupId)
     ?? db.prepare('SELECT * FROM groups WHERE id = ?').get(DEFAULT_GROUP_ID)
     ?? db.prepare('SELECT * FROM groups ORDER BY created_at, name LIMIT 1').get()
+  return row ? rowToGroup(row) : null
+}
+
+function getStrictGroup(groupId) {
+  const row = db.prepare('SELECT * FROM groups WHERE id = ?').get(groupId)
   return row ? rowToGroup(row) : null
 }
 
@@ -803,8 +1140,65 @@ function getLedgerSnapshot({ user, plan, group, profile }) {
   }
 }
 
+function getQuotaBalanceSnapshot(user, group = getStrictGroup(user.groupId), personalBalanceAfter = user.quotaBalance) {
+  const groupBalance = group?.quotaBalance ?? 0
+  return {
+    balanceBefore: user.quotaBalance + groupBalance,
+    balanceAfter: personalBalanceAfter + groupBalance,
+    personalBalanceBefore: user.quotaBalance,
+    personalBalanceAfter,
+    groupBalanceBefore: groupBalance,
+    groupBalanceAfter: groupBalance,
+  }
+}
+
+function splitQuotaDebit(user, group, amount) {
+  const personalBalanceBefore = normalizeNonNegativeInteger(user.quotaBalance, 0)
+  const groupBalanceBefore = normalizeNonNegativeInteger(group?.quotaBalance ?? 0, 0)
+  const balanceBefore = personalBalanceBefore + groupBalanceBefore
+  if (balanceBefore < amount) {
+    fail(402, `额度不足：本次需要 ${amount} 点，当前剩余 ${balanceBefore} 点`)
+  }
+
+  const deductionPriority = normalizeQuotaDeductionPriority(user.quotaDeductionPriority)
+  let remaining = amount
+  let personalAmount = 0
+  let groupAmount = 0
+
+  if (deductionPriority === 'personal_first') {
+    personalAmount = Math.min(personalBalanceBefore, remaining)
+    remaining -= personalAmount
+    groupAmount = Math.min(groupBalanceBefore, remaining)
+  } else {
+    groupAmount = Math.min(groupBalanceBefore, remaining)
+    remaining -= groupAmount
+    personalAmount = Math.min(personalBalanceBefore, remaining)
+  }
+
+  return {
+    deductionPriority,
+    balanceBefore,
+    balanceAfter: balanceBefore - amount,
+    personalAmount,
+    groupAmount,
+    personalBalanceBefore,
+    personalBalanceAfter: personalBalanceBefore - personalAmount,
+    groupBalanceBefore,
+    groupBalanceAfter: groupBalanceBefore - groupAmount,
+  }
+}
+
 function insertLedgerEntry(input) {
   const snapshot = getLedgerSnapshot(input)
+  const groupBalanceBefore = normalizeNonNegativeInteger(input.groupBalanceBefore ?? 0, 0)
+  const groupBalanceAfter = normalizeNonNegativeInteger(input.groupBalanceAfter ?? groupBalanceBefore, groupBalanceBefore)
+  const personalBalanceBefore = normalizeNonNegativeInteger(input.personalBalanceBefore ?? input.balanceBefore ?? 0, 0)
+  const personalBalanceAfter = normalizeNonNegativeInteger(input.personalBalanceAfter ?? input.balanceAfter ?? personalBalanceBefore, personalBalanceBefore)
+  const balanceBefore = normalizeNonNegativeInteger(input.balanceBefore ?? groupBalanceBefore + personalBalanceBefore, 0)
+  const balanceAfter = normalizeNonNegativeInteger(input.balanceAfter ?? groupBalanceAfter + personalBalanceAfter, 0)
+  const groupAmount = normalizeNonNegativeInteger(input.groupAmount ?? 0, 0)
+  const personalAmount = normalizeNonNegativeInteger(input.personalAmount ?? Math.max(0, input.amount - groupAmount), 0)
+  const deductionPriority = normalizeQuotaDeductionPriority(input.deductionPriority ?? input.user?.quotaDeductionPriority)
   db.prepare(`
     INSERT INTO billing_ledger (
       id,
@@ -816,6 +1210,13 @@ function insertLedgerEntry(input) {
       unit_cost,
       balance_before,
       balance_after,
+      personal_amount,
+      group_amount,
+      personal_balance_before,
+      personal_balance_after,
+      group_balance_before,
+      group_balance_after,
+      deduction_priority,
       plan_id,
       plan_name,
       group_id,
@@ -827,7 +1228,7 @@ function insertLedgerEntry(input) {
       note,
       created_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     genId(),
     input.userId,
@@ -836,8 +1237,15 @@ function insertLedgerEntry(input) {
     input.amount,
     input.units ?? 0,
     input.unitCost ?? 0,
-    input.balanceBefore ?? 0,
-    input.balanceAfter,
+    balanceBefore,
+    balanceAfter,
+    personalAmount,
+    groupAmount,
+    personalBalanceBefore,
+    personalBalanceAfter,
+    groupBalanceBefore,
+    groupBalanceAfter,
+    deductionPriority,
     snapshot.planId,
     snapshot.planName,
     snapshot.groupId,
@@ -1033,6 +1441,7 @@ function getState(actor, authSession = null) {
     setupRequired,
     apiSettings: actor ? createRuntimeApiSettings(adminApiSettings, authSession) : null,
     adminApiSettings: admin ? adminApiSettings : null,
+    emailSettings: admin || setupRequired ? redactEmailSettings() : null,
     rewardState: getRewardState(actor),
   }
 }
@@ -1087,6 +1496,11 @@ function normalizeBoolean(value, fallback = false) {
   if (value === 1 || value === '1' || value === 'true') return true
   if (value === 0 || value === '0' || value === 'false') return false
   return fallback
+}
+
+function normalizeQuotaDeductionPriority(value, fallback = 'group_first') {
+  const priority = String(value || '').trim()
+  return QUOTA_DEDUCTION_PRIORITIES.has(priority) ? priority : fallback
 }
 
 function normalizeOptionalTimestamp(value, fallback = null) {
@@ -1168,15 +1582,23 @@ function normalizePlanInput(input, fallback = {}) {
     monthlyQuota: Math.floor(normalizeNonNegativeNumber(input.monthlyQuota ?? fallback.monthlyQuota, 100)),
     galleryUnitCost: normalizePositiveInteger(input.galleryUnitCost ?? fallback.galleryUnitCost, 4),
     agentTurnCost: normalizePositiveInteger(input.agentTurnCost ?? fallback.agentTurnCost, 6),
-    accent: String(input.accent || fallback.accent || 'sky').trim().slice(0, 24) || 'sky',
+    accent: normalizeAccent(input.accent ?? fallback.accent, 'sky'),
   }
+}
+
+function normalizeAccent(value, fallback = 'cyan') {
+  const accent = String(value || '').trim()
+  if (ACCENT_VALUES.has(accent)) return accent
+  if (/^#[0-9a-fA-F]{6}$/.test(accent)) return accent.toLowerCase()
+  return fallback
 }
 
 function normalizeGroupInput(input, fallback = {}) {
   return {
     name: String(input.name || fallback.name || '新分组').trim().slice(0, 40) || '新分组',
     description: String(input.description ?? fallback.description ?? '').trim().slice(0, 120),
-    accent: String(input.accent || fallback.accent || 'cyan').trim().slice(0, 24) || 'cyan',
+    accent: normalizeAccent(input.accent ?? fallback.accent, 'cyan'),
+    quotaBalance: normalizeNonNegativeInteger(input.quotaBalance ?? fallback.quotaBalance, 0),
   }
 }
 
@@ -1208,6 +1630,209 @@ function getExistingGroupId(value) {
   const groupId = typeof value === 'string' && value.trim() ? value.trim() : ''
   if (!groupId) return null
   return db.prepare('SELECT 1 FROM groups WHERE id = ?').get(groupId) ? groupId : null
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+function renderTemplate(template, values, htmlMode = false) {
+  return String(template || '').replace(/\{([a-zA-Z0-9_]+)\}/g, (_, key) => {
+    const value = values[key] ?? ''
+    return htmlMode ? escapeHtml(value) : String(value)
+  })
+}
+
+function createVerificationCode() {
+  const max = 10 ** EMAIL_VERIFICATION_CODE_LENGTH
+  return String(Math.floor(Math.random() * max)).padStart(EMAIL_VERIFICATION_CODE_LENGTH, '0')
+}
+
+function getRequestBaseUrl(req, settings) {
+  if (settings.appBaseUrl) return settings.appBaseUrl
+  const origin = req.headers.origin
+  if (typeof origin === 'string' && origin) return origin.replace(/\/+$/, '')
+  const referer = req.headers.referer
+  if (typeof referer === 'string' && referer) {
+    try {
+      const url = new URL(referer)
+      return url.origin
+    } catch {
+      // Referer is advisory; fall through to Host.
+    }
+  }
+  return `http://${req.headers.host || `${host}:${port}`}`.replace(/\/+$/, '')
+}
+
+function assertEmailConfigured(settings) {
+  if (!settings.enabled) fail(400, '管理员尚未开启邮箱验证服务')
+  if (!settings.smtpHost || !settings.smtpPort || !settings.fromEmail) {
+    fail(400, '管理员尚未完整配置邮箱服务')
+  }
+}
+
+async function sendVerificationEmail({ req, email, displayName, token, code, expiresAt }) {
+  const settings = getEmailSettings()
+  assertEmailConfigured(settings)
+  const baseUrl = getRequestBaseUrl(req, settings)
+  const verificationLink = `${baseUrl}/backend-api/auth/verify-email?token=${encodeURIComponent(token)}`
+  const expiresMinutes = Math.max(1, Math.ceil((expiresAt - Date.now()) / 60000))
+  const values = {
+    brandName: settings.brandName,
+    displayName,
+    email,
+    verificationLink,
+    verificationCode: code,
+    expiresMinutes,
+  }
+  const transporter = nodemailer.createTransport({
+    host: settings.smtpHost,
+    port: settings.smtpPort,
+    secure: settings.smtpSecure,
+    auth: settings.smtpUser ? { user: settings.smtpUser, pass: settings.smtpPassword } : undefined,
+  })
+  await transporter.sendMail({
+    from: `"${settings.fromName.replace(/"/g, '\\"')}" <${settings.fromEmail}>`,
+    to: email,
+    subject: renderTemplate(settings.verificationSubject, values),
+    text: renderTemplate(settings.verificationText, values),
+    html: renderTemplate(settings.verificationHtml, values, true),
+  })
+}
+
+function createUserFromPendingRegistration(pending) {
+  const plan = db.prepare('SELECT * FROM plans WHERE id = ? AND group_id = ?').get('starter', DEFAULT_GROUP_ID)
+    ?? db.prepare('SELECT * FROM plans WHERE group_id = ? ORDER BY monthly_price LIMIT 1').get(DEFAULT_GROUP_ID)
+  if (!plan) fail(400, '默认分组还没有可用套餐，请先创建套餐')
+  const now = Date.now()
+  const userId = genId()
+  const role = hasAdmin() ? 'member' : 'admin'
+  db.prepare('INSERT INTO users (id, email, display_name, role, group_id, plan_id, quota_balance, quota_deduction_priority, total_quota_used, can_use_agent, password_hash, password_salt, created_at, updated_at, last_login_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?, ?, ?, NULL)')
+    .run(userId, pending.email, pending.display_name, role, DEFAULT_GROUP_ID, plan.id, plan.monthly_quota, 'group_first', pending.password_hash, pending.password_salt, now, now)
+  const group = getStrictGroup(DEFAULT_GROUP_ID)
+  const balances = getQuotaBalanceSnapshot({ groupId: DEFAULT_GROUP_ID, planId: plan.id, quotaBalance: 0 }, group, plan.monthly_quota)
+  insertLedgerEntry({
+    userId,
+    user: { groupId: DEFAULT_GROUP_ID, planId: plan.id, quotaDeductionPriority: 'group_first' },
+    type: 'credit',
+    source: 'admin',
+    amount: plan.monthly_quota,
+    units: 1,
+    unitCost: plan.monthly_quota,
+    personalAmount: plan.monthly_quota,
+    ...balances,
+    plan,
+    group,
+    note: `邮箱验证通过，发放 ${plan.name} 起始额度`,
+    createdAt: now,
+  })
+  return userId
+}
+
+function verificationResultHtml({ title, message, tone = 'success' }) {
+  const accent = tone === 'success' ? '#0891b2' : '#dc2626'
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>${escapeHtml(title)}</title>
+</head>
+<body style="margin:0;background:#f8fafc;color:#111827;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+  <main style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;">
+    <section style="max-width:440px;width:100%;background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:28px;box-shadow:0 10px 30px rgba(15,23,42,.08);">
+      <div style="font-size:12px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:${accent};">Pixel Foundry Console</div>
+      <h1 style="margin:12px 0 8px;font-size:24px;line-height:1.25;">${escapeHtml(title)}</h1>
+      <p style="margin:0;color:#4b5563;line-height:1.8;font-size:14px;">${escapeHtml(message)}</p>
+      <a href="/" style="display:inline-block;margin-top:22px;background:#111827;color:#fff;text-decoration:none;border-radius:8px;padding:11px 16px;font-weight:700;font-size:14px;">返回登录</a>
+    </section>
+  </main>
+</body>
+</html>`
+}
+
+async function startEmailRegistration(req, body) {
+  const email = normalizeEmail(body.email)
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) fail(400, '请输入有效邮箱')
+  if (String(body.password || '').length < 8) fail(400, '密码至少 8 位')
+  if (db.prepare('SELECT 1 FROM users WHERE email = ?').get(email)) fail(409, '这个邮箱已经注册')
+  const settings = getEmailSettings()
+  assertEmailConfigured(settings)
+
+  const now = Date.now()
+  const salt = randomBytes(16).toString('hex')
+  const token = randomBytes(32).toString('hex')
+  const code = createVerificationCode()
+  const expiresAt = now + settings.verificationExpiresMinutes * 60 * 1000
+  const displayName = String(body.displayName || email.split('@')[0]).trim().slice(0, 48) || email
+  const pending = {
+    id: genId(),
+    email,
+    displayName,
+    passwordHash: hashPassword(String(body.password), salt),
+    passwordSalt: salt,
+    tokenHash: hashToken(token),
+    codeHash: hashToken(code),
+    expiresAt,
+    now,
+  }
+
+  try {
+    withImmediateTransaction(() => {
+      db.prepare('DELETE FROM pending_email_registrations WHERE expires_at <= ?').run(now)
+      db.prepare(`
+        INSERT INTO pending_email_registrations (id, email, display_name, password_hash, password_salt, verification_token_hash, verification_code_hash, expires_at, created_at, updated_at, last_sent_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(email) DO UPDATE SET
+          display_name = excluded.display_name,
+          password_hash = excluded.password_hash,
+          password_salt = excluded.password_salt,
+          verification_token_hash = excluded.verification_token_hash,
+          verification_code_hash = excluded.verification_code_hash,
+          expires_at = excluded.expires_at,
+          updated_at = excluded.updated_at,
+          last_sent_at = excluded.last_sent_at
+      `).run(pending.id, email, displayName, pending.passwordHash, pending.passwordSalt, pending.tokenHash, pending.codeHash, expiresAt, now, now, now)
+    })
+    await sendVerificationEmail({ req, email, displayName, token, code, expiresAt })
+  } catch (error) {
+    db.prepare('DELETE FROM pending_email_registrations WHERE email = ? AND verification_token_hash = ?').run(email, pending.tokenHash)
+    throw error
+  }
+
+  return {
+    ...getState(null, null),
+    emailVerification: {
+      required: true,
+      email,
+      expiresAt,
+    },
+  }
+}
+
+function verifyEmailRegistration(token) {
+  const tokenHash = hashToken(String(token || ''))
+  if (!token || tokenHash === hashToken('')) fail(400, '验证链接无效')
+  return withImmediateTransaction(() => {
+    const pending = db.prepare('SELECT * FROM pending_email_registrations WHERE verification_token_hash = ?').get(tokenHash)
+    if (!pending) fail(404, '验证链接不存在或已被使用')
+    if (pending.expires_at <= Date.now()) {
+      db.prepare('DELETE FROM pending_email_registrations WHERE id = ?').run(pending.id)
+      fail(410, '验证链接已过期，请重新注册获取新的验证邮件')
+    }
+    if (db.prepare('SELECT 1 FROM users WHERE email = ?').get(pending.email)) {
+      db.prepare('DELETE FROM pending_email_registrations WHERE id = ?').run(pending.id)
+      fail(409, '这个邮箱已经完成注册，请直接登录')
+    }
+    const userId = createUserFromPendingRegistration(pending)
+    db.prepare('DELETE FROM pending_email_registrations WHERE id = ?').run(pending.id)
+    return userId
+  })
 }
 
 function getRewardCodeById(codeId) {
@@ -1334,6 +1959,8 @@ function redeemRewardCode(actor, rawCode, ipAddress) {
     const user = getUser(actor.id)
     if (!user) fail(401, '请重新登录')
     const balanceAfter = user.quotaBalance + code.quotaAmount
+    const group = getStrictGroup(user.groupId)
+    const balances = getQuotaBalanceSnapshot(user, group, balanceAfter)
     db.prepare('UPDATE users SET quota_balance = ?, updated_at = ? WHERE id = ?').run(balanceAfter, now, user.id)
     db.prepare('INSERT INTO reward_redemptions (id, code_id, user_id, ip_address, quota_amount, created_at) VALUES (?, ?, ?, ?, ?, ?)')
       .run(genId(), code.id, user.id, ipAddress, code.quotaAmount, now)
@@ -1345,10 +1972,10 @@ function redeemRewardCode(actor, rawCode, ipAddress) {
       amount: code.quotaAmount,
       units: 1,
       unitCost: code.quotaAmount,
-      balanceBefore: user.quotaBalance,
-      balanceAfter,
+      personalAmount: code.quotaAmount,
+      ...balances,
       plan: getPlan(user.planId),
-      group: getGroup(user.groupId),
+      group,
       note: `兑换码 ${code.code}：${code.name}`,
       createdAt: now,
     })
@@ -1377,6 +2004,8 @@ function checkInUser(actor, ipAddress) {
     const user = getUser(actor.id)
     if (!user) fail(401, '请重新登录')
     const balanceAfter = user.quotaBalance + settings.quotaAmount
+    const group = getStrictGroup(user.groupId)
+    const balances = getQuotaBalanceSnapshot(user, group, balanceAfter)
     db.prepare('UPDATE users SET quota_balance = ?, updated_at = ? WHERE id = ?').run(balanceAfter, now, user.id)
     db.prepare('INSERT INTO checkin_records (id, user_id, ip_address, quota_amount, created_at) VALUES (?, ?, ?, ?, ?)')
       .run(genId(), user.id, ipAddress, settings.quotaAmount, now)
@@ -1388,10 +2017,10 @@ function checkInUser(actor, ipAddress) {
       amount: settings.quotaAmount,
       units: 1,
       unitCost: settings.quotaAmount,
-      balanceBefore: user.quotaBalance,
-      balanceAfter,
+      personalAmount: settings.quotaAmount,
+      ...balances,
       plan: getPlan(user.planId),
-      group: getGroup(user.groupId),
+      group,
       note: `${settings.brandTitle} 签到奖励`,
       createdAt: now,
     })
@@ -1414,41 +2043,35 @@ const server = http.createServer(async (req, res) => {
       return json(res, 410, { error: '客户端账号迁移接口已移除，请通过注册和管理员后台管理账号。' })
     }
 
+    if (req.method === 'GET' && path === '/auth/verify-email') {
+      try {
+        verifyEmailRegistration(url.searchParams.get('token') || '')
+        return html(res, 200, verificationResultHtml({
+          title: '邮箱验证成功',
+          message: '账号已经激活。现在可以返回登录页，使用邮箱和密码进入工作台。',
+        }))
+      } catch (error) {
+        const message = error instanceof Error ? error.message : '验证失败，请重新注册获取新的验证邮件'
+        const status = error instanceof ApiError ? error.status : 500
+        return html(res, status, verificationResultHtml({
+          title: '邮箱验证未完成',
+          message,
+          tone: 'error',
+        }))
+      }
+    }
+
     if (req.method === 'POST' && path === '/auth/register') {
-      const body = await readJson(req)
-      const email = normalizeEmail(body.email)
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json(res, 400, { error: '请输入有效邮箱' })
-      if (String(body.password || '').length < 8) return json(res, 400, { error: '密码至少 8 位' })
-      if (db.prepare('SELECT 1 FROM users WHERE email = ?').get(email)) return json(res, 409, { error: '这个邮箱已经注册' })
-      const now = Date.now()
-      const plan = db.prepare('SELECT * FROM plans WHERE id = ? AND group_id = ?').get('starter', DEFAULT_GROUP_ID)
-        ?? db.prepare('SELECT * FROM plans WHERE group_id = ? ORDER BY monthly_price LIMIT 1').get(DEFAULT_GROUP_ID)
-      const salt = randomBytes(16).toString('hex')
-      const userId = genId()
-      db.prepare('INSERT INTO users (id, email, display_name, role, group_id, plan_id, quota_balance, total_quota_used, can_use_agent, password_hash, password_salt, created_at, updated_at, last_login_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?, ?, ?, ?)')
-        .run(userId, email, String(body.displayName || email.split('@')[0]).trim().slice(0, 48), hasAdmin() ? 'member' : 'admin', DEFAULT_GROUP_ID, plan.id, plan.monthly_quota, hashPassword(String(body.password), salt), salt, now, now, now)
-      insertLedgerEntry({
-        userId,
-        user: { groupId: DEFAULT_GROUP_ID, planId: plan.id },
-        type: 'credit',
-        source: 'admin',
-        amount: plan.monthly_quota,
-        units: 1,
-        unitCost: plan.monthly_quota,
-        balanceBefore: 0,
-        balanceAfter: plan.monthly_quota,
-        plan,
-        group: getGroup(DEFAULT_GROUP_ID),
-        note: `注册发放 ${plan.name} 起始额度`,
-        createdAt: now,
-      })
-      const user = getUser(userId)
-      return json(res, 200, getState(user, createSession(userId)))
+      return json(res, 200, await startEmailRegistration(req, await readJson(req)))
     }
 
     if (req.method === 'POST' && path === '/auth/login') {
       const body = await readJson(req)
-      const row = db.prepare('SELECT * FROM users WHERE email = ?').get(normalizeEmail(body.email))
+      const email = normalizeEmail(body.email)
+      const row = db.prepare('SELECT * FROM users WHERE email = ?').get(email)
+      if (!row && db.prepare('SELECT 1 FROM pending_email_registrations WHERE email = ? AND expires_at > ?').get(email, Date.now())) {
+        return json(res, 403, { error: '账号尚未激活，请先点击验证邮件中的专属链接完成注册' })
+      }
       if (!row || row.password_hash !== hashPassword(String(body.password || ''), row.password_salt)) return json(res, 401, { error: '账号或密码不正确' })
       const now = Date.now()
       db.prepare('UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?').run(now, now, row.id)
@@ -1459,6 +2082,12 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && path === '/auth/logout') {
       const token = getBearerToken(req)
       if (token) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashToken(token))
+      return json(res, 200, getState(null, null))
+    }
+
+    if (req.method === 'PATCH' && path === '/settings/email' && getUserCount() === 0) {
+      const body = await readJson(req)
+      updateEmailSettings(isRecord(body.settings) ? body.settings : body)
       return json(res, 200, getState(null, null))
     }
 
@@ -1498,43 +2127,54 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, getState(getUser(actor.id), authSession))
     }
 
+    if (req.method === 'PATCH' && path === '/me/quota-priority') {
+      const body = await readJson(req)
+      const priority = normalizeQuotaDeductionPriority(body.quotaDeductionPriority, actor.quotaDeductionPriority)
+      db.prepare('UPDATE users SET quota_deduction_priority = ?, updated_at = ? WHERE id = ?').run(priority, Date.now(), actor.id)
+      return json(res, 200, getState(getUser(actor.id), authSession))
+    }
+
     if (req.method === 'POST' && path === '/usage/charge') {
       const body = await readJson(req)
       const source = body.source === 'agent' ? 'agent' : 'gallery'
-      const user = getUser(actor.id)
-      if (!user) return json(res, 401, { error: '请重新登录' })
-      if (source === 'agent' && user.canUseAgent === false) return json(res, 403, { error: '当前账号未开通 Agent 权限' })
       const activeProfile = getActiveProfile(getApiSettings())
       const admin = canManage(actor)
       if (typeof activeProfile.apiKey !== 'string' || !activeProfile.apiKey.trim()) return json(res, 400, { error: admin ? '管理员尚未配置 API Key' : '当前后台接口配置不可用，请联系管理员检查。' })
       if (typeof activeProfile.baseUrl !== 'string' || !activeProfile.baseUrl.trim()) return json(res, 400, { error: admin ? '管理员尚未配置 API Base URL' : '当前后台接口配置不可用，请联系管理员检查。' })
       if (source === 'agent' && (activeProfile.provider !== 'openai' || activeProfile.apiMode !== 'responses')) return json(res, 400, { error: admin ? '管理员尚未配置可用的 OpenAI Responses API' : '当前 Agent 接口配置不可用，请联系管理员检查。' })
-      const plan = db.prepare('SELECT * FROM plans WHERE id = ? AND group_id = ?').get(user.planId, user.groupId)
-      if (!plan) return json(res, 400, { error: '当前套餐不属于用户分组，请联系管理员重新分配套餐。' })
-      const unitCost = source === 'agent' ? plan.agent_turn_cost : plan.gallery_unit_cost
       const units = normalizePositiveInteger(body.units, 1)
-      const cost = units * unitCost
-      if (user.quotaBalance < cost) return json(res, 402, { error: `额度不足：本次需要 ${cost} 点，当前剩余 ${user.quotaBalance} 点` })
-      const balanceAfter = user.quotaBalance - cost
-      const now = Date.now()
-      db.prepare('UPDATE users SET quota_balance = ?, total_quota_used = total_quota_used + ?, updated_at = ? WHERE id = ?').run(balanceAfter, cost, now, user.id)
-      insertLedgerEntry({
-        userId: user.id,
-        user,
-        type: 'debit',
-        source,
-        amount: cost,
-        units,
-        unitCost,
-        balanceBefore: user.quotaBalance,
-        balanceAfter,
-        plan,
-        group: getGroup(user.groupId),
-        profile: activeProfile,
-        note: String(body.note || ''),
-        createdAt: now,
+      withImmediateTransaction(() => {
+        const user = getUser(actor.id)
+        if (!user) fail(401, '请重新登录')
+        if (source === 'agent' && user.canUseAgent === false) fail(403, '当前账号未开通 Agent 权限')
+        const plan = db.prepare('SELECT * FROM plans WHERE id = ? AND group_id = ?').get(user.planId, user.groupId)
+        if (!plan) fail(400, '当前套餐不属于用户分组，请联系管理员重新分配套餐。')
+        const group = getStrictGroup(user.groupId)
+        const unitCost = source === 'agent' ? plan.agent_turn_cost : plan.gallery_unit_cost
+        const cost = units * unitCost
+        const split = splitQuotaDebit(user, group, cost)
+        const now = Date.now()
+        if (group && split.groupAmount > 0) {
+          db.prepare('UPDATE groups SET quota_balance = ?, updated_at = ? WHERE id = ?').run(split.groupBalanceAfter, now, group.id)
+        }
+        db.prepare('UPDATE users SET quota_balance = ?, total_quota_used = total_quota_used + ?, updated_at = ? WHERE id = ?').run(split.personalBalanceAfter, cost, now, user.id)
+        insertLedgerEntry({
+          userId: user.id,
+          user,
+          type: 'debit',
+          source,
+          amount: cost,
+          units,
+          unitCost,
+          ...split,
+          plan,
+          group,
+          profile: activeProfile,
+          note: String(body.note || ''),
+          createdAt: now,
+        })
       })
-      return json(res, 200, getState(getUser(user.id), authSession))
+      return json(res, 200, getState(getUser(actor.id), authSession))
     }
 
     if (!canManage(actor)) return json(res, 403, { error: '需要管理员权限' })
@@ -1580,8 +2220,9 @@ const server = http.createServer(async (req, res) => {
       if (!requestedPlanInGroup && !fallbackPlan) return json(res, 400, { error: '目标分组还没有套餐，先给该分组创建套餐。' })
       const planId = requestedPlanInGroup ? requestedPlanId : fallbackPlan
       const canUseAgent = typeof body.canUseAgent === 'boolean' ? body.canUseAgent : user.canUseAgent
-      db.prepare('UPDATE users SET display_name = ?, role = ?, group_id = ?, plan_id = ?, can_use_agent = ?, updated_at = ? WHERE id = ?')
-        .run(String(body.displayName || user.displayName).trim().slice(0, 48), nextRole, groupId, planId, canUseAgent ? 1 : 0, Date.now(), user.id)
+      const quotaDeductionPriority = normalizeQuotaDeductionPriority(body.quotaDeductionPriority, user.quotaDeductionPriority)
+      db.prepare('UPDATE users SET display_name = ?, role = ?, group_id = ?, plan_id = ?, can_use_agent = ?, quota_deduction_priority = ?, updated_at = ? WHERE id = ?')
+        .run(String(body.displayName || user.displayName).trim().slice(0, 48), nextRole, groupId, planId, canUseAgent ? 1 : 0, quotaDeductionPriority, Date.now(), user.id)
       return json(res, 200, getState(getUser(actor.id), authSession))
     }
 
@@ -1592,12 +2233,48 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, getState(getUser(actor.id), authSession))
     }
 
+    if (req.method === 'POST' && path === '/settings/api/management-config') {
+      await syncManagementApiConfig(await readJson(req))
+      return json(res, 200, getState(getUser(actor.id), authSession))
+    }
+
+    if (req.method === 'PATCH' && path === '/settings/email') {
+      const body = await readJson(req)
+      updateEmailSettings(isRecord(body.settings) ? body.settings : body)
+      return json(res, 200, getState(getUser(actor.id), authSession))
+    }
+
     if (req.method === 'POST' && path === '/groups') {
       const body = normalizeGroupInput(await readJson(req))
       const id = createGroupId(body.name)
       const now = Date.now()
-      db.prepare('INSERT INTO groups (id, name, description, accent, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(id, body.name, body.description, body.accent, now, now)
+      withImmediateTransaction(() => {
+        db.prepare('INSERT INTO groups (id, name, description, accent, quota_balance, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+          .run(id, body.name, body.description, body.accent, body.quotaBalance, now, now)
+        if (body.quotaBalance > 0) {
+          insertLedgerEntry({
+            userId: actor.id,
+            user: actor,
+            type: 'adjustment',
+            source: 'admin',
+            amount: body.quotaBalance,
+            units: 0,
+            unitCost: 0,
+            balanceBefore: 0,
+            balanceAfter: body.quotaBalance,
+            personalAmount: 0,
+            groupAmount: body.quotaBalance,
+            personalBalanceBefore: 0,
+            personalBalanceAfter: 0,
+            groupBalanceBefore: 0,
+            groupBalanceAfter: body.quotaBalance,
+            plan: { id: '', name: '' },
+            group: { id, name: body.name, description: body.description, accent: body.accent, quotaBalance: body.quotaBalance },
+            note: `创建分组积分池：${body.name}`,
+            createdAt: now,
+          })
+        }
+      })
       return json(res, 200, getState(getUser(actor.id), authSession))
     }
 
@@ -1606,8 +2283,35 @@ const server = http.createServer(async (req, res) => {
       const group = db.prepare('SELECT * FROM groups WHERE id = ?').get(groupMatch[1])
       if (!group) return json(res, 404, { error: '找不到分组' })
       const body = normalizeGroupInput(await readJson(req), rowToGroup(group))
-      db.prepare('UPDATE groups SET name = ?, description = ?, accent = ?, updated_at = ? WHERE id = ?')
-        .run(body.name, body.description, body.accent, Date.now(), group.id)
+      const previous = rowToGroup(group)
+      const now = Date.now()
+      withImmediateTransaction(() => {
+        db.prepare('UPDATE groups SET name = ?, description = ?, accent = ?, quota_balance = ?, updated_at = ? WHERE id = ?')
+          .run(body.name, body.description, body.accent, body.quotaBalance, now, group.id)
+        if (body.quotaBalance !== previous.quotaBalance) {
+          insertLedgerEntry({
+            userId: actor.id,
+            user: actor,
+            type: 'adjustment',
+            source: 'admin',
+            amount: Math.abs(body.quotaBalance - previous.quotaBalance),
+            units: 0,
+            unitCost: 0,
+            balanceBefore: previous.quotaBalance,
+            balanceAfter: body.quotaBalance,
+            personalAmount: 0,
+            groupAmount: Math.abs(body.quotaBalance - previous.quotaBalance),
+            personalBalanceBefore: 0,
+            personalBalanceAfter: 0,
+            groupBalanceBefore: previous.quotaBalance,
+            groupBalanceAfter: body.quotaBalance,
+            plan: { id: '', name: '' },
+            group: { ...previous, ...body },
+            note: `调整分组积分池：${previous.name}`,
+            createdAt: now,
+          })
+        }
+      })
       return json(res, 200, getState(getUser(actor.id), authSession))
     }
 
@@ -1630,6 +2334,8 @@ const server = http.createServer(async (req, res) => {
       const amount = normalizePositiveInteger(body.amount, 1)
       const balanceAfter = user.quotaBalance + amount
       const now = Date.now()
+      const group = getStrictGroup(user.groupId)
+      const balances = getQuotaBalanceSnapshot(user, group, balanceAfter)
       db.prepare('UPDATE users SET quota_balance = ?, updated_at = ? WHERE id = ?').run(balanceAfter, now, user.id)
       insertLedgerEntry({
         userId: user.id,
@@ -1639,10 +2345,10 @@ const server = http.createServer(async (req, res) => {
         amount,
         units: 1,
         unitCost: amount,
-        balanceBefore: user.quotaBalance,
-        balanceAfter,
+        personalAmount: amount,
+        ...balances,
         plan: getPlan(user.planId),
-        group: getGroup(user.groupId),
+        group,
         note: String(body.note || '管理员发放额度'),
         createdAt: now,
       })
@@ -1655,6 +2361,8 @@ const server = http.createServer(async (req, res) => {
       if (!user) return json(res, 404, { error: '找不到用户' })
       const balanceAfter = Math.floor(normalizeNonNegativeNumber(body.balance, 0))
       const now = Date.now()
+      const group = getStrictGroup(user.groupId)
+      const balances = getQuotaBalanceSnapshot(user, group, balanceAfter)
       db.prepare('UPDATE users SET quota_balance = ?, updated_at = ? WHERE id = ?').run(balanceAfter, now, user.id)
       insertLedgerEntry({
         userId: user.id,
@@ -1664,10 +2372,10 @@ const server = http.createServer(async (req, res) => {
         amount: Math.abs(balanceAfter - user.quotaBalance),
         units: 0,
         unitCost: 0,
-        balanceBefore: user.quotaBalance,
-        balanceAfter,
+        personalAmount: Math.abs(balanceAfter - user.quotaBalance),
+        ...balances,
         plan: getPlan(user.planId),
-        group: getGroup(user.groupId),
+        group,
         note: String(body.note || '管理员校准额度'),
         createdAt: now,
       })

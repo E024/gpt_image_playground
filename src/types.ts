@@ -94,6 +94,9 @@ export interface AppSettings {
   apiProxy: boolean
   streamImages?: boolean
   streamPartialImages?: number
+  managementConfigUrl?: string
+  managementConfigAuthToken?: string
+  managementConfigUpdatedAt?: number
   customProviders: CustomProviderDefinition[]
   providerOrder?: string[]
   clearInputAfterSubmit: boolean
@@ -153,6 +156,7 @@ export interface MaskDraft {
 export type UserRole = 'admin' | 'member'
 export type BillingLedgerType = 'credit' | 'debit' | 'payment' | 'adjustment'
 export type BillingUsageSource = 'gallery' | 'agent' | 'admin'
+export type QuotaDeductionPriority = 'group_first' | 'personal_first'
 
 export interface UserPlan {
   id: string
@@ -171,6 +175,7 @@ export interface UserGroup {
   name: string
   description: string
   accent: string
+  quotaBalance: number
   createdAt: number
   updatedAt: number
 }
@@ -183,6 +188,7 @@ export interface ManagedUser {
   groupId: string
   planId: string
   quotaBalance: number
+  quotaDeductionPriority: QuotaDeductionPriority
   totalQuotaUsed: number
   canUseAgent: boolean
   createdAt: number
@@ -197,6 +203,30 @@ export interface AuthSession {
   expiresAt: number
 }
 
+export interface EmailSettings {
+  enabled: boolean
+  smtpHost: string
+  smtpPort: number
+  smtpSecure: boolean
+  smtpUser: string
+  smtpPassword?: string
+  hasSmtpPassword?: boolean
+  fromEmail: string
+  fromName: string
+  brandName: string
+  appBaseUrl: string
+  verificationExpiresMinutes: number
+  verificationSubject: string
+  verificationText: string
+  verificationHtml: string
+}
+
+export interface EmailVerificationState {
+  required: boolean
+  email: string
+  expiresAt: number
+}
+
 export interface BillingLedgerEntry {
   id: string
   userId: string
@@ -207,6 +237,13 @@ export interface BillingLedgerEntry {
   unitCost: number
   balanceBefore: number
   balanceAfter: number
+  personalAmount: number
+  groupAmount: number
+  personalBalanceBefore: number
+  personalBalanceAfter: number
+  groupBalanceBefore: number
+  groupBalanceAfter: number
+  deductionPriority: QuotaDeductionPriority
   planId: string
   planName: string
   groupId: string

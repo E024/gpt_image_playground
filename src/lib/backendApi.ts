@@ -1,4 +1,4 @@
-import type { AppSettings, AuthSession, BillingLedgerEntry, BillingLedgerType, BillingUsageSource, ManagedUser, RewardCode, RewardState, UserGroup, UserPlan } from '../types'
+import type { AppSettings, AuthSession, BillingLedgerEntry, BillingLedgerType, BillingUsageSource, EmailSettings, EmailVerificationState, ManagedUser, QuotaDeductionPriority, RewardCode, RewardState, UserGroup, UserPlan } from '../types'
 
 export interface BackendState {
   groups: UserGroup[]
@@ -9,6 +9,8 @@ export interface BackendState {
   setupRequired: boolean
   apiSettings: AppSettings | null
   adminApiSettings: AppSettings | null
+  emailSettings: EmailSettings | null
+  emailVerification?: EmailVerificationState
   rewardState: RewardState
 }
 
@@ -92,12 +94,24 @@ export function backendDeleteGroup(groupId: string, session?: AuthSession | null
   return request<BackendState>(`/groups/${encodeURIComponent(groupId)}`, { method: 'DELETE', session })
 }
 
-export function backendUpdateUser(userId: string, patch: Partial<Pick<ManagedUser, 'displayName' | 'role' | 'groupId' | 'planId' | 'canUseAgent'>>, session?: AuthSession | null) {
+export function backendUpdateUser(userId: string, patch: Partial<Pick<ManagedUser, 'displayName' | 'role' | 'groupId' | 'planId' | 'canUseAgent' | 'quotaDeductionPriority'>>, session?: AuthSession | null) {
   return request<BackendState>(`/users/${encodeURIComponent(userId)}`, { method: 'PATCH', body: JSON.stringify(patch), session })
+}
+
+export function backendUpdateMyQuotaPriority(quotaDeductionPriority: QuotaDeductionPriority, session?: AuthSession | null) {
+  return request<BackendState>('/me/quota-priority', { method: 'PATCH', body: JSON.stringify({ quotaDeductionPriority }), session })
 }
 
 export function backendUpdateApiSettings(settings: AppSettings, session?: AuthSession | null) {
   return request<BackendState>('/settings/api', { method: 'PATCH', body: JSON.stringify({ settings }), session })
+}
+
+export function backendSyncManagementApiConfig(input: { url?: string; authToken?: string }, session?: AuthSession | null) {
+  return request<BackendState>('/settings/api/management-config', { method: 'POST', body: JSON.stringify(input), session })
+}
+
+export function backendUpdateEmailSettings(settings: EmailSettings, session?: AuthSession | null) {
+  return request<BackendState>('/settings/email', { method: 'PATCH', body: JSON.stringify({ settings }), session })
 }
 
 export function backendGrantUserQuota(userId: string, amount: number, note: string, session?: AuthSession | null) {

@@ -143,6 +143,7 @@ const testGroup: UserGroup = {
   name: '默认分组',
   description: '测试分组',
   accent: 'cyan',
+  quotaBalance: 0,
   createdAt: 1,
   updatedAt: 1,
 }
@@ -160,6 +161,7 @@ const testUser: ManagedUser = {
   groupId: testGroup.id,
   planId: testPlan.id,
   quotaBalance: 1000,
+  quotaDeductionPriority: 'group_first',
   totalQuotaUsed: 0,
   canUseAgent: true,
   createdAt: 1,
@@ -197,6 +199,7 @@ describe('backend group state normalization', () => {
       name: 'Studio Group',
       description: '独立套餐分组',
       accent: 'emerald',
+      quotaBalance: 0,
       createdAt: 2,
       updatedAt: 2,
     }

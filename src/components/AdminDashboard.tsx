@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, type CSSProperties } from 'react'
 import { useStore } from '../store'
 import { getActiveApiProfile, normalizeSettings } from '../lib/apiProfiles'
 import { backendFetchLedger, type LedgerPage, type RewardCodeInput } from '../lib/backendApi'
-import type { ApiMode, ApiProfile, AppSettings, BillingLedgerEntry, BillingLedgerType, BillingUsageSource, ManagedUser, RewardCode, RewardState, UserGroup, UserPlan } from '../types'
+import { getEmailSettingsDraft } from '../lib/emailSettings'
+import type { ApiMode, ApiProfile, AppSettings, BillingLedgerEntry, BillingLedgerType, BillingUsageSource, EmailSettings, ManagedUser, QuotaDeductionPriority, RewardCode, RewardState, UserGroup, UserPlan } from '../types'
 
 type AdminSection = 'overview' | 'groups' | 'plans' | 'users' | 'rewards' | 'ledger' | 'settings'
 type NavItem = { id: AdminSection; label: string; description: string; adminOnly?: boolean }
@@ -21,6 +22,27 @@ const ledgerTypeLabels: Record<BillingLedgerType | 'all', string> = {
   payment: '付款',
   adjustment: '校准',
 }
+const quotaPriorityLabels: Record<QuotaDeductionPriority, string> = {
+  group_first: '分组优先',
+  personal_first: '个人优先',
+}
+const quotaPriorityNotes: Record<QuotaDeductionPriority, string> = {
+  group_first: '先扣分组积分池，不足部分再扣个人账户。',
+  personal_first: '先扣个人账户，不足部分再扣分组积分池。',
+}
+const CUSTOM_ACCENT_VALUE = '__custom__'
+const ACCENT_PRESETS = [
+  { value: 'cyan', label: '电光青', color: '#06b6d4' },
+  { value: 'sky', label: '极光蓝', color: '#0ea5e9' },
+  { value: 'violet', label: '星云紫', color: '#8b5cf6' },
+  { value: 'fuchsia', label: '霓虹粉', color: '#d946ef' },
+  { value: 'rose', label: '脉冲红', color: '#f43f5e' },
+  { value: 'amber', label: '熔金橙', color: '#f59e0b' },
+  { value: 'emerald', label: '晶体绿', color: '#10b981' },
+  { value: 'lime', label: '酸橙绿', color: '#84cc16' },
+  { value: 'indigo', label: '深空靛', color: '#6366f1' },
+  { value: 'slate', label: '钛灰', color: '#64748b' },
+] as const
 
 function formatMoney(value: number) {
   return new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(value)
@@ -86,6 +108,101 @@ function getCheckinStatusLabel(checkin: RewardState['checkin']) {
   return `下次 ${formatNextCheckin(checkin.nextAvailableAt)}`
 }
 
+function isHexAccent(value: string) {
+  return /^#[0-9a-fA-F]{6}$/.test(value.trim())
+}
+
+function getAccentPreset(value: string) {
+  return ACCENT_PRESETS.find((accent) => accent.value === value)
+}
+
+function getAccentColor(value: string) {
+  const trimmed = value.trim()
+  if (isHexAccent(trimmed)) return trimmed
+  return getAccentPreset(trimmed)?.color ?? ACCENT_PRESETS[0].color
+}
+
+function getAccentLabel(value: string) {
+  const trimmed = value.trim()
+  if (isHexAccent(trimmed)) return trimmed.toUpperCase()
+  return getAccentPreset(trimmed)?.label ?? (trimmed || '电光青')
+}
+
+function getAccentFrameStyle(value: string): CSSProperties {
+  const color = getAccentColor(value)
+  return {
+    borderColor: `${color}66`,
+    boxShadow: `inset 3px 0 0 ${color}`,
+  }
+}
+
+function getAccentPillStyle(value: string): CSSProperties {
+  const color = getAccentColor(value)
+  return {
+    borderColor: `${color}55`,
+    backgroundColor: `${color}18`,
+    color,
+  }
+}
+
+function AccentBadge({ accent, label }: { accent: string; label?: string }) {
+  const color = getAccentColor(accent)
+  return (
+    <span className="inline-flex max-w-full items-center gap-1.5 rounded-md border px-2 py-1 text-xs font-black" style={getAccentPillStyle(accent)}>
+      <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: color, boxShadow: `0 0 0 3px ${color}22` }} />
+      <span className="truncate">{label ?? getAccentLabel(accent)}</span>
+    </span>
+  )
+}
+
+function AccentPicker({
+  value,
+  onChange,
+  onBlur,
+}: {
+  value: string
+  onChange: (value: string) => void
+  onBlur: () => void
+}) {
+  const presetValue = getAccentPreset(value) ? value : CUSTOM_ACCENT_VALUE
+  const customColor = isHexAccent(value) ? value : getAccentColor(value)
+  return (
+    <div className="space-y-2">
+      <select
+        value={presetValue}
+        onChange={(event) => {
+          const next = event.target.value
+          onChange(next === CUSTOM_ACCENT_VALUE ? customColor : next)
+        }}
+        onBlur={onBlur}
+        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+      >
+        {ACCENT_PRESETS.map((accent) => (
+          <option key={accent.value} value={accent.value}>{accent.label}</option>
+        ))}
+        <option value={CUSTOM_ACCENT_VALUE}>自定义色值</option>
+      </select>
+      <div className="grid gap-2 sm:grid-cols-[44px_1fr]">
+        <input
+          type="color"
+          value={customColor}
+          onChange={(event) => onChange(event.target.value)}
+          onBlur={onBlur}
+          className="h-10 w-11 rounded-md border border-gray-200 bg-white p-1 dark:border-white/[0.08] dark:bg-gray-950"
+          aria-label="自定义强调色"
+        />
+        <input
+          value={value}
+          onChange={(event) => onChange(event.target.value.trim().slice(0, 24))}
+          onBlur={onBlur}
+          placeholder="#06b6d4 或 cyan"
+          className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 font-mono text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+        />
+      </div>
+    </div>
+  )
+}
+
 function getLedgerAmountLabel(entry: BillingLedgerEntry) {
   return `${entry.type === 'debit' ? '-' : '+'}${entry.amount} 点`
 }
@@ -129,9 +246,11 @@ export default function AdminDashboard() {
   const rewardState = useStore((s) => s.rewardState)
   const settings = useStore((s) => s.settings)
   const adminApiSettings = useStore((s) => s.adminApiSettings)
+  const emailSettings = useStore((s) => s.emailSettings)
   const session = useStore((s) => s.authSession)
   const setAppMode = useStore((s) => s.setAppMode)
   const updateManagedUser = useStore((s) => s.updateManagedUser)
+  const updateMyQuotaDeductionPriority = useStore((s) => s.updateMyQuotaDeductionPriority)
   const grantUserQuota = useStore((s) => s.grantUserQuota)
   const setUserQuotaBalance = useStore((s) => s.setUserQuotaBalance)
   const createGroup = useStore((s) => s.createGroup)
@@ -141,6 +260,8 @@ export default function AdminDashboard() {
   const updatePlan = useStore((s) => s.updatePlan)
   const deletePlan = useStore((s) => s.deletePlan)
   const updateApiSettings = useStore((s) => s.updateApiSettings)
+  const syncManagementApiConfig = useStore((s) => s.syncManagementApiConfig)
+  const updateEmailSettings = useStore((s) => s.updateEmailSettings)
   const createRewardCode = useStore((s) => s.createRewardCode)
   const updateRewardCode = useStore((s) => s.updateRewardCode)
   const deleteRewardCode = useStore((s) => s.deleteRewardCode)
@@ -154,7 +275,9 @@ export default function AdminDashboard() {
   const currentPlan = plans.find((plan) => plan.id === currentUser?.planId && plan.groupId === currentUser?.groupId)
     ?? plans.find((plan) => plan.groupId === currentUser?.groupId)
     ?? plans[0]
-  const [section, setSection] = useState<AdminSection>(isAdmin ? 'overview' : 'plans')
+  const currentGroupQuotaBalance = currentGroup?.quotaBalance ?? 0
+  const currentTotalQuotaBalance = (currentUser?.quotaBalance ?? 0) + currentGroupQuotaBalance
+  const [section, setSection] = useState<AdminSection>('overview')
   const [selectedGroupId, setSelectedGroupId] = useState(currentGroup?.id ?? groups[0]?.id ?? DEFAULT_GROUP_ID)
   const [selectedPlanId, setSelectedPlanId] = useState(currentPlan?.id ?? plans[0]?.id ?? '')
   const [quotaDrafts, setQuotaDrafts] = useState<Record<string, string>>({})
@@ -167,6 +290,7 @@ export default function AdminDashboard() {
   const [redeemBusy, setRedeemBusy] = useState(false)
   const [checkinBusy, setCheckinBusy] = useState(false)
   const [apiDraft, setApiDraft] = useState<AppSettings>(() => normalizeSettings(adminApiSettings ?? settings))
+  const [emailDraft, setEmailDraft] = useState<EmailSettings>(() => getEmailSettingsDraft(emailSettings))
   const [ledgerQuery, setLedgerQuery] = useState('')
   const [ledgerSource, setLedgerSource] = useState<BillingUsageSource | 'all'>('all')
   const [ledgerType, setLedgerType] = useState<BillingLedgerType | 'all'>('all')
@@ -179,6 +303,7 @@ export default function AdminDashboard() {
   const [ledgerResult, setLedgerResult] = useState<LedgerPage | null>(null)
   const [ledgerBusy, setLedgerBusy] = useState(false)
   const [ledgerError, setLedgerError] = useState('')
+  const [managementConfigBusy, setManagementConfigBusy] = useState(false)
 
   const visibleLedger = isAdmin ? ledger : ledger.filter((entry) => entry.userId === currentUser?.id)
   const selectedGroup = groups.find((group) => group.id === selectedGroupId) ?? currentGroup ?? groups[0] ?? null
@@ -208,6 +333,10 @@ export default function AdminDashboard() {
   useEffect(() => {
     setApiDraft(normalizeSettings(adminApiSettings ?? settings))
   }, [adminApiSettings, settings])
+
+  useEffect(() => {
+    setEmailDraft(getEmailSettingsDraft(emailSettings))
+  }, [emailSettings])
 
   useEffect(() => {
     setCheckinDraft(rewardState.checkin)
@@ -305,6 +434,19 @@ export default function AdminDashboard() {
     { id: 'settings', label: 'API 配置', description: '统一接口与 Agent', adminOnly: true },
     { id: 'ledger', label: '流水', description: isAdmin ? '全部消费与调整' : '我的消费记录' },
   ] satisfies NavItem[]).filter((item) => isAdmin || !item.adminOnly)
+  const summaryCards = isAdmin
+    ? [
+        ['预计 MRR', formatMoney(stats.mrr), '按当前套餐汇总'],
+        ['已发放额度', `${stats.issued} 点`, '注册、校准与补发'],
+        ['已消耗额度', `${stats.consumed} 点`, '画廊与 Agent 扣费'],
+        ['活跃用户', `${stats.activeUsers}/${users.length}`, '至少登录过一次'],
+      ]
+    : [
+        ['当前套餐', currentPlan?.name ?? '未分配', `${formatMoney(currentPlan?.monthlyPrice ?? 0)} / 月`],
+        ['总可用额度', `${currentTotalQuotaBalance} 点`, `分组 ${currentGroupQuotaBalance} + 个人 ${currentUser.quotaBalance}`],
+        ['个人账户', `${currentUser.quotaBalance} 点`, '兑换码、签到和补发入账'],
+        ['扣费顺序', quotaPriorityLabels[currentUser.quotaDeductionPriority], quotaPriorityNotes[currentUser.quotaDeductionPriority]],
+      ]
 
   const handleSelectGroup = (groupId: string) => {
     setSelectedGroupId(groupId)
@@ -316,6 +458,7 @@ export default function AdminDashboard() {
       name: '新创作组',
       description: '独立用户、套餐和额度策略。',
       accent: 'cyan',
+      quotaBalance: 0,
     })
   }
 
@@ -374,6 +517,26 @@ export default function AdminDashboard() {
 
   const commitApiSettings = () => {
     updateApiSettings(normalizeSettings(apiDraft))
+  }
+
+  const handleSyncManagementConfig = async () => {
+    setManagementConfigBusy(true)
+    try {
+      await syncManagementApiConfig({
+        url: apiDraft.managementConfigUrl,
+        authToken: apiDraft.managementConfigAuthToken,
+      })
+    } finally {
+      setManagementConfigBusy(false)
+    }
+  }
+
+  const updateEmailDraft = (patch: Partial<EmailSettings>) => {
+    setEmailDraft((draft) => ({ ...draft, ...patch }))
+  }
+
+  const commitEmailSettings = () => {
+    updateEmailSettings(emailDraft)
   }
 
   const updateSelectedDraft = (patch: Partial<UserPlan>) => {
@@ -503,10 +666,17 @@ export default function AdminDashboard() {
             <div className="text-xs font-black uppercase tracking-[0.18em] text-cyan-600 dark:text-cyan-400">Backend Desk</div>
             <div className="mt-2 truncate text-sm font-black">{currentUser.displayName}</div>
             <div className="truncate text-xs text-gray-500">{currentUser.email}</div>
+            {currentGroup && (
+              <div className="mt-3 flex flex-wrap items-center gap-1.5 text-xs font-bold text-gray-500 dark:text-gray-400">
+                <span>分组：</span>
+                <AccentBadge accent={currentGroup.accent} label={currentGroup.name} />
+              </div>
+            )}
             <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
               <div className="rounded-md bg-gray-50 p-2 dark:bg-white/[0.04]">
-                <div className="text-gray-500">余额</div>
-                <div className="mt-1 font-black">{currentUser.quotaBalance} 点</div>
+                <div className="text-gray-500">总可用</div>
+                <div className="mt-1 font-black">{currentTotalQuotaBalance} 点</div>
+                <div className="mt-0.5 truncate text-[11px] text-gray-400">分组 {currentGroupQuotaBalance} / 个人 {currentUser.quotaBalance}</div>
               </div>
               <div className="rounded-md bg-gray-50 p-2 dark:bg-white/[0.04]">
                 <div className="text-gray-500">角色</div>
@@ -548,12 +718,7 @@ export default function AdminDashboard() {
             {section === 'overview' && (
               <div className="space-y-4">
                 <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-                  {[
-                    [isAdmin ? '预计 MRR' : '当前套餐', isAdmin ? formatMoney(stats.mrr) : currentPlan?.name ?? '未分配', isAdmin ? '按当前套餐汇总' : `${formatMoney(currentPlan?.monthlyPrice ?? 0)} / 月`],
-                    [isAdmin ? '已发放额度' : '可用额度', isAdmin ? `${stats.issued} 点` : `${currentUser.quotaBalance} 点`, isAdmin ? '注册、校准与补发' : '提交生成时自动扣除'],
-                    ['已消耗额度', `${stats.consumed} 点`, '画廊与 Agent 扣费'],
-                    [isAdmin ? '活跃用户' : '扣费规则', isAdmin ? `${stats.activeUsers}/${users.length}` : `图 ${currentPlan?.galleryUnitCost ?? '-'} / Agent ${currentPlan?.agentTurnCost ?? '-'}`, isAdmin ? '至少登录过一次' : '按当前套餐执行'],
-                  ].map(([label, value, note]) => (
+                  {summaryCards.map(([label, value, note]) => (
                     <div key={label} className="rounded-lg border border-gray-200 bg-white p-4 shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
                       <div className="text-xs font-semibold text-gray-500 dark:text-gray-400">{label}</div>
                       <div className="mt-2 text-2xl font-black">{value}</div>
@@ -561,6 +726,56 @@ export default function AdminDashboard() {
                     </div>
                   ))}
                 </div>
+                {currentGroup && (
+                  <div className="rounded-lg border bg-white p-4 shadow-sm dark:bg-white/[0.04]" style={getAccentFrameStyle(currentGroup.accent)}>
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="min-w-0">
+                        <div className="text-xs font-semibold text-gray-500 dark:text-gray-400">{isAdmin ? '当前登录分组' : '我的分组'}</div>
+                        <div className="mt-1 truncate text-xl font-black">{currentGroup.name}</div>
+                        <p className="mt-1 text-sm leading-6 text-gray-500 dark:text-gray-400">
+                          {currentGroup.description || '该分组暂无说明。'} 分组积分池当前还有 <span className="font-black text-gray-900 dark:text-gray-100">{currentGroup.quotaBalance}</span> 点。
+                        </p>
+                      </div>
+                      <div className="shrink-0">
+                        <AccentBadge accent={currentGroup.accent} label={getAccentLabel(currentGroup.accent)} />
+                      </div>
+                    </div>
+                  </div>
+                )}
+                {!isAdmin && (
+                  <div className="grid gap-4 lg:grid-cols-[1.1fr_0.9fr]">
+                    <div className="rounded-lg border border-gray-200 bg-white p-4 shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
+                      <div className="text-xs font-black uppercase tracking-[0.18em] text-cyan-600 dark:text-cyan-400">Quota Split</div>
+                      <h2 className="mt-1 text-lg font-black">积分来源</h2>
+                      <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                        <div className="rounded-md bg-gray-50 p-3 dark:bg-white/[0.04]">
+                          <div className="text-xs font-semibold text-gray-500 dark:text-gray-400">总可用</div>
+                          <div className="mt-1 text-xl font-black">{currentTotalQuotaBalance} 点</div>
+                        </div>
+                        <div className="rounded-md bg-gray-50 p-3 dark:bg-white/[0.04]">
+                          <div className="text-xs font-semibold text-gray-500 dark:text-gray-400">分组积分池</div>
+                          <div className="mt-1 text-xl font-black">{currentGroupQuotaBalance} 点</div>
+                        </div>
+                        <div className="rounded-md bg-gray-50 p-3 dark:bg-white/[0.04]">
+                          <div className="text-xs font-semibold text-gray-500 dark:text-gray-400">个人账户</div>
+                          <div className="mt-1 text-xl font-black">{currentUser.quotaBalance} 点</div>
+                        </div>
+                      </div>
+                    </div>
+                    <label className="rounded-lg border border-gray-200 bg-white p-4 shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
+                      <span className="text-xs font-black uppercase tracking-[0.18em] text-violet-600 dark:text-violet-300">Deduction Rule</span>
+                      <span className="mt-1 block text-lg font-black">扣费顺序</span>
+                      <select
+                        value={currentUser.quotaDeductionPriority}
+                        onChange={(event) => updateMyQuotaDeductionPriority(event.target.value as QuotaDeductionPriority)}
+                        className="mt-4 w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm font-bold outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      >
+                        {Object.entries(quotaPriorityLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                      </select>
+                      <span className="mt-3 block text-sm leading-6 text-gray-500 dark:text-gray-400">{quotaPriorityNotes[currentUser.quotaDeductionPriority]}</span>
+                    </label>
+                  </div>
+                )}
               </div>
             )}
 
@@ -586,7 +801,8 @@ export default function AdminDashboard() {
                           key={group.id}
                           type="button"
                           onClick={() => handleSelectGroup(group.id)}
-                          className={`mb-2 w-full rounded-lg border p-3 text-left transition ${isSelected ? 'border-cyan-400 bg-cyan-50 dark:border-cyan-500/60 dark:bg-cyan-500/10' : 'border-gray-200 bg-white hover:bg-gray-50 dark:border-white/[0.08] dark:bg-transparent dark:hover:bg-white/[0.04]'}`}
+                          style={isSelected ? getAccentFrameStyle(group.accent) : undefined}
+                          className={`mb-2 w-full rounded-lg border p-3 text-left transition ${isSelected ? 'bg-white shadow-sm dark:bg-white/[0.05]' : 'border-gray-200 bg-white hover:bg-gray-50 dark:border-white/[0.08] dark:bg-transparent dark:hover:bg-white/[0.04]'}`}
                         >
                           <div className="flex items-center justify-between gap-2">
                             <div className="min-w-0">
@@ -599,8 +815,8 @@ export default function AdminDashboard() {
                           </div>
                           <div className="mt-2 line-clamp-2 text-xs leading-5 text-gray-500">{group.description || '暂无说明'}</div>
                           <div className="mt-2 flex items-center justify-between text-xs text-gray-400">
-                            <span>{groupPlanCount} 个套餐</span>
-                            <span>{group.id === DEFAULT_GROUP_ID ? '默认分组' : group.accent}</span>
+                            <span>{groupPlanCount} 个套餐 · 池 {group.quotaBalance} 点</span>
+                            <AccentBadge accent={group.accent} label={group.id === DEFAULT_GROUP_ID ? '默认分组' : getAccentLabel(group.accent)} />
                           </div>
                         </button>
                       )
@@ -659,16 +875,25 @@ export default function AdminDashboard() {
                       </label>
                       <label className="block">
                         <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">强调色</span>
-                        <input
+                        <AccentPicker
                           value={selectedGroupDraft.accent}
-                          onChange={(event) => updateSelectedGroupDraft({ accent: event.target.value })}
+                          onChange={(accent) => updateSelectedGroupDraft({ accent })}
                           onBlur={commitSelectedGroupDraft}
-                          className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
                         />
                       </label>
-                      <div className="rounded-lg bg-gray-50 p-4 text-sm text-gray-600 dark:bg-white/[0.04] dark:text-gray-300 lg:col-span-2">
-                        <div className="font-black text-gray-900 dark:text-gray-100">分组规则</div>
-                        <p className="mt-2 leading-6">用户只能分配到所属分组的套餐。普通成员进入后台时，只能看到自己的套餐和消费流水。</p>
+                      <NumberField
+                        label="分组积分池"
+                        value={selectedGroupDraft.quotaBalance}
+                        min={0}
+                        onChange={(value) => updateSelectedGroupDraft({ quotaBalance: value })}
+                        onBlur={commitSelectedGroupDraft}
+                      />
+                      <div className="rounded-lg border bg-gray-50 p-4 text-sm text-gray-600 dark:bg-white/[0.04] dark:text-gray-300 lg:col-span-2" style={getAccentFrameStyle(selectedGroupDraft.accent)}>
+                        <div className="flex flex-wrap items-center gap-2 font-black text-gray-900 dark:text-gray-100">
+                          <span>分组规则</span>
+                          <AccentBadge accent={selectedGroupDraft.accent} label={getAccentLabel(selectedGroupDraft.accent)} />
+                        </div>
+                        <p className="mt-2 leading-6">用户只能分配到所属分组的套餐。调用时会按用户扣费顺序在分组积分池和个人账户之间拆分扣除。</p>
                       </div>
                     </div>
                   ) : (
@@ -791,7 +1016,7 @@ export default function AdminDashboard() {
                         />
                       </label>
                       <NumberField label="月费" value={selectedDraft.monthlyPrice} disabled={!canEditPlans} onChange={(value) => updateSelectedDraft({ monthlyPrice: value })} onBlur={commitSelectedDraft} />
-                      <NumberField label="月额度" value={selectedDraft.monthlyQuota} min={1} disabled={!canEditPlans} onChange={(value) => updateSelectedDraft({ monthlyQuota: value })} onBlur={commitSelectedDraft} />
+                      <NumberField label="个人月额度" value={selectedDraft.monthlyQuota} min={1} disabled={!canEditPlans} onChange={(value) => updateSelectedDraft({ monthlyQuota: value })} onBlur={commitSelectedDraft} />
                       <NumberField label="画廊扣费 / 张" value={selectedDraft.galleryUnitCost} min={1} disabled={!canEditPlans} onChange={(value) => updateSelectedDraft({ galleryUnitCost: value })} onBlur={commitSelectedDraft} />
                       <NumberField label="Agent 扣费 / 轮" value={selectedDraft.agentTurnCost} min={1} disabled={!canEditPlans} onChange={(value) => updateSelectedDraft({ agentTurnCost: value })} onBlur={commitSelectedDraft} />
                     </div>
@@ -1106,6 +1331,40 @@ export default function AdminDashboard() {
                         className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm font-black outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
                       />
                     </label>
+                    <div className="rounded-lg border border-cyan-100 bg-cyan-50/70 p-3 dark:border-cyan-500/20 dark:bg-cyan-500/10 lg:col-span-2">
+                      <div className="flex flex-col gap-3 lg:flex-row lg:items-end">
+                        <label className="block min-w-0 flex-1">
+                          <span className="mb-1 block text-xs font-semibold text-cyan-800 dark:text-cyan-100">管理配置 URL</span>
+                          <input
+                            value={apiDraft.managementConfigUrl ?? ''}
+                            onChange={(event) => updateApiDraft({ managementConfigUrl: event.target.value })}
+                            placeholder="https://cpajp.cloud1024.com/v0/management/config.yaml"
+                            className="w-full rounded-md border border-cyan-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-500 dark:border-cyan-500/30 dark:bg-gray-950"
+                          />
+                        </label>
+                        <label className="block min-w-0 flex-1">
+                          <span className="mb-1 block text-xs font-semibold text-cyan-800 dark:text-cyan-100">管理配置授权 Token</span>
+                          <input
+                            type="password"
+                            value={apiDraft.managementConfigAuthToken ?? ''}
+                            onChange={(event) => updateApiDraft({ managementConfigAuthToken: event.target.value })}
+                            placeholder="Bearer token 或原始 token"
+                            className="w-full rounded-md border border-cyan-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-500 dark:border-cyan-500/30 dark:bg-gray-950"
+                          />
+                        </label>
+                        <button
+                          type="button"
+                          onClick={handleSyncManagementConfig}
+                          disabled={managementConfigBusy}
+                          className="rounded-md bg-cyan-700 px-3 py-2 text-sm font-bold text-white transition hover:bg-cyan-600 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {managementConfigBusy ? '同步中...' : '拉取配置'}
+                        </button>
+                      </div>
+                      <div className="mt-2 text-xs leading-5 text-cyan-800/80 dark:text-cyan-100/80">
+                        后端会用 GET 请求读取 config.yaml，并带上 Authorization 请求头。{apiDraft.managementConfigUpdatedAt ? `上次同步：${formatFullDate(apiDraft.managementConfigUpdatedAt)}` : '尚未同步远程管理配置。'}
+                      </div>
+                    </div>
                     <label className="block lg:col-span-2">
                       <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">API Base URL（含端口）</span>
                       <input
@@ -1191,6 +1450,142 @@ export default function AdminDashboard() {
                     </button>
                   </div>
                 </div>
+
+                <div className="rounded-lg border border-gray-200 bg-white shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04] xl:col-span-2">
+                  <div className="flex flex-col gap-3 border-b border-gray-200 px-4 py-3 dark:border-white/[0.08] sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <h2 className="text-sm font-black">邮箱验证配置</h2>
+                      <p className="mt-1 text-xs text-gray-500">注册账号必须点击专属验证链接后才会写入用户表。</p>
+                    </div>
+                    <button onClick={commitEmailSettings} className="rounded-md bg-gray-900 px-3 py-2 text-xs font-bold text-white transition hover:bg-gray-700 dark:bg-white dark:text-gray-950">
+                      保存邮箱配置
+                    </button>
+                  </div>
+                  <div className="grid gap-4 p-4 lg:grid-cols-4">
+                    <label className="flex items-center justify-between gap-3 rounded-md border border-gray-200 px-3 py-2 dark:border-white/[0.08] lg:col-span-4">
+                      <span>
+                        <span className="block text-xs font-semibold text-gray-500 dark:text-gray-400">启用邮箱验证</span>
+                        <span className="mt-1 block text-xs text-gray-400">关闭后注册接口会拒绝创建新账号，避免未验证账号混入。</span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => updateEmailDraft({ enabled: !emailDraft.enabled })}
+                        className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${emailDraft.enabled ? 'bg-cyan-500' : 'bg-gray-300 dark:bg-gray-600'}`}
+                        aria-pressed={emailDraft.enabled}
+                      >
+                        <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${emailDraft.enabled ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                      </button>
+                    </label>
+                    <label className="block lg:col-span-2">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">SMTP Host</span>
+                      <input
+                        value={emailDraft.smtpHost}
+                        onChange={(event) => updateEmailDraft({ smtpHost: event.target.value })}
+                        placeholder="smtp.example.com"
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      />
+                    </label>
+                    <NumberField label="SMTP Port" value={emailDraft.smtpPort} min={1} onChange={(value) => updateEmailDraft({ smtpPort: value })} />
+                    <label className="flex items-center justify-between gap-3 rounded-md border border-gray-200 px-3 py-2 dark:border-white/[0.08]">
+                      <span>
+                        <span className="block text-xs font-semibold text-gray-500 dark:text-gray-400">SSL/TLS</span>
+                        <span className="mt-1 block text-xs text-gray-400">465 通常开启。</span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => updateEmailDraft({ smtpSecure: !emailDraft.smtpSecure })}
+                        className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${emailDraft.smtpSecure ? 'bg-cyan-500' : 'bg-gray-300 dark:bg-gray-600'}`}
+                        aria-pressed={emailDraft.smtpSecure}
+                      >
+                        <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${emailDraft.smtpSecure ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                      </button>
+                    </label>
+                    <label className="block lg:col-span-2">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">SMTP 用户名</span>
+                      <input
+                        value={emailDraft.smtpUser}
+                        onChange={(event) => updateEmailDraft({ smtpUser: event.target.value })}
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      />
+                    </label>
+                    <label className="block lg:col-span-2">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">
+                        SMTP 密码 {emailDraft.hasSmtpPassword ? '（留空保留当前密码）' : ''}
+                      </span>
+                      <input
+                        type="password"
+                        value={emailDraft.smtpPassword ?? ''}
+                        onChange={(event) => updateEmailDraft({ smtpPassword: event.target.value })}
+                        placeholder={emailDraft.hasSmtpPassword ? '已保存密码，留空不修改' : '请输入 SMTP 密码或授权码'}
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      />
+                    </label>
+                    <label className="block lg:col-span-2">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">发件邮箱</span>
+                      <input
+                        value={emailDraft.fromEmail}
+                        onChange={(event) => updateEmailDraft({ fromEmail: event.target.value })}
+                        placeholder="noreply@example.com"
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      />
+                    </label>
+                    <label className="block lg:col-span-2">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">发件名称</span>
+                      <input
+                        value={emailDraft.fromName}
+                        onChange={(event) => updateEmailDraft({ fromName: event.target.value })}
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      />
+                    </label>
+                    <label className="block lg:col-span-2">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">品牌名</span>
+                      <input
+                        value={emailDraft.brandName}
+                        onChange={(event) => updateEmailDraft({ brandName: event.target.value })}
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm font-black outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      />
+                    </label>
+                    <label className="block lg:col-span-2">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">应用访问地址</span>
+                      <input
+                        value={emailDraft.appBaseUrl}
+                        onChange={(event) => updateEmailDraft({ appBaseUrl: event.target.value })}
+                        placeholder="https://your-domain.com"
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      />
+                    </label>
+                    <NumberField label="验证有效期（分钟）" value={emailDraft.verificationExpiresMinutes} min={1} onChange={(value) => updateEmailDraft({ verificationExpiresMinutes: value })} />
+                    <label className="block lg:col-span-3">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">邮件标题</span>
+                      <input
+                        value={emailDraft.verificationSubject}
+                        onChange={(event) => updateEmailDraft({ verificationSubject: event.target.value })}
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      />
+                    </label>
+                    <label className="block lg:col-span-2">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">纯文本模板</span>
+                      <textarea
+                        value={emailDraft.verificationText}
+                        onChange={(event) => updateEmailDraft({ verificationText: event.target.value })}
+                        rows={8}
+                        className="w-full resize-none rounded-md border border-gray-200 bg-white px-3 py-2 font-mono text-xs outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      />
+                    </label>
+                    <label className="block lg:col-span-2">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">HTML 模板</span>
+                      <textarea
+                        value={emailDraft.verificationHtml}
+                        onChange={(event) => updateEmailDraft({ verificationHtml: event.target.value })}
+                        rows={8}
+                        className="w-full resize-none rounded-md border border-gray-200 bg-white px-3 py-2 font-mono text-xs outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      />
+                    </label>
+                    <div className="rounded-md bg-gray-50 p-3 text-xs leading-5 text-gray-500 dark:bg-white/[0.04] lg:col-span-4">
+                      可用变量：<span className="font-mono text-gray-800 dark:text-gray-200">{'{brandName}'}</span>、<span className="font-mono text-gray-800 dark:text-gray-200">{'{displayName}'}</span>、<span className="font-mono text-gray-800 dark:text-gray-200">{'{verificationLink}'}</span>、<span className="font-mono text-gray-800 dark:text-gray-200">{'{verificationCode}'}</span>、<span className="font-mono text-gray-800 dark:text-gray-200">{'{expiresMinutes}'}</span>。
+                    </div>
+                  </div>
+                </div>
               </div>
             )}
 
@@ -1204,7 +1599,8 @@ export default function AdminDashboard() {
                       <th className="px-4 py-3 text-left font-bold">分组</th>
                       <th className="px-4 py-3 text-left font-bold">Agent</th>
                       <th className="px-4 py-3 text-left font-bold">套餐</th>
-                      <th className="px-4 py-3 text-left font-bold">额度</th>
+                      <th className="px-4 py-3 text-left font-bold">扣费顺序</th>
+                      <th className="px-4 py-3 text-left font-bold">积分</th>
                       <th className="px-4 py-3 text-left font-bold">消耗</th>
                       <th className="px-4 py-3 text-left font-bold">最近登录</th>
                       <th className="px-4 py-3 text-left font-bold">操作</th>
@@ -1233,6 +1629,11 @@ export default function AdminDashboard() {
                             </select>
                           </td>
                           <td className="px-4 py-3">
+                            {userGroup && (
+                              <div className="mb-2">
+                                <AccentBadge accent={userGroup.accent} label={userGroup.name} />
+                              </div>
+                            )}
                             <select
                               value={userGroup?.id ?? DEFAULT_GROUP_ID}
                               onChange={(event) => updateManagedUser(user.id, { groupId: event.target.value })}
@@ -1262,6 +1663,18 @@ export default function AdminDashboard() {
                             </select>
                           </td>
                           <td className="px-4 py-3">
+                            <select
+                              value={user.quotaDeductionPriority}
+                              onChange={(event) => updateManagedUser(user.id, { quotaDeductionPriority: event.target.value as QuotaDeductionPriority })}
+                              className="min-w-28 rounded-md border border-gray-200 bg-white px-2 py-1 text-xs dark:border-white/[0.08] dark:bg-gray-950"
+                            >
+                              {Object.entries(quotaPriorityLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                            </select>
+                            <div className="mt-1 max-w-36 text-[11px] leading-4 text-gray-400">{quotaPriorityNotes[user.quotaDeductionPriority]}</div>
+                          </td>
+                          <td className="px-4 py-3">
+                            <div className="mb-1 text-xs text-gray-500">总 {user.quotaBalance + (userGroup?.quotaBalance ?? 0)} 点</div>
+                            <div className="mb-1 text-[11px] text-gray-400">分组 {userGroup?.quotaBalance ?? 0} / 个人</div>
                             <input
                               value={quotaDrafts[user.id] ?? String(user.quotaBalance)}
                               onChange={(event) => setQuotaDrafts((drafts) => ({ ...drafts, [user.id]: event.target.value }))}
@@ -1292,7 +1705,7 @@ export default function AdminDashboard() {
                       <div>
                         <div className="text-xs font-black uppercase tracking-[0.18em] text-cyan-600 dark:text-cyan-400">Ledger Lens</div>
                         <h2 className="mt-1 text-lg font-black">{isAdmin ? '全站调用账本' : '我的调用账本'}</h2>
-                        <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">每条记录都保留扣费公式、套餐快照和调用配置，方便对账。</p>
+                        <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">每条记录都保留扣费公式、分组/个人余额拆分和套餐快照，方便对账。</p>
                       </div>
                       <div className="grid grid-cols-3 gap-2 text-xs sm:flex">
                         {[
@@ -1445,14 +1858,20 @@ export default function AdminDashboard() {
                             </div>
                             <div className={`shrink-0 text-left text-2xl font-black lg:text-right ${amountTone}`}>
                               {getLedgerAmountLabel(entry)}
-                              <div className="mt-1 text-xs font-semibold text-gray-400">余额 {entry.balanceBefore} → {entry.balanceAfter}</div>
+                              <div className="mt-1 text-xs font-semibold text-gray-400">总余额 {entry.balanceBefore} → {entry.balanceAfter}</div>
+                              <div className="mt-0.5 text-xs font-semibold text-gray-400">分组 {entry.groupBalanceBefore} → {entry.groupBalanceAfter} · 个人 {entry.personalBalanceBefore} → {entry.personalBalanceAfter}</div>
                             </div>
                           </div>
 
-                          <div className={`mt-4 grid gap-2 text-xs sm:grid-cols-2 ${isAdmin ? 'xl:grid-cols-4' : 'xl:grid-cols-2'}`}>
+                          <div className={`mt-4 grid gap-2 text-xs sm:grid-cols-2 ${isAdmin ? 'xl:grid-cols-5' : 'xl:grid-cols-3'}`}>
                             <div className="rounded-md bg-gray-50 p-3 dark:bg-white/[0.04]">
                               <div className="font-semibold text-gray-500 dark:text-gray-400">扣费公式</div>
                               <div className="mt-1 font-black">{entry.units > 0 ? `${entry.units} × ${entry.unitCost} = ${entry.amount} 点` : `${entry.amount} 点`}</div>
+                            </div>
+                            <div className="rounded-md bg-gray-50 p-3 dark:bg-white/[0.04]">
+                              <div className="font-semibold text-gray-500 dark:text-gray-400">积分拆分</div>
+                              <div className="mt-1 font-black">分组 {entry.groupAmount} / 个人 {entry.personalAmount}</div>
+                              <div className="mt-1 text-gray-400">{quotaPriorityLabels[entry.deductionPriority]}</div>
                             </div>
                             <div className="rounded-md bg-gray-50 p-3 dark:bg-white/[0.04]">
                               <div className="font-semibold text-gray-500 dark:text-gray-400">套餐 / 分组</div>
