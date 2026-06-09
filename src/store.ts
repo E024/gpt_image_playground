@@ -24,6 +24,7 @@ import type {
   QuotaDeductionPriority,
   RewardCode,
   RewardState,
+  SystemSettings,
   UserGroup,
   UserPlan,
 } from './types'
@@ -65,6 +66,7 @@ import { createTransparentOutputMeta, getTransparentRequestParams, removeKeyedBa
 import {
   backendChargeQuota,
   backendCheckIn,
+  backendCreateContentAuditRecord,
   backendCreateGroup,
   backendCreatePlan,
   backendCreateRewardCode,
@@ -82,6 +84,7 @@ import {
   backendUpdateApiSettings,
   backendUpdateEmailSettings,
   backendUpdateGroup,
+  backendUpdateSystemSettings,
   backendUpdateMyQuotaPriority,
   backendUpdatePlan,
   backendUpdateRewardCode,
@@ -89,6 +92,7 @@ import {
   fetchBackendState,
   type RewardCodeInput,
   type BackendState,
+  type ContentAuditInput,
 } from './lib/backendApi'
 import { DEFAULT_EMAIL_SETTINGS } from './lib/emailSettings'
 import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate'
@@ -188,6 +192,9 @@ const DEFAULT_REWARD_STATE: RewardState = {
   rewardCodes: [],
   myRedemptions: [],
   myCheckins: [],
+}
+const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
+  siteName: '造像台',
 }
 const BACKEND_MANAGED_SETTING_KEYS: Array<keyof AppSettings> = [
   'baseUrl',
@@ -928,6 +935,7 @@ function mergePersistedState(persistedState: unknown, currentState: AppState): A
     setupRequired: currentState.setupRequired,
     billingLedger: [],
     rewardState: DEFAULT_REWARD_STATE,
+    systemSettings: currentState.systemSettings,
     emailSettings: null,
     emailVerification: null,
     activeFavoriteCollectionId: null,
@@ -955,6 +963,8 @@ interface AppState {
   adminApiSettings: AppSettings | null
   updateApiSettings: (settings: AppSettings) => Promise<void>
   syncManagementApiConfig: (input: { url?: string; authToken?: string }) => Promise<boolean>
+  systemSettings: SystemSettings
+  updateSystemSettings: (settings: SystemSettings) => Promise<void>
   emailSettings: EmailSettings | null
   updateEmailSettings: (settings: EmailSettings) => Promise<void>
   dismissedCodexCliPrompts: string[]
@@ -1417,6 +1427,14 @@ function normalizeEmailSettings(value: unknown): EmailSettings | null {
   }
 }
 
+function normalizeSystemSettings(value: unknown): SystemSettings {
+  if (!isRecord(value)) return DEFAULT_SYSTEM_SETTINGS
+  const siteName = typeof value.siteName === 'string' && value.siteName.trim()
+    ? value.siteName.trim().slice(0, 80)
+    : DEFAULT_SYSTEM_SETTINGS.siteName
+  return { siteName }
+}
+
 function normalizeEmailVerification(value: unknown): EmailVerificationState | null {
   if (!isRecord(value)) return null
   const email = typeof value.email === 'string' ? normalizeEmail(value.email) : ''
@@ -1468,6 +1486,7 @@ function applyBackendStatePatch(state: BackendState) {
     setupRequired: Boolean(state.setupRequired),
     ...(apiSettings ? { settings: apiSettings } : {}),
     adminApiSettings: state.adminApiSettings ? normalizeSettings(state.adminApiSettings) : null,
+    systemSettings: normalizeSystemSettings(state.systemSettings),
     emailSettings: normalizeEmailSettings(state.emailSettings),
     emailVerification: normalizeEmailVerification(state.emailVerification),
   })
@@ -1792,6 +1811,7 @@ export const useStore = create<AppState>()(
         }
       }),
       adminApiSettings: null,
+      systemSettings: DEFAULT_SYSTEM_SETTINGS,
       emailSettings: null,
       updateApiSettings: async (settings) => {
         try {
@@ -1809,6 +1829,14 @@ export const useStore = create<AppState>()(
         } catch (error) {
           get().showToast(error instanceof Error ? error.message : '同步管理配置失败', 'error')
           return false
+        }
+      },
+      updateSystemSettings: async (settings) => {
+        try {
+          applyBackendStatePatch(await backendUpdateSystemSettings({ siteName: settings.siteName.trim() }, get().authSession))
+          get().showToast('系统设置已保存', 'success')
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '保存系统设置失败', 'error')
         }
       },
       updateEmailSettings: async (settings) => {
@@ -1870,6 +1898,7 @@ export const useStore = create<AppState>()(
             users: [],
             billingLedger: [],
             rewardState: DEFAULT_REWARD_STATE,
+            systemSettings: DEFAULT_SYSTEM_SETTINGS,
             emailSettings: null,
             emailVerification: null,
             authSession: null,
@@ -1888,6 +1917,7 @@ export const useStore = create<AppState>()(
           users: [],
           billingLedger: [],
           rewardState: DEFAULT_REWARD_STATE,
+          systemSettings: DEFAULT_SYSTEM_SETTINGS,
           emailSettings: null,
           emailVerification: null,
           appMode: 'gallery',
@@ -2666,6 +2696,123 @@ function getRawErrorPayload(err: unknown): Pick<Partial<TaskRecord>, 'rawImageUr
   }
 }
 
+function reportContentAuditRecord(input: ContentAuditInput) {
+  const session = useStore.getState().authSession
+  if (!session) return
+  void backendCreateContentAuditRecord(input, session).catch((error) => {
+    console.warn('上报内容审计记录失败', error)
+  })
+}
+
+function createTaskContentAuditInput(task: TaskRecord): ContentAuditInput | null {
+  if (task.status !== 'done') return null
+  if (task.outputImages.length === 0 && !task.rawImageUrls?.length) return null
+
+  return {
+    id: `image:${task.id}`,
+    kind: 'image',
+    source: isAgentTask(task) ? 'agent' : 'gallery',
+    taskId: task.id,
+    conversationId: task.agentConversationId ?? '',
+    roundId: task.agentRoundId ?? '',
+    messageId: task.agentMessageId ?? '',
+    prompt: task.prompt,
+    assistantText: '',
+    imageUrls: task.rawImageUrls ?? [],
+    imageIds: task.outputImages,
+    inputImageIds: task.inputImageIds,
+    outputTaskIds: [],
+    apiProvider: String(task.apiProvider ?? ''),
+    apiMode: String(task.apiMode ?? ''),
+    apiModel: task.apiModel ?? '',
+    apiProfileName: task.apiProfileName ?? '',
+    metadata: {
+      params: task.params,
+      actualParams: task.actualParams ?? null,
+      actualParamsByImage: task.actualParamsByImage ?? null,
+      revisedPromptByImage: task.revisedPromptByImage ?? null,
+      maskTargetImageId: task.maskTargetImageId ?? null,
+      maskImageId: task.maskImageId ?? null,
+      transparentOutput: task.transparentOutput ?? false,
+      sourceMode: task.sourceMode ?? 'gallery',
+      apiProfileId: task.apiProfileId ?? '',
+      agentToolCallId: task.agentToolCallId ?? '',
+      agentBatchCallId: task.agentBatchCallId ?? '',
+      agentToolAction: task.agentToolAction ?? '',
+      elapsed: task.elapsed,
+      rawResponsePayloadAvailable: Boolean(task.rawResponsePayload),
+    },
+    elapsedMs: task.elapsed,
+    createdAt: task.createdAt,
+    finishedAt: task.finishedAt,
+  }
+}
+
+function reportTaskContentAudit(task: TaskRecord) {
+  const input = createTaskContentAuditInput(task)
+  if (input) reportContentAuditRecord(input)
+}
+
+function reportAgentRoundContentAudit(
+  conversationId: string,
+  roundId: string,
+  assistantMessage: AgentMessage,
+  taskIds: string[],
+  activeProfile: ApiProfile,
+  params: TaskParams,
+  meta: {
+    responseId?: string
+    toolCallsUsed: number
+    reachedToolLimit: boolean
+    maxToolCalls: number
+  },
+) {
+  const state = useStore.getState()
+  const conversation = state.agentConversations.find((item) => item.id === conversationId)
+  const round = conversation?.rounds.find((item) => item.id === roundId)
+  if (!conversation || !round) return
+
+  const userMessage = conversation.messages.find((message) => message.id === round.userMessageId)
+  const outputTasks = taskIds
+    .map((taskId) => state.tasks.find((task) => task.id === taskId))
+    .filter((task): task is TaskRecord => Boolean(task))
+  const finishedAt = round.finishedAt ?? Date.now()
+  reportContentAuditRecord({
+    id: `chat:${conversationId}:${roundId}`,
+    kind: 'chat',
+    source: 'agent',
+    taskId: '',
+    conversationId,
+    roundId,
+    messageId: assistantMessage.id,
+    prompt: round.prompt || userMessage?.content || '',
+    assistantText: assistantMessage.content,
+    imageUrls: outputTasks.flatMap((task) => task.rawImageUrls ?? []),
+    imageIds: outputTasks.flatMap((task) => task.outputImages),
+    inputImageIds: round.inputImageIds,
+    outputTaskIds: taskIds,
+    apiProvider: String(activeProfile.provider ?? ''),
+    apiMode: activeProfile.apiMode,
+    apiModel: activeProfile.model,
+    apiProfileName: activeProfile.name,
+    metadata: {
+      conversationTitle: conversation.title,
+      roundIndex: round.index,
+      responseId: meta.responseId ?? '',
+      params,
+      outputImageCount: outputTasks.reduce((sum, task) => sum + task.outputImages.length, 0),
+      toolCallsUsed: meta.toolCallsUsed,
+      reachedToolLimit: meta.reachedToolLimit,
+      maxToolCalls: meta.maxToolCalls,
+      maskTargetImageId: round.maskTargetImageId ?? null,
+      maskImageId: round.maskImageId ?? null,
+    },
+    elapsedMs: Math.max(0, finishedAt - round.createdAt),
+    createdAt: round.createdAt,
+    finishedAt,
+  })
+}
+
 function clearFalRecoveryTimer(taskId: string) {
   const timer = falRecoveryTimers.get(taskId)
   if (timer) clearTimeout(timer)
@@ -2764,6 +2911,7 @@ async function completeRecoveredFalTask(task: TaskRecord, result: Awaited<Return
   updateTaskInStore(task.id, {
     outputImages: outputIds,
     transparentOriginalImages: transparentOriginalImageIds,
+    rawImageUrls: result.rawImageUrls?.length ? result.rawImageUrls : undefined,
     actualParams: firstActualParams(actualParamsList),
     actualParamsByImage: mapActualParamsByImage(outputIds, actualParamsList),
     revisedPromptByImage: undefined,
@@ -2773,6 +2921,8 @@ async function completeRecoveredFalTask(task: TaskRecord, result: Awaited<Return
     finishedAt: Date.now(),
     elapsed: Date.now() - task.createdAt,
   })
+  const completedTask = useStore.getState().tasks.find((item) => item.id === task.id)
+  if (completedTask) reportTaskContentAudit(completedTask)
   useStore.getState().showToast(`fal.ai 任务已恢复，共 ${outputIds.length} 张图片`, 'success')
   if (!isAgentTask(task)) showTaskCompletionNotification('图像生成完成', `fal.ai 任务已恢复，共 ${outputIds.length} 张图片。`)
 }
@@ -4294,6 +4444,8 @@ async function executeAgentRound(
         elapsed: Date.now() - (latestTask?.createdAt ?? startedAt),
         agentToolAction: image.action,
       })
+      const completedTask = useStore.getState().tasks.find((item) => item.id === taskId)
+      if (completedTask) reportTaskContentAudit(completedTask)
       useStore.getState().setTaskStreamPreview(taskId)
       return taskId
     }
@@ -4594,6 +4746,7 @@ async function executeAgentRound(
         useStore.getState().setTasks([task, ...useStore.getState().tasks])
         attachTaskToAgentRound(task.id)
         await putTask(task)
+        reportTaskContentAudit(task)
       }
 
       if (result.rawResponsePayload && streamingTaskIds.length > 0) {
@@ -4722,6 +4875,12 @@ async function executeAgentRound(
         ? current.messages.map((message) => message.id === assistantMessageId ? assistantMessage : message)
         : [...current.messages, assistantMessage],
     }))
+    reportAgentRoundContentAudit(conversationId, roundId, assistantMessage, taskIds, activeProfile, params, {
+      responseId: lastResponseId,
+      toolCallsUsed,
+      reachedToolLimit,
+      maxToolCalls,
+    })
 
     useStore.getState().showToast(outputIds.length > 0 ? 'Agent 已生成图片' : 'Agent 已回复', 'success')
     showTaskCompletionNotification(
@@ -4924,6 +5083,8 @@ async function executeTask(taskId: string) {
       customRecoverable: false,
     })
     void deleteUnreferencedImageIds(partialImageIdsToClean)
+    const completedTask = useStore.getState().tasks.find((item) => item.id === taskId)
+    if (completedTask) reportTaskContentAudit(completedTask)
 
     useStore.getState().showToast(`生成完成，共 ${outputIds.length} 张图片`, 'success')
     if (!isAgentTask(task)) showTaskCompletionNotification('图像生成完成', `生成完成，共 ${outputIds.length} 张图片。`)
@@ -5477,6 +5638,7 @@ async function completeRecoveredCustomTask(task: TaskRecord, result: Awaited<Ret
   updateTaskInStore(task.id, {
     outputImages: outputIds,
     transparentOriginalImages: transparentOriginalImageIds,
+    rawImageUrls: result.rawImageUrls?.length ? result.rawImageUrls : undefined,
     actualParams: firstActualParams(actualParamsList),
     actualParamsByImage: mapActualParamsByImage(outputIds, actualParamsList),
     revisedPromptByImage: undefined,
@@ -5486,6 +5648,8 @@ async function completeRecoveredCustomTask(task: TaskRecord, result: Awaited<Ret
     finishedAt: Date.now(),
     elapsed: Date.now() - task.createdAt,
   })
+  const completedTask = useStore.getState().tasks.find((item) => item.id === task.id)
+  if (completedTask) reportTaskContentAudit(completedTask)
   useStore.getState().showToast(`自定义异步任务已恢复，共 ${outputIds.length} 张图片`, 'success')
   if (!isAgentTask(task)) showTaskCompletionNotification('图像生成完成', `自定义异步任务已恢复，共 ${outputIds.length} 张图片。`)
 }

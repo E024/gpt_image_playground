@@ -32,8 +32,13 @@ const BACKEND_UPSTREAM_BASE_URL = '/backend-api/upstream'
 const LEDGER_PAGE_SIZES = new Set([10, 20, 50, 100])
 const LEDGER_TYPES = new Set(['credit', 'debit', 'payment', 'adjustment'])
 const LEDGER_SOURCES = new Set(['gallery', 'agent', 'admin'])
+const CONTENT_AUDIT_PAGE_SIZES = new Set([10, 20, 50, 100])
+const CONTENT_AUDIT_KINDS = new Set(['image', 'chat'])
+const CONTENT_AUDIT_SOURCES = new Set(['gallery', 'agent'])
 const DEFAULT_CHECKIN_SETTINGS_ID = 'default'
 const EMAIL_SETTINGS_KEY = 'email_settings'
+const SYSTEM_SETTINGS_KEY = 'system_settings'
+const DEFAULT_SITE_NAME = '造像台'
 const DEFAULT_EMAIL_VERIFICATION_EXPIRES_MINUTES = 30
 const EMAIL_VERIFICATION_CODE_LENGTH = 6
 const DEFAULT_EMAIL_SUBJECT = '验证你的 {brandName} 账号'
@@ -120,6 +125,37 @@ CREATE TABLE IF NOT EXISTS billing_ledger (
   note TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS content_audit_records (
+  id TEXT PRIMARY KEY,
+  client_record_id TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  user_email TEXT NOT NULL DEFAULT '',
+  user_display_name TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL CHECK (kind IN ('image','chat')),
+  source TEXT NOT NULL CHECK (source IN ('gallery','agent')),
+  task_id TEXT NOT NULL DEFAULT '',
+  conversation_id TEXT NOT NULL DEFAULT '',
+  round_id TEXT NOT NULL DEFAULT '',
+  message_id TEXT NOT NULL DEFAULT '',
+  prompt TEXT NOT NULL DEFAULT '',
+  assistant_text TEXT NOT NULL DEFAULT '',
+  image_urls_json TEXT NOT NULL DEFAULT '[]',
+  image_ids_json TEXT NOT NULL DEFAULT '[]',
+  input_image_ids_json TEXT NOT NULL DEFAULT '[]',
+  output_task_ids_json TEXT NOT NULL DEFAULT '[]',
+  api_provider TEXT NOT NULL DEFAULT '',
+  api_mode TEXT NOT NULL DEFAULT '',
+  api_model TEXT NOT NULL DEFAULT '',
+  api_profile_name TEXT NOT NULL DEFAULT '',
+  plan_id TEXT NOT NULL DEFAULT '',
+  plan_name TEXT NOT NULL DEFAULT '',
+  group_id TEXT NOT NULL DEFAULT '',
+  group_name TEXT NOT NULL DEFAULT '',
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  elapsed_ms INTEGER,
+  created_at INTEGER NOT NULL,
+  finished_at INTEGER
+);
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -192,6 +228,11 @@ CREATE INDEX IF NOT EXISTS idx_reward_redemptions_ip ON reward_redemptions(ip_ad
 CREATE INDEX IF NOT EXISTS idx_checkin_records_user ON checkin_records(user_id);
 CREATE INDEX IF NOT EXISTS idx_checkin_records_ip_created ON checkin_records(ip_address, created_at);
 CREATE INDEX IF NOT EXISTS idx_pending_email_registrations_token ON pending_email_registrations(verification_token_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_content_audit_user_client_record ON content_audit_records(user_id, client_record_id);
+CREATE INDEX IF NOT EXISTS idx_content_audit_created ON content_audit_records(created_at);
+CREATE INDEX IF NOT EXISTS idx_content_audit_user_created ON content_audit_records(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_content_audit_kind_created ON content_audit_records(kind, created_at);
+CREATE INDEX IF NOT EXISTS idx_content_audit_group_created ON content_audit_records(group_id, created_at);
 `)
 
 ensureDefaultGroup()
@@ -218,6 +259,7 @@ ensureColumn('billing_ledger', 'api_provider', "api_provider TEXT NOT NULL DEFAU
 ensureColumn('billing_ledger', 'api_mode', "api_mode TEXT NOT NULL DEFAULT ''")
 ensureColumn('billing_ledger', 'api_model', "api_model TEXT NOT NULL DEFAULT ''")
 ensureColumn('billing_ledger', 'api_base_url', "api_base_url TEXT NOT NULL DEFAULT ''")
+ensureColumn('content_audit_records', 'elapsed_ms', 'elapsed_ms INTEGER')
 ensureColumn('reward_codes', 'deleted_at', 'deleted_at INTEGER')
 
 const planCount = db.prepare('SELECT COUNT(*) AS count FROM plans').get().count
@@ -228,6 +270,7 @@ if (planCount === 0) {
 
 ensureApiSettings()
 ensureEmailSettings()
+ensureSystemSettings()
 ensureCheckinSettings()
 repairMissingAdmin()
 
@@ -375,13 +418,19 @@ function createDefaultEmailSettings() {
     smtpUser: process.env.SMTP_USER || '',
     smtpPassword: process.env.SMTP_PASS || '',
     fromEmail: process.env.SMTP_FROM_EMAIL || '',
-    fromName: process.env.SMTP_FROM_NAME || 'Pixel Foundry Console',
-    brandName: process.env.MAIL_BRAND_NAME || 'Pixel Foundry Console',
+    fromName: process.env.SMTP_FROM_NAME || '造像台',
+    brandName: process.env.MAIL_BRAND_NAME || '造像台',
     appBaseUrl: process.env.APP_BASE_URL || '',
     verificationExpiresMinutes: DEFAULT_EMAIL_VERIFICATION_EXPIRES_MINUTES,
     verificationSubject: DEFAULT_EMAIL_SUBJECT,
     verificationText: DEFAULT_EMAIL_TEXT,
     verificationHtml: DEFAULT_EMAIL_HTML,
+  }
+}
+
+function createDefaultSystemSettings() {
+  return {
+    siteName: process.env.SITE_NAME || DEFAULT_SITE_NAME,
   }
 }
 
@@ -419,6 +468,21 @@ function setEmailSettings(settings) {
   `).run(EMAIL_SETTINGS_KEY, JSON.stringify(settings), Date.now())
 }
 
+function parseSystemSettings(value) {
+  const parsed = JSON.parse(value)
+  if (!isRecord(parsed)) throw new Error('系统配置已损坏：配置不是 JSON 对象')
+  return parsed
+}
+
+function setSystemSettings(settings) {
+  if (!isRecord(settings)) throw new Error('系统配置必须是 JSON 对象')
+  db.prepare(`
+    INSERT INTO app_settings (key, value, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+  `).run(SYSTEM_SETTINGS_KEY, JSON.stringify(settings), Date.now())
+}
+
 function ensureApiSettings() {
   const row = db.prepare("SELECT value FROM app_settings WHERE key = 'api_settings'").get()
   if (row) {
@@ -434,6 +498,12 @@ function ensureEmailSettings() {
   const row = db.prepare('SELECT value FROM app_settings WHERE key = ?').get(EMAIL_SETTINGS_KEY)
   if (row) return
   setEmailSettings(createDefaultEmailSettings())
+}
+
+function ensureSystemSettings() {
+  const row = db.prepare('SELECT value FROM app_settings WHERE key = ?').get(SYSTEM_SETTINGS_KEY)
+  if (row) return
+  setSystemSettings(normalizeSystemSettings(createDefaultSystemSettings(), { allowDefault: true }))
 }
 
 function ensureCheckinSettings() {
@@ -464,8 +534,8 @@ function normalizeEmailSettings(settings) {
     smtpUser: String(settings.smtpUser || '').trim(),
     smtpPassword: typeof settings.smtpPassword === 'string' ? settings.smtpPassword : '',
     fromEmail: normalizeEmail(settings.fromEmail),
-    fromName: String(settings.fromName || 'Pixel Foundry Console').trim().slice(0, 80) || 'Pixel Foundry Console',
-    brandName: String(settings.brandName || 'Pixel Foundry Console').trim().slice(0, 80) || 'Pixel Foundry Console',
+    fromName: String(settings.fromName || '造像台').trim().slice(0, 80) || '造像台',
+    brandName: String(settings.brandName || '造像台').trim().slice(0, 80) || '造像台',
     appBaseUrl: String(settings.appBaseUrl || '').trim().replace(/\/+$/, ''),
     verificationExpiresMinutes: Math.min(1440, normalizePositiveInteger(settings.verificationExpiresMinutes, DEFAULT_EMAIL_VERIFICATION_EXPIRES_MINUTES)),
     verificationSubject: String(settings.verificationSubject || DEFAULT_EMAIL_SUBJECT).trim().slice(0, 160) || DEFAULT_EMAIL_SUBJECT,
@@ -476,6 +546,30 @@ function normalizeEmailSettings(settings) {
 
 function getEmailSettings() {
   return normalizeEmailSettings(getRawEmailSettings())
+}
+
+function normalizeSystemSettings(settings, options = {}) {
+  const fallback = options.allowDefault ? DEFAULT_SITE_NAME : ''
+  const rawSiteName = String(settings.siteName ?? '').trim()
+  const siteName = (rawSiteName || fallback).slice(0, 80)
+  if (!siteName) fail(400, '网站名称不能为空')
+  return { siteName }
+}
+
+function getSystemSettings() {
+  const row = db.prepare('SELECT value FROM app_settings WHERE key = ?').get(SYSTEM_SETTINGS_KEY)
+  if (!row) {
+    const settings = normalizeSystemSettings(createDefaultSystemSettings(), { allowDefault: true })
+    setSystemSettings(settings)
+    return settings
+  }
+  return normalizeSystemSettings(parseSystemSettings(row.value), { allowDefault: true })
+}
+
+function updateSystemSettings(input) {
+  const next = normalizeSystemSettings({ ...getSystemSettings(), ...input })
+  setSystemSettings(next)
+  return next
 }
 
 function redactEmailSettings(settings = getEmailSettings()) {
@@ -963,6 +1057,62 @@ function rowToLedger(row) {
   }
 }
 
+function parseJsonArray(value) {
+  const parsed = JSON.parse(typeof value === 'string' && value ? value : '[]')
+  return Array.isArray(parsed) ? parsed.filter((item) => typeof item === 'string') : []
+}
+
+function parseJsonRecord(value) {
+  const parsed = JSON.parse(typeof value === 'string' && value ? value : '{}')
+  return isRecord(parsed) ? parsed : {}
+}
+
+function normalizeContentElapsedMs(value, createdAt, finishedAt, metadata = {}) {
+  const stored = Math.floor(Number(value))
+  if (Number.isFinite(stored) && stored >= 0) return stored
+  const metadataElapsed = Math.floor(Number(metadata.elapsedMs ?? metadata.elapsed))
+  if (Number.isFinite(metadataElapsed) && metadataElapsed >= 0) return metadataElapsed
+  const created = Number(createdAt)
+  const finished = Number(finishedAt)
+  if (Number.isFinite(created) && Number.isFinite(finished) && finished >= created) return Math.floor(finished - created)
+  return null
+}
+
+function rowToContentAudit(row) {
+  const metadata = parseJsonRecord(row.metadata_json)
+  return {
+    id: row.id,
+    clientRecordId: row.client_record_id,
+    userId: row.user_id,
+    userEmail: row.user_email || row.current_user_email || '',
+    userDisplayName: row.user_display_name || row.current_user_display_name || '',
+    kind: row.kind,
+    source: row.source,
+    taskId: row.task_id,
+    conversationId: row.conversation_id,
+    roundId: row.round_id,
+    messageId: row.message_id,
+    prompt: row.prompt,
+    assistantText: row.assistant_text,
+    imageUrls: parseJsonArray(row.image_urls_json),
+    imageIds: parseJsonArray(row.image_ids_json),
+    inputImageIds: parseJsonArray(row.input_image_ids_json),
+    outputTaskIds: parseJsonArray(row.output_task_ids_json),
+    apiProvider: row.api_provider,
+    apiMode: row.api_mode,
+    apiModel: row.api_model,
+    apiProfileName: row.api_profile_name,
+    planId: row.plan_id,
+    planName: row.plan_name,
+    groupId: row.group_id,
+    groupName: row.group_name,
+    metadata,
+    elapsedMs: normalizeContentElapsedMs(row.elapsed_ms, row.created_at, row.finished_at, metadata),
+    createdAt: row.created_at,
+    finishedAt: row.finished_at ?? null,
+  }
+}
+
 function redactLedgerEntry(entry) {
   return {
     ...entry,
@@ -1369,6 +1519,293 @@ function getLedgerPage(actor, filters = {}) {
   }
 }
 
+function normalizeContentAuditPageSize(value) {
+  const pageSize = Math.floor(Number(value))
+  return CONTENT_AUDIT_PAGE_SIZES.has(pageSize) ? pageSize : 10
+}
+
+function normalizeAuditText(value, maxLength) {
+  return String(value ?? '').slice(0, maxLength)
+}
+
+function normalizeAuditId(value, maxLength = 160) {
+  return String(value || '').trim().slice(0, maxLength)
+}
+
+function isHttpImageUrl(value) {
+  if (typeof value !== 'string') return false
+  try {
+    const url = new URL(value)
+    return url.protocol === 'http:' || url.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+function normalizeAuditStringArray(value, maxItems, maxLength, filter = null) {
+  if (!Array.isArray(value)) return []
+  const result = []
+  for (const item of value) {
+    if (typeof item !== 'string') continue
+    const trimmed = item.trim()
+    if (!trimmed) continue
+    if (filter && !filter(trimmed)) continue
+    result.push(trimmed.slice(0, maxLength))
+    if (result.length >= maxItems) break
+  }
+  return [...new Set(result)]
+}
+
+function sanitizeAuditJsonValue(value, depth = 0) {
+  if (value == null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return value
+  if (Array.isArray(value)) return depth >= 3 ? [] : value.slice(0, 50).map((item) => sanitizeAuditJsonValue(item, depth + 1))
+  if (!isRecord(value) || depth >= 3) return String(value).slice(0, 200)
+
+  const output = {}
+  for (const [key, item] of Object.entries(value).slice(0, 40)) {
+    output[String(key).slice(0, 80)] = sanitizeAuditJsonValue(item, depth + 1)
+  }
+  return output
+}
+
+function normalizeAuditMetadata(value) {
+  const sanitized = sanitizeAuditJsonValue(isRecord(value) ? value : {})
+  const jsonText = JSON.stringify(sanitized)
+  if (jsonText.length <= 20_000) return jsonText
+  return JSON.stringify({ truncated: true, originalLength: jsonText.length })
+}
+
+function normalizeAuditElapsedMs(input, createdAt, finishedAt) {
+  const elapsedMs = Math.floor(Number(input.elapsedMs))
+  if (Number.isFinite(elapsedMs) && elapsedMs >= 0) return elapsedMs
+  if (finishedAt != null && finishedAt >= createdAt) return Math.floor(finishedAt - createdAt)
+  return null
+}
+
+function normalizeContentAuditInput(input, actor) {
+  if (!isRecord(input)) fail(400, '审计记录必须是 JSON 对象')
+  const clientRecordId = normalizeAuditId(input.id ?? input.clientRecordId)
+  if (!clientRecordId) fail(400, '审计记录缺少客户端记录 ID')
+
+  const kind = String(input.kind || '').trim()
+  if (!CONTENT_AUDIT_KINDS.has(kind)) fail(400, '审计记录类型不正确')
+  const source = String(input.source || '').trim()
+  if (!CONTENT_AUDIT_SOURCES.has(source)) fail(400, '审计记录来源不正确')
+
+  const createdAt = normalizeLedgerTime(input.createdAt) ?? Date.now()
+  const finishedAt = normalizeLedgerTime(input.finishedAt)
+  return {
+    clientRecordId,
+    kind,
+    source,
+    taskId: normalizeAuditId(input.taskId, 120),
+    conversationId: normalizeAuditId(input.conversationId, 120),
+    roundId: normalizeAuditId(input.roundId, 120),
+    messageId: normalizeAuditId(input.messageId, 120),
+    prompt: normalizeAuditText(input.prompt, 8_000),
+    assistantText: normalizeAuditText(input.assistantText, 20_000),
+    imageUrls: normalizeAuditStringArray(input.imageUrls, 20, 2_048, isHttpImageUrl),
+    imageIds: normalizeAuditStringArray(input.imageIds, 80, 128),
+    inputImageIds: normalizeAuditStringArray(input.inputImageIds, 80, 128),
+    outputTaskIds: normalizeAuditStringArray(input.outputTaskIds, 80, 128),
+    apiProvider: normalizeAuditText(input.apiProvider, 64),
+    apiMode: normalizeAuditText(input.apiMode, 32),
+    apiModel: normalizeAuditText(input.apiModel, 120),
+    apiProfileName: normalizeAuditText(input.apiProfileName, 120),
+    metadataJson: normalizeAuditMetadata(input.metadata),
+    elapsedMs: normalizeAuditElapsedMs(input, createdAt, finishedAt),
+    createdAt,
+    finishedAt,
+    user: actor,
+    plan: getPlan(actor.planId),
+    group: getStrictGroup(actor.groupId),
+  }
+}
+
+function insertContentAuditRecord(actor, input) {
+  const record = normalizeContentAuditInput(input, actor)
+  const plan = record.plan ?? { id: '', name: '' }
+  const group = record.group ?? { id: '', name: '' }
+  db.prepare(`
+    INSERT INTO content_audit_records (
+      id,
+      client_record_id,
+      user_id,
+      user_email,
+      user_display_name,
+      kind,
+      source,
+      task_id,
+      conversation_id,
+      round_id,
+      message_id,
+      prompt,
+      assistant_text,
+      image_urls_json,
+      image_ids_json,
+      input_image_ids_json,
+      output_task_ids_json,
+      api_provider,
+      api_mode,
+      api_model,
+      api_profile_name,
+      plan_id,
+      plan_name,
+      group_id,
+      group_name,
+      metadata_json,
+      elapsed_ms,
+      created_at,
+      finished_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_id, client_record_id) DO UPDATE SET
+      user_email = excluded.user_email,
+      user_display_name = excluded.user_display_name,
+      kind = excluded.kind,
+      source = excluded.source,
+      task_id = excluded.task_id,
+      conversation_id = excluded.conversation_id,
+      round_id = excluded.round_id,
+      message_id = excluded.message_id,
+      prompt = excluded.prompt,
+      assistant_text = excluded.assistant_text,
+      image_urls_json = excluded.image_urls_json,
+      image_ids_json = excluded.image_ids_json,
+      input_image_ids_json = excluded.input_image_ids_json,
+      output_task_ids_json = excluded.output_task_ids_json,
+      api_provider = excluded.api_provider,
+      api_mode = excluded.api_mode,
+      api_model = excluded.api_model,
+      api_profile_name = excluded.api_profile_name,
+      plan_id = excluded.plan_id,
+      plan_name = excluded.plan_name,
+      group_id = excluded.group_id,
+      group_name = excluded.group_name,
+      metadata_json = excluded.metadata_json,
+      elapsed_ms = excluded.elapsed_ms,
+      created_at = excluded.created_at,
+      finished_at = excluded.finished_at
+  `).run(
+    genId(),
+    record.clientRecordId,
+    actor.id,
+    actor.email,
+    actor.displayName,
+    record.kind,
+    record.source,
+    record.taskId,
+    record.conversationId,
+    record.roundId,
+    record.messageId,
+    record.prompt,
+    record.assistantText,
+    JSON.stringify(record.imageUrls),
+    JSON.stringify(record.imageIds),
+    JSON.stringify(record.inputImageIds),
+    JSON.stringify(record.outputTaskIds),
+    record.apiProvider,
+    record.apiMode,
+    record.apiModel,
+    record.apiProfileName,
+    plan.id ?? '',
+    plan.name ?? '',
+    group.id ?? '',
+    group.name ?? '',
+    record.metadataJson,
+    record.elapsedMs,
+    record.createdAt,
+    record.finishedAt,
+  )
+
+  return { ok: true }
+}
+
+function getContentAuditPage(actor, filters = {}) {
+  if (!canManage(actor)) fail(403, '需要管理员权限')
+  const pageSize = normalizeContentAuditPageSize(filters.pageSize)
+  const requestedPage = normalizeLedgerPage(filters.page)
+  const clauses = []
+  const values = []
+
+  if (typeof filters.userId === 'string' && filters.userId.trim()) {
+    clauses.push('content_audit_records.user_id = ?')
+    values.push(filters.userId.trim())
+  }
+  if (typeof filters.groupId === 'string' && filters.groupId.trim()) {
+    clauses.push('content_audit_records.group_id = ?')
+    values.push(filters.groupId.trim())
+  }
+  if (CONTENT_AUDIT_KINDS.has(filters.kind)) {
+    clauses.push('content_audit_records.kind = ?')
+    values.push(filters.kind)
+  }
+  if (CONTENT_AUDIT_SOURCES.has(filters.source)) {
+    clauses.push('content_audit_records.source = ?')
+    values.push(filters.source)
+  }
+
+  const from = normalizeLedgerTime(filters.from)
+  const to = normalizeLedgerTime(filters.to)
+  if (from) {
+    clauses.push('content_audit_records.created_at >= ?')
+    values.push(from)
+  }
+  if (to) {
+    clauses.push('content_audit_records.created_at <= ?')
+    values.push(to)
+  }
+
+  const query = typeof filters.query === 'string' ? filters.query.trim() : ''
+  if (query) {
+    const like = `%${query}%`
+    clauses.push(`(
+      content_audit_records.id LIKE ?
+      OR content_audit_records.client_record_id LIKE ?
+      OR content_audit_records.task_id LIKE ?
+      OR content_audit_records.conversation_id LIKE ?
+      OR content_audit_records.round_id LIKE ?
+      OR content_audit_records.message_id LIKE ?
+      OR content_audit_records.prompt LIKE ?
+      OR content_audit_records.assistant_text LIKE ?
+      OR content_audit_records.image_urls_json LIKE ?
+      OR content_audit_records.api_provider LIKE ?
+      OR content_audit_records.api_mode LIKE ?
+      OR content_audit_records.api_model LIKE ?
+      OR content_audit_records.api_profile_name LIKE ?
+      OR content_audit_records.plan_name LIKE ?
+      OR content_audit_records.group_name LIKE ?
+      OR content_audit_records.user_email LIKE ?
+      OR content_audit_records.user_display_name LIKE ?
+      OR users.email LIKE ?
+      OR users.display_name LIKE ?
+    )`)
+    values.push(like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like)
+  }
+
+  const fromClause = 'FROM content_audit_records LEFT JOIN users ON users.id = content_audit_records.user_id'
+  const whereClause = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : ''
+  const total = db.prepare(`SELECT COUNT(*) AS count ${fromClause}${whereClause}`).get(...values).count
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+  const page = Math.min(requestedPage, totalPages)
+  const offset = (page - 1) * pageSize
+  const rows = db.prepare(`
+    SELECT content_audit_records.*, users.email AS current_user_email, users.display_name AS current_user_display_name
+    ${fromClause}
+    ${whereClause}
+    ORDER BY content_audit_records.created_at DESC, content_audit_records.id DESC
+    LIMIT ? OFFSET ?
+  `).all(...values, pageSize, offset)
+
+  return {
+    entries: rows.map(rowToContentAudit),
+    total,
+    page,
+    pageSize,
+    totalPages,
+  }
+}
+
 function hasAdmin() {
   return Boolean(db.prepare("SELECT 1 FROM users WHERE role = 'admin' LIMIT 1").get())
 }
@@ -1441,6 +1878,7 @@ function getState(actor, authSession = null) {
     setupRequired,
     apiSettings: actor ? createRuntimeApiSettings(adminApiSettings, authSession) : null,
     adminApiSettings: admin ? adminApiSettings : null,
+    systemSettings: getSystemSettings(),
     emailSettings: admin || setupRequired ? redactEmailSettings() : null,
     rewardState: getRewardState(actor),
   }
@@ -1736,6 +2174,7 @@ function createUserFromPendingRegistration(pending) {
 
 function verificationResultHtml({ title, message, tone = 'success' }) {
   const accent = tone === 'success' ? '#0891b2' : '#dc2626'
+  const siteName = getSystemSettings().siteName
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1746,7 +2185,7 @@ function verificationResultHtml({ title, message, tone = 'success' }) {
 <body style="margin:0;background:#f8fafc;color:#111827;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
   <main style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;">
     <section style="max-width:440px;width:100%;background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:28px;box-shadow:0 10px 30px rgba(15,23,42,.08);">
-      <div style="font-size:12px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:${accent};">Pixel Foundry Console</div>
+      <div style="font-size:12px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:${accent};">${escapeHtml(siteName)}</div>
       <h1 style="margin:12px 0 8px;font-size:24px;line-height:1.25;">${escapeHtml(title)}</h1>
       <p style="margin:0;color:#4b5563;line-height:1.8;font-size:14px;">${escapeHtml(message)}</p>
       <a href="/" style="display:inline-block;margin-top:22px;background:#111827;color:#fff;text-decoration:none;border-radius:8px;padding:11px 16px;font-weight:700;font-size:14px;">返回登录</a>
@@ -2112,6 +2551,25 @@ const server = http.createServer(async (req, res) => {
       }))
     }
 
+    if (req.method === 'POST' && path === '/content-audit') {
+      insertContentAuditRecord(actor, await readJson(req))
+      return json(res, 200, { ok: true })
+    }
+
+    if (req.method === 'GET' && path === '/content-audit') {
+      return json(res, 200, getContentAuditPage(actor, {
+        query: url.searchParams.get('query') ?? '',
+        kind: url.searchParams.get('kind') ?? '',
+        source: url.searchParams.get('source') ?? '',
+        userId: url.searchParams.get('userId') ?? '',
+        groupId: url.searchParams.get('groupId') ?? '',
+        from: url.searchParams.get('from') ?? '',
+        to: url.searchParams.get('to') ?? '',
+        page: url.searchParams.get('page') ?? '',
+        pageSize: url.searchParams.get('pageSize') ?? '',
+      }))
+    }
+
     if (req.method === 'GET' && path === '/rewards/state') {
       return json(res, 200, getRewardState(actor))
     }
@@ -2241,6 +2699,12 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'PATCH' && path === '/settings/email') {
       const body = await readJson(req)
       updateEmailSettings(isRecord(body.settings) ? body.settings : body)
+      return json(res, 200, getState(getUser(actor.id), authSession))
+    }
+
+    if (req.method === 'PATCH' && path === '/settings/system') {
+      const body = await readJson(req)
+      updateSystemSettings(isRecord(body.settings) ? body.settings : body)
       return json(res, 200, getState(getUser(actor.id), authSession))
     }
 

@@ -27,6 +27,7 @@ export default function AuthLanding() {
   const register = useStore((s) => s.register)
   const setupRequired = useStore((s) => s.setupRequired)
   const plans = useStore((s) => s.plans)
+  const siteName = useStore((s) => s.systemSettings.siteName)
   const emailSettings = useStore((s) => s.emailSettings)
   const updateEmailSettings = useStore((s) => s.updateEmailSettings)
   const emailVerification = useStore((s) => s.emailVerification)
@@ -36,7 +37,7 @@ export default function AuthLanding() {
   const needsMailSetup = setupRequired && !mailConfigured
   const modeCopy = useMemo(() => mode === 'login'
     ? {
-        title: '欢迎回到 Pixel Foundry',
+        title: `欢迎回到 ${siteName}`,
         action: '进入创作空间',
         note: '用同一个账号进入创作台与个人空间。权限会在登录后自动匹配。',
       }
@@ -44,7 +45,7 @@ export default function AuthLanding() {
         title: setupRequired ? '创建初始账号' : '创建创作账号',
         action: '发送验证邮件',
         note: '提交后会发送验证邮件，点击专属链接激活后才算完成注册。',
-      }, [mode, setupRequired])
+      }, [mode, setupRequired, siteName])
 
   useEffect(() => {
     setEmailDraft(getEmailSettingsDraft(emailSettings))
@@ -90,7 +91,7 @@ export default function AuthLanding() {
           <div className="relative flex min-h-full flex-col">
             <header className="flex items-start justify-between gap-4">
               <div>
-                <div className="text-xs font-black uppercase tracking-[0.22em] text-cyan-700">Pixel Foundry</div>
+                <div className="max-w-full truncate text-xs font-black uppercase tracking-[0.22em] text-cyan-700">{siteName}</div>
                 <h1 className="mt-2 max-w-xl text-3xl font-black leading-tight sm:text-4xl">把灵感变成一条可追踪的创作流水线</h1>
               </div>
               <span className="rounded-md border border-cyan-200 bg-white/80 px-3 py-1.5 text-xs font-black text-cyan-700 shadow-sm">Studio</span>

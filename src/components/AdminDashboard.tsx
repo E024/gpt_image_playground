@@ -1,14 +1,15 @@
 import { useEffect, useMemo, useState, type CSSProperties } from 'react'
 import { useStore } from '../store'
 import { getActiveApiProfile, normalizeSettings } from '../lib/apiProfiles'
-import { backendFetchLedger, type LedgerPage, type RewardCodeInput } from '../lib/backendApi'
+import { backendFetchContentAudit, backendFetchLedger, type ContentAuditPage, type LedgerPage, type RewardCodeInput } from '../lib/backendApi'
 import { getEmailSettingsDraft } from '../lib/emailSettings'
-import type { ApiMode, ApiProfile, AppSettings, BillingLedgerEntry, BillingLedgerType, BillingUsageSource, EmailSettings, ManagedUser, QuotaDeductionPriority, RewardCode, RewardState, UserGroup, UserPlan } from '../types'
+import type { ApiMode, ApiProfile, AppSettings, BillingLedgerEntry, BillingLedgerType, BillingUsageSource, ContentAuditKind, ContentAuditSource, EmailSettings, ManagedUser, QuotaDeductionPriority, RewardCode, RewardState, SystemSettings, UserGroup, UserPlan } from '../types'
 
-type AdminSection = 'overview' | 'groups' | 'plans' | 'users' | 'rewards' | 'ledger' | 'settings'
+type AdminSection = 'overview' | 'groups' | 'plans' | 'users' | 'rewards' | 'content' | 'ledger' | 'system' | 'settings' | 'email'
 type NavItem = { id: AdminSection; label: string; description: string; adminOnly?: boolean }
 const DEFAULT_GROUP_ID = 'default'
 const LEDGER_PAGE_SIZES = [10, 20, 50, 100]
+const CONTENT_AUDIT_PAGE_SIZES = [10, 20, 50, 100]
 const ledgerSourceLabels: Record<BillingUsageSource | 'all', string> = {
   all: '全部来源',
   gallery: '画廊生成',
@@ -21,6 +22,16 @@ const ledgerTypeLabels: Record<BillingLedgerType | 'all', string> = {
   debit: '扣费',
   payment: '付款',
   adjustment: '校准',
+}
+const contentKindLabels: Record<ContentAuditKind | 'all', string> = {
+  all: '全部内容',
+  image: '图片',
+  chat: '聊天',
+}
+const contentSourceLabels: Record<ContentAuditSource | 'all', string> = {
+  all: '全部来源',
+  gallery: '画廊',
+  agent: 'Agent',
 }
 const quotaPriorityLabels: Record<QuotaDeductionPriority, string> = {
   group_first: '分组优先',
@@ -63,6 +74,19 @@ function formatFullDate(value: number | null) {
     minute: '2-digit',
     second: '2-digit',
   }).format(value)
+}
+
+function formatDurationMs(value: number | null) {
+  if (value == null || !Number.isFinite(value) || value < 0) return '未记录'
+  if (value < 1000) return `${Math.round(value)} ms`
+  const seconds = value / 1000
+  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} 秒`
+  const minutes = Math.floor(seconds / 60)
+  const restSeconds = Math.round(seconds % 60)
+  if (minutes < 60) return `${minutes} 分 ${restSeconds} 秒`
+  const hours = Math.floor(minutes / 60)
+  const restMinutes = minutes % 60
+  return `${hours} 小时 ${restMinutes} 分`
 }
 
 function toDateTimeLocal(value: number) {
@@ -246,6 +270,7 @@ export default function AdminDashboard() {
   const rewardState = useStore((s) => s.rewardState)
   const settings = useStore((s) => s.settings)
   const adminApiSettings = useStore((s) => s.adminApiSettings)
+  const systemSettings = useStore((s) => s.systemSettings)
   const emailSettings = useStore((s) => s.emailSettings)
   const session = useStore((s) => s.authSession)
   const setAppMode = useStore((s) => s.setAppMode)
@@ -261,6 +286,7 @@ export default function AdminDashboard() {
   const deletePlan = useStore((s) => s.deletePlan)
   const updateApiSettings = useStore((s) => s.updateApiSettings)
   const syncManagementApiConfig = useStore((s) => s.syncManagementApiConfig)
+  const updateSystemSettings = useStore((s) => s.updateSystemSettings)
   const updateEmailSettings = useStore((s) => s.updateEmailSettings)
   const createRewardCode = useStore((s) => s.createRewardCode)
   const updateRewardCode = useStore((s) => s.updateRewardCode)
@@ -290,6 +316,7 @@ export default function AdminDashboard() {
   const [redeemBusy, setRedeemBusy] = useState(false)
   const [checkinBusy, setCheckinBusy] = useState(false)
   const [apiDraft, setApiDraft] = useState<AppSettings>(() => normalizeSettings(adminApiSettings ?? settings))
+  const [systemDraft, setSystemDraft] = useState<SystemSettings>(systemSettings)
   const [emailDraft, setEmailDraft] = useState<EmailSettings>(() => getEmailSettingsDraft(emailSettings))
   const [ledgerQuery, setLedgerQuery] = useState('')
   const [ledgerSource, setLedgerSource] = useState<BillingUsageSource | 'all'>('all')
@@ -303,6 +330,18 @@ export default function AdminDashboard() {
   const [ledgerResult, setLedgerResult] = useState<LedgerPage | null>(null)
   const [ledgerBusy, setLedgerBusy] = useState(false)
   const [ledgerError, setLedgerError] = useState('')
+  const [contentQuery, setContentQuery] = useState('')
+  const [contentKind, setContentKind] = useState<ContentAuditKind | 'all'>('all')
+  const [contentSource, setContentSource] = useState<ContentAuditSource | 'all'>('all')
+  const [contentUserId, setContentUserId] = useState('all')
+  const [contentGroupId, setContentGroupId] = useState('all')
+  const [contentFrom, setContentFrom] = useState('')
+  const [contentTo, setContentTo] = useState('')
+  const [contentPage, setContentPage] = useState(1)
+  const [contentPageSize, setContentPageSize] = useState(10)
+  const [contentResult, setContentResult] = useState<ContentAuditPage | null>(null)
+  const [contentBusy, setContentBusy] = useState(false)
+  const [contentError, setContentError] = useState('')
   const [managementConfigBusy, setManagementConfigBusy] = useState(false)
 
   const visibleLedger = isAdmin ? ledger : ledger.filter((entry) => entry.userId === currentUser?.id)
@@ -329,10 +368,20 @@ export default function AdminDashboard() {
   const ledgerCurrentPage = ledgerResult?.page ?? ledgerPage
   const ledgerStart = ledgerTotal === 0 ? 0 : (ledgerCurrentPage - 1) * ledgerPageSize + 1
   const ledgerEnd = ledgerTotal === 0 ? 0 : Math.min(ledgerStart + ledgerEntries.length - 1, ledgerTotal)
+  const contentEntries = contentResult?.entries ?? []
+  const contentTotal = contentResult?.total ?? contentEntries.length
+  const contentTotalPages = contentResult?.totalPages ?? 1
+  const contentCurrentPage = contentResult?.page ?? contentPage
+  const contentStart = contentTotal === 0 ? 0 : (contentCurrentPage - 1) * contentPageSize + 1
+  const contentEnd = contentTotal === 0 ? 0 : Math.min(contentStart + contentEntries.length - 1, contentTotal)
 
   useEffect(() => {
     setApiDraft(normalizeSettings(adminApiSettings ?? settings))
   }, [adminApiSettings, settings])
+
+  useEffect(() => {
+    setSystemDraft(systemSettings)
+  }, [systemSettings])
 
   useEffect(() => {
     setEmailDraft(getEmailSettingsDraft(emailSettings))
@@ -348,7 +397,7 @@ export default function AdminDashboard() {
   }, [rewardState.rewardCodes, selectedRewardCodeId])
 
   useEffect(() => {
-    if (!isAdmin && (section === 'groups' || section === 'users' || section === 'settings')) setSection('overview')
+    if (!isAdmin && (section === 'groups' || section === 'users' || section === 'system' || section === 'settings' || section === 'email' || section === 'content')) setSection('overview')
   }, [isAdmin, section])
 
   useEffect(() => {
@@ -364,6 +413,10 @@ export default function AdminDashboard() {
   useEffect(() => {
     setLedgerPage(1)
   }, [ledgerQuery, ledgerSource, ledgerType, ledgerUserId, ledgerGroupId, ledgerFrom, ledgerTo, ledgerPageSize])
+
+  useEffect(() => {
+    setContentPage(1)
+  }, [contentQuery, contentKind, contentSource, contentUserId, contentGroupId, contentFrom, contentTo, contentPageSize])
 
   useEffect(() => {
     if (!isAdmin) {
@@ -405,6 +458,39 @@ export default function AdminDashboard() {
     }
   }, [currentUser, isAdmin, ledgerFrom, ledgerGroupId, ledgerPage, ledgerPageSize, ledgerQuery, ledgerSource, ledgerTo, ledgerType, ledgerUserId, section, session])
 
+  useEffect(() => {
+    if (section !== 'content' || !isAdmin || !currentUser || !session) return
+    let cancelled = false
+    setContentBusy(true)
+    setContentError('')
+    void backendFetchContentAudit({
+      query: contentQuery,
+      kind: contentKind,
+      source: contentSource,
+      userId: contentUserId !== 'all' ? contentUserId : '',
+      groupId: contentGroupId !== 'all' ? contentGroupId : '',
+      from: fromDateTimeLocal(contentFrom),
+      to: fromDateTimeLocal(contentTo),
+      page: contentPage,
+      pageSize: contentPageSize,
+    }, session)
+      .then((result) => {
+        if (!cancelled) setContentResult(result)
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setContentError(error instanceof Error ? error.message : '读取内容记录失败')
+          setContentResult(null)
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setContentBusy(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [contentFrom, contentGroupId, contentKind, contentPage, contentPageSize, contentQuery, contentSource, contentTo, contentUserId, currentUser, isAdmin, section, session])
+
   const stats = useMemo(() => {
     const mrr = users.reduce((sum, user) => sum + (plans.find((plan) => plan.id === user.planId)?.monthlyPrice ?? 0), 0)
     const issued = visibleLedger.filter((entry) => entry.type === 'credit' || entry.type === 'adjustment').reduce((sum, entry) => sum + entry.amount, 0)
@@ -431,6 +517,8 @@ export default function AdminDashboard() {
     { id: 'plans', label: '套餐', description: isAdmin ? '列表与详情编辑' : '当前套餐详情' },
     { id: 'users', label: '用户', description: '角色、套餐、额度', adminOnly: true },
     { id: 'rewards', label: '权益', description: isAdmin ? '兑换码与签到' : '兑换、签到、领取记录' },
+    { id: 'content', label: '内容', description: '图片与聊天审计', adminOnly: true },
+    { id: 'system', label: '系统设置', description: '站点名称与系统邮箱', adminOnly: true },
     { id: 'settings', label: 'API 配置', description: '统一接口与 Agent', adminOnly: true },
     { id: 'ledger', label: '流水', description: isAdmin ? '全部消费与调整' : '我的消费记录' },
   ] satisfies NavItem[]).filter((item) => isAdmin || !item.adminOnly)
@@ -517,6 +605,10 @@ export default function AdminDashboard() {
 
   const commitApiSettings = () => {
     updateApiSettings(normalizeSettings(apiDraft))
+  }
+
+  const commitSystemSettings = () => {
+    updateSystemSettings({ siteName: systemDraft.siteName.trim() })
   }
 
   const handleSyncManagementConfig = async () => {
@@ -647,6 +739,28 @@ export default function AdminDashboard() {
     setLedgerTo(toDateTimeLocal(end))
   }
 
+  const applyContentRange = (range: 'today' | 'week' | 'month' | 'all') => {
+    if (range === 'all') {
+      setContentFrom('')
+      setContentTo('')
+      return
+    }
+    const now = new Date()
+    const end = now.getTime()
+    const start = new Date(now)
+    if (range === 'today') {
+      start.setHours(0, 0, 0, 0)
+    } else if (range === 'week') {
+      start.setDate(now.getDate() - 6)
+      start.setHours(0, 0, 0, 0)
+    } else {
+      start.setDate(1)
+      start.setHours(0, 0, 0, 0)
+    }
+    setContentFrom(toDateTimeLocal(start.getTime()))
+    setContentTo(toDateTimeLocal(end))
+  }
+
   const clearLedgerFilters = () => {
     setLedgerQuery('')
     setLedgerSource('all')
@@ -656,6 +770,17 @@ export default function AdminDashboard() {
     setLedgerFrom('')
     setLedgerTo('')
     setLedgerPage(1)
+  }
+
+  const clearContentFilters = () => {
+    setContentQuery('')
+    setContentKind('all')
+    setContentSource('all')
+    setContentUserId('all')
+    setContentGroupId('all')
+    setContentFrom('')
+    setContentTo('')
+    setContentPage(1)
   }
 
   return (
@@ -711,7 +836,7 @@ export default function AdminDashboard() {
               <span>/</span>
               <span className="font-bold text-gray-900 dark:text-gray-100">{navItems.find((item) => item.id === section)?.label}</span>
             </div>
-            <h1 className="mt-1 text-2xl font-black">{section === 'groups' ? '分组管理' : section === 'plans' ? '套餐列表与详情' : section === 'users' ? '用户管理' : section === 'rewards' ? '权益补给站' : section === 'settings' ? 'API 与 Agent 配置' : section === 'ledger' ? '消费流水' : isAdmin ? '运营总览' : '我的账户'}</h1>
+            <h1 className="mt-1 text-2xl font-black">{section === 'groups' ? '分组管理' : section === 'plans' ? '套餐列表与详情' : section === 'users' ? '用户管理' : section === 'rewards' ? '权益补给站' : section === 'content' ? '内容观测台' : section === 'system' ? '系统设置' : section === 'settings' ? 'API 与 Agent 配置' : section === 'email' ? '系统邮箱配置' : section === 'ledger' ? '消费流水' : isAdmin ? '运营总览' : '我的账户'}</h1>
           </header>
 
           <div className="p-4">
@@ -1310,6 +1435,51 @@ export default function AdminDashboard() {
               </div>
             )}
 
+            {section === 'system' && isAdmin && (
+              <div className="grid gap-4 xl:grid-cols-[1fr_360px]">
+                <div className="rounded-lg border border-gray-200 bg-white shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
+                  <div className="flex flex-col gap-3 border-b border-gray-200 px-4 py-3 dark:border-white/[0.08] sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <h2 className="text-sm font-black">站点基础信息</h2>
+                      <p className="mt-1 text-xs text-gray-500">这里控制所有用户可见的网站名称，系统邮箱配置在本页下方统一管理。</p>
+                    </div>
+                    <button
+                      onClick={commitSystemSettings}
+                      disabled={!systemDraft.siteName.trim()}
+                      className="rounded-md bg-gray-900 px-3 py-2 text-xs font-bold text-white transition hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-white dark:text-gray-950"
+                    >
+                      保存系统设置
+                    </button>
+                  </div>
+                  <div className="grid gap-4 p-4 lg:grid-cols-2">
+                    <label className="block lg:col-span-2">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">网站名称</span>
+                      <input
+                        value={systemDraft.siteName}
+                        maxLength={80}
+                        onChange={(event) => setSystemDraft({ siteName: event.target.value })}
+                        placeholder="例如：Pixel Studio"
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm font-black outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      />
+                      <span className="mt-1 block text-xs text-gray-400">1-80 个字符。建议使用清晰、有识别度的产品名。</span>
+                    </label>
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-gray-200 bg-white p-4 shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
+                  <div className="text-xs font-black uppercase tracking-[0.18em] text-cyan-600 dark:text-cyan-400">Brand Preview</div>
+                  <div className="mt-4 rounded-lg border border-cyan-100 bg-cyan-50/70 p-4 dark:border-cyan-500/20 dark:bg-cyan-500/10">
+                    <div className="text-xs font-semibold text-cyan-800/80 dark:text-cyan-100/80">登录页标题</div>
+                    <div className="mt-1 truncate text-xl font-black text-gray-950 dark:text-gray-50">{systemDraft.siteName.trim() || '未设置网站名称'}</div>
+                  </div>
+                  <div className="mt-3 rounded-lg border border-gray-200 p-3 dark:border-white/[0.08]">
+                    <div className="text-xs font-semibold text-gray-500 dark:text-gray-400">顶部导航</div>
+                    <div className="mt-1 truncate text-sm font-black">{systemDraft.siteName.trim() || '未设置网站名称'}</div>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {section === 'settings' && isAdmin && (
               <div className="grid gap-4 xl:grid-cols-[1.2fr_0.8fr]">
                 <div className="rounded-lg border border-gray-200 bg-white shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
@@ -1450,140 +1620,142 @@ export default function AdminDashboard() {
                     </button>
                   </div>
                 </div>
+              </div>
+            )}
 
-                <div className="rounded-lg border border-gray-200 bg-white shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04] xl:col-span-2">
-                  <div className="flex flex-col gap-3 border-b border-gray-200 px-4 py-3 dark:border-white/[0.08] sm:flex-row sm:items-center sm:justify-between">
-                    <div>
-                      <h2 className="text-sm font-black">邮箱验证配置</h2>
-                      <p className="mt-1 text-xs text-gray-500">注册账号必须点击专属验证链接后才会写入用户表。</p>
-                    </div>
-                    <button onClick={commitEmailSettings} className="rounded-md bg-gray-900 px-3 py-2 text-xs font-bold text-white transition hover:bg-gray-700 dark:bg-white dark:text-gray-950">
-                      保存邮箱配置
-                    </button>
+            {(section === 'email' || section === 'system') && isAdmin && (
+              <div className="mt-4 rounded-lg border border-gray-200 bg-white shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
+                <div className="flex flex-col gap-3 border-b border-gray-200 px-4 py-3 dark:border-white/[0.08] sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <h2 className="text-sm font-black">系统邮箱配置</h2>
+                    <p className="mt-1 text-xs text-gray-500">用于发送注册激活链接和验证码，保存后会应用到所有新用户注册流程。</p>
                   </div>
-                  <div className="grid gap-4 p-4 lg:grid-cols-4">
-                    <label className="flex items-center justify-between gap-3 rounded-md border border-gray-200 px-3 py-2 dark:border-white/[0.08] lg:col-span-4">
-                      <span>
-                        <span className="block text-xs font-semibold text-gray-500 dark:text-gray-400">启用邮箱验证</span>
-                        <span className="mt-1 block text-xs text-gray-400">关闭后注册接口会拒绝创建新账号，避免未验证账号混入。</span>
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => updateEmailDraft({ enabled: !emailDraft.enabled })}
-                        className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${emailDraft.enabled ? 'bg-cyan-500' : 'bg-gray-300 dark:bg-gray-600'}`}
-                        aria-pressed={emailDraft.enabled}
-                      >
-                        <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${emailDraft.enabled ? 'translate-x-4' : 'translate-x-0.5'}`} />
-                      </button>
-                    </label>
-                    <label className="block lg:col-span-2">
-                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">SMTP Host</span>
-                      <input
-                        value={emailDraft.smtpHost}
-                        onChange={(event) => updateEmailDraft({ smtpHost: event.target.value })}
-                        placeholder="smtp.example.com"
-                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
-                      />
-                    </label>
-                    <NumberField label="SMTP Port" value={emailDraft.smtpPort} min={1} onChange={(value) => updateEmailDraft({ smtpPort: value })} />
-                    <label className="flex items-center justify-between gap-3 rounded-md border border-gray-200 px-3 py-2 dark:border-white/[0.08]">
-                      <span>
-                        <span className="block text-xs font-semibold text-gray-500 dark:text-gray-400">SSL/TLS</span>
-                        <span className="mt-1 block text-xs text-gray-400">465 通常开启。</span>
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => updateEmailDraft({ smtpSecure: !emailDraft.smtpSecure })}
-                        className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${emailDraft.smtpSecure ? 'bg-cyan-500' : 'bg-gray-300 dark:bg-gray-600'}`}
-                        aria-pressed={emailDraft.smtpSecure}
-                      >
-                        <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${emailDraft.smtpSecure ? 'translate-x-4' : 'translate-x-0.5'}`} />
-                      </button>
-                    </label>
-                    <label className="block lg:col-span-2">
-                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">SMTP 用户名</span>
-                      <input
-                        value={emailDraft.smtpUser}
-                        onChange={(event) => updateEmailDraft({ smtpUser: event.target.value })}
-                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
-                      />
-                    </label>
-                    <label className="block lg:col-span-2">
-                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">
-                        SMTP 密码 {emailDraft.hasSmtpPassword ? '（留空保留当前密码）' : ''}
-                      </span>
-                      <input
-                        type="password"
-                        value={emailDraft.smtpPassword ?? ''}
-                        onChange={(event) => updateEmailDraft({ smtpPassword: event.target.value })}
-                        placeholder={emailDraft.hasSmtpPassword ? '已保存密码，留空不修改' : '请输入 SMTP 密码或授权码'}
-                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
-                      />
-                    </label>
-                    <label className="block lg:col-span-2">
-                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">发件邮箱</span>
-                      <input
-                        value={emailDraft.fromEmail}
-                        onChange={(event) => updateEmailDraft({ fromEmail: event.target.value })}
-                        placeholder="noreply@example.com"
-                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
-                      />
-                    </label>
-                    <label className="block lg:col-span-2">
-                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">发件名称</span>
-                      <input
-                        value={emailDraft.fromName}
-                        onChange={(event) => updateEmailDraft({ fromName: event.target.value })}
-                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
-                      />
-                    </label>
-                    <label className="block lg:col-span-2">
-                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">品牌名</span>
-                      <input
-                        value={emailDraft.brandName}
-                        onChange={(event) => updateEmailDraft({ brandName: event.target.value })}
-                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm font-black outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
-                      />
-                    </label>
-                    <label className="block lg:col-span-2">
-                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">应用访问地址</span>
-                      <input
-                        value={emailDraft.appBaseUrl}
-                        onChange={(event) => updateEmailDraft({ appBaseUrl: event.target.value })}
-                        placeholder="https://your-domain.com"
-                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
-                      />
-                    </label>
-                    <NumberField label="验证有效期（分钟）" value={emailDraft.verificationExpiresMinutes} min={1} onChange={(value) => updateEmailDraft({ verificationExpiresMinutes: value })} />
-                    <label className="block lg:col-span-3">
-                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">邮件标题</span>
-                      <input
-                        value={emailDraft.verificationSubject}
-                        onChange={(event) => updateEmailDraft({ verificationSubject: event.target.value })}
-                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
-                      />
-                    </label>
-                    <label className="block lg:col-span-2">
-                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">纯文本模板</span>
-                      <textarea
-                        value={emailDraft.verificationText}
-                        onChange={(event) => updateEmailDraft({ verificationText: event.target.value })}
-                        rows={8}
-                        className="w-full resize-none rounded-md border border-gray-200 bg-white px-3 py-2 font-mono text-xs outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
-                      />
-                    </label>
-                    <label className="block lg:col-span-2">
-                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">HTML 模板</span>
-                      <textarea
-                        value={emailDraft.verificationHtml}
-                        onChange={(event) => updateEmailDraft({ verificationHtml: event.target.value })}
-                        rows={8}
-                        className="w-full resize-none rounded-md border border-gray-200 bg-white px-3 py-2 font-mono text-xs outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
-                      />
-                    </label>
-                    <div className="rounded-md bg-gray-50 p-3 text-xs leading-5 text-gray-500 dark:bg-white/[0.04] lg:col-span-4">
-                      可用变量：<span className="font-mono text-gray-800 dark:text-gray-200">{'{brandName}'}</span>、<span className="font-mono text-gray-800 dark:text-gray-200">{'{displayName}'}</span>、<span className="font-mono text-gray-800 dark:text-gray-200">{'{verificationLink}'}</span>、<span className="font-mono text-gray-800 dark:text-gray-200">{'{verificationCode}'}</span>、<span className="font-mono text-gray-800 dark:text-gray-200">{'{expiresMinutes}'}</span>。
-                    </div>
+                  <button onClick={commitEmailSettings} className="rounded-md bg-gray-900 px-3 py-2 text-xs font-bold text-white transition hover:bg-gray-700 dark:bg-white dark:text-gray-950">
+                    保存邮箱配置
+                  </button>
+                </div>
+                <div className="grid gap-4 p-4 lg:grid-cols-4">
+                  <label className="flex items-center justify-between gap-3 rounded-md border border-gray-200 px-3 py-2 dark:border-white/[0.08] lg:col-span-4">
+                    <span>
+                      <span className="block text-xs font-semibold text-gray-500 dark:text-gray-400">启用邮箱验证</span>
+                      <span className="mt-1 block text-xs text-gray-400">关闭后注册接口会拒绝创建新账号，避免未验证账号混入。</span>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => updateEmailDraft({ enabled: !emailDraft.enabled })}
+                      className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${emailDraft.enabled ? 'bg-cyan-500' : 'bg-gray-300 dark:bg-gray-600'}`}
+                      aria-pressed={emailDraft.enabled}
+                    >
+                      <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${emailDraft.enabled ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                    </button>
+                  </label>
+                  <label className="block lg:col-span-2">
+                    <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">SMTP Host</span>
+                    <input
+                      value={emailDraft.smtpHost}
+                      onChange={(event) => updateEmailDraft({ smtpHost: event.target.value })}
+                      placeholder="smtp.example.com"
+                      className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                    />
+                  </label>
+                  <NumberField label="SMTP Port" value={emailDraft.smtpPort} min={1} onChange={(value) => updateEmailDraft({ smtpPort: value })} />
+                  <label className="flex items-center justify-between gap-3 rounded-md border border-gray-200 px-3 py-2 dark:border-white/[0.08]">
+                    <span>
+                      <span className="block text-xs font-semibold text-gray-500 dark:text-gray-400">SSL/TLS</span>
+                      <span className="mt-1 block text-xs text-gray-400">465 通常开启。</span>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => updateEmailDraft({ smtpSecure: !emailDraft.smtpSecure })}
+                      className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${emailDraft.smtpSecure ? 'bg-cyan-500' : 'bg-gray-300 dark:bg-gray-600'}`}
+                      aria-pressed={emailDraft.smtpSecure}
+                    >
+                      <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${emailDraft.smtpSecure ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                    </button>
+                  </label>
+                  <label className="block lg:col-span-2">
+                    <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">SMTP 用户名</span>
+                    <input
+                      value={emailDraft.smtpUser}
+                      onChange={(event) => updateEmailDraft({ smtpUser: event.target.value })}
+                      className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                    />
+                  </label>
+                  <label className="block lg:col-span-2">
+                    <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">
+                      SMTP 密码 {emailDraft.hasSmtpPassword ? '（留空保留当前密码）' : ''}
+                    </span>
+                    <input
+                      type="password"
+                      value={emailDraft.smtpPassword ?? ''}
+                      onChange={(event) => updateEmailDraft({ smtpPassword: event.target.value })}
+                      placeholder={emailDraft.hasSmtpPassword ? '已保存密码，留空不修改' : '请输入 SMTP 密码或授权码'}
+                      className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                    />
+                  </label>
+                  <label className="block lg:col-span-2">
+                    <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">发件邮箱</span>
+                    <input
+                      value={emailDraft.fromEmail}
+                      onChange={(event) => updateEmailDraft({ fromEmail: event.target.value })}
+                      placeholder="noreply@example.com"
+                      className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                    />
+                  </label>
+                  <label className="block lg:col-span-2">
+                    <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">发件名称</span>
+                    <input
+                      value={emailDraft.fromName}
+                      onChange={(event) => updateEmailDraft({ fromName: event.target.value })}
+                      className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                    />
+                  </label>
+                  <label className="block lg:col-span-2">
+                    <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">品牌名</span>
+                    <input
+                      value={emailDraft.brandName}
+                      onChange={(event) => updateEmailDraft({ brandName: event.target.value })}
+                      className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm font-black outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                    />
+                  </label>
+                  <label className="block lg:col-span-2">
+                    <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">应用访问地址</span>
+                    <input
+                      value={emailDraft.appBaseUrl}
+                      onChange={(event) => updateEmailDraft({ appBaseUrl: event.target.value })}
+                      placeholder="https://your-domain.com"
+                      className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                    />
+                  </label>
+                  <NumberField label="验证有效期（分钟）" value={emailDraft.verificationExpiresMinutes} min={1} onChange={(value) => updateEmailDraft({ verificationExpiresMinutes: value })} />
+                  <label className="block lg:col-span-3">
+                    <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">邮件标题</span>
+                    <input
+                      value={emailDraft.verificationSubject}
+                      onChange={(event) => updateEmailDraft({ verificationSubject: event.target.value })}
+                      className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                    />
+                  </label>
+                  <label className="block lg:col-span-2">
+                    <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">纯文本模板</span>
+                    <textarea
+                      value={emailDraft.verificationText}
+                      onChange={(event) => updateEmailDraft({ verificationText: event.target.value })}
+                      rows={8}
+                      className="w-full resize-none rounded-md border border-gray-200 bg-white px-3 py-2 font-mono text-xs outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                    />
+                  </label>
+                  <label className="block lg:col-span-2">
+                    <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">HTML 模板</span>
+                    <textarea
+                      value={emailDraft.verificationHtml}
+                      onChange={(event) => updateEmailDraft({ verificationHtml: event.target.value })}
+                      rows={8}
+                      className="w-full resize-none rounded-md border border-gray-200 bg-white px-3 py-2 font-mono text-xs outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                    />
+                  </label>
+                  <div className="rounded-md bg-gray-50 p-3 text-xs leading-5 text-gray-500 dark:bg-white/[0.04] lg:col-span-4">
+                    可用变量：<span className="font-mono text-gray-800 dark:text-gray-200">{'{brandName}'}</span>、<span className="font-mono text-gray-800 dark:text-gray-200">{'{displayName}'}</span>、<span className="font-mono text-gray-800 dark:text-gray-200">{'{verificationLink}'}</span>、<span className="font-mono text-gray-800 dark:text-gray-200">{'{verificationCode}'}</span>、<span className="font-mono text-gray-800 dark:text-gray-200">{'{expiresMinutes}'}</span>。
                   </div>
                 </div>
               </div>
@@ -1694,6 +1866,261 @@ export default function AdminDashboard() {
                     })}
                   </tbody>
                 </table>
+              </div>
+            )}
+
+            {section === 'content' && isAdmin && (
+              <div className="space-y-4">
+                <div className="rounded-lg border border-gray-200 bg-white shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
+                  <div className="border-b border-gray-200 px-4 py-4 dark:border-white/[0.08]">
+                    <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+                      <div>
+                        <div className="text-xs font-black uppercase tracking-[0.18em] text-fuchsia-600 dark:text-fuchsia-400">Content Observatory</div>
+                        <h2 className="mt-1 text-lg font-black">全站图片与聊天记录</h2>
+                        <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">按用户、分组、时间和关键词查看生成内容，图片优先使用接口原始返回 URL。</p>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2 text-xs sm:flex">
+                        {[
+                          ['today', '今天'],
+                          ['week', '近 7 天'],
+                          ['month', '本月'],
+                          ['all', '全部'],
+                        ].map(([range, label]) => (
+                          <button
+                            key={range}
+                            type="button"
+                            onClick={() => applyContentRange(range as 'today' | 'week' | 'month' | 'all')}
+                            className="rounded-md border border-gray-200 px-2.5 py-1.5 font-bold text-gray-600 transition hover:border-fuchsia-300 hover:text-fuchsia-700 dark:border-white/[0.08] dark:text-gray-300 dark:hover:border-fuchsia-500 dark:hover:text-fuchsia-300"
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid gap-3 p-4 lg:grid-cols-12">
+                    <label className="block lg:col-span-4">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">搜索</span>
+                      <input
+                        value={contentQuery}
+                        onChange={(event) => setContentQuery(event.target.value)}
+                        placeholder="用户、邮箱、提示词、回复、模型、任务 ID"
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-fuchsia-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      />
+                    </label>
+                    <label className="block lg:col-span-2">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">类型</span>
+                      <select
+                        value={contentKind}
+                        onChange={(event) => setContentKind(event.target.value as ContentAuditKind | 'all')}
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-fuchsia-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      >
+                        {Object.entries(contentKindLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                      </select>
+                    </label>
+                    <label className="block lg:col-span-2">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">来源</span>
+                      <select
+                        value={contentSource}
+                        onChange={(event) => setContentSource(event.target.value as ContentAuditSource | 'all')}
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-fuchsia-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      >
+                        {Object.entries(contentSourceLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                      </select>
+                    </label>
+                    <label className="block lg:col-span-2">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">开始时间</span>
+                      <input
+                        type="datetime-local"
+                        value={contentFrom}
+                        onChange={(event) => setContentFrom(event.target.value)}
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-fuchsia-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      />
+                    </label>
+                    <label className="block lg:col-span-2">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">结束时间</span>
+                      <input
+                        type="datetime-local"
+                        value={contentTo}
+                        onChange={(event) => setContentTo(event.target.value)}
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-fuchsia-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      />
+                    </label>
+                    <label className="block lg:col-span-3">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">用户</span>
+                      <select
+                        value={contentUserId}
+                        onChange={(event) => setContentUserId(event.target.value)}
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-fuchsia-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      >
+                        <option value="all">全部用户</option>
+                        {users.map((user) => <option key={user.id} value={user.id}>{user.displayName} · {user.email}</option>)}
+                      </select>
+                    </label>
+                    <label className="block lg:col-span-3">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">分组</span>
+                      <select
+                        value={contentGroupId}
+                        onChange={(event) => setContentGroupId(event.target.value)}
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-fuchsia-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      >
+                        <option value="all">全部分组</option>
+                        {groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}
+                      </select>
+                    </label>
+                    <label className="block lg:col-span-2">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">每页</span>
+                      <select
+                        value={contentPageSize}
+                        onChange={(event) => setContentPageSize(Number(event.target.value))}
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-fuchsia-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      >
+                        {CONTENT_AUDIT_PAGE_SIZES.map((size) => <option key={size} value={size}>{size} 条</option>)}
+                      </select>
+                    </label>
+                    <div className="flex items-end gap-2 lg:col-span-4">
+                      <button
+                        type="button"
+                        onClick={clearContentFilters}
+                        className="rounded-md border border-gray-200 px-3 py-2 text-sm font-bold text-gray-600 transition hover:bg-gray-50 dark:border-white/[0.08] dark:text-gray-300 dark:hover:bg-white/[0.06]"
+                      >
+                        清空筛选
+                      </button>
+                      <div className="text-xs leading-5 text-gray-500 dark:text-gray-400">
+                        {contentBusy ? '内容探针正在同步...' : `显示 ${contentStart}-${contentEnd} / ${contentTotal} 条`}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {contentError && (
+                  <div className="rounded-lg border border-rose-200 bg-rose-50 p-4 text-sm font-semibold text-rose-700 dark:border-rose-500/20 dark:bg-rose-500/10 dark:text-rose-200">
+                    {contentError}
+                  </div>
+                )}
+
+                <div className="space-y-3">
+                  {contentEntries.length === 0 && !contentBusy ? (
+                    <div className="rounded-lg border border-dashed border-gray-200 bg-white p-8 text-sm text-gray-500 shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
+                      <div className="text-base font-black text-gray-900 dark:text-gray-100">还没有捕捉到内容记录</div>
+                      <p className="mt-2">生成一张图或完成一次 Agent 对话后，这里会出现可追踪的内容快照。</p>
+                    </div>
+                  ) : (
+                    contentEntries.map((entry) => {
+                      const user = users.find((item) => item.id === entry.userId)
+                      const group = groups.find((item) => item.id === entry.groupId)
+                      return (
+                        <article key={entry.id} className="rounded-lg border border-gray-200 bg-white p-4 shadow-sm transition hover:border-fuchsia-200 dark:border-white/[0.08] dark:bg-white/[0.04] dark:hover:border-fuchsia-500/50">
+                          <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                            <div className="min-w-0">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className="rounded-md bg-gray-900 px-2 py-1 text-xs font-black text-white dark:bg-white dark:text-gray-950">{contentKindLabels[entry.kind]}</span>
+                                <span className="rounded-md bg-fuchsia-50 px-2 py-1 text-xs font-bold text-fuchsia-700 dark:bg-fuchsia-400/10 dark:text-fuchsia-200">{contentSourceLabels[entry.source]}</span>
+                                <span className="font-mono text-xs text-gray-400">#{entry.clientRecordId.slice(0, 28)}</span>
+                              </div>
+                              <h3 className="mt-2 line-clamp-2 text-base font-black">{entry.prompt || (entry.kind === 'image' ? '未记录提示词' : '未记录用户输入')}</h3>
+                              <div className="mt-1 text-xs text-gray-500">
+                                {(user?.displayName ?? entry.userDisplayName) || '未知用户'} · {(user?.email ?? entry.userEmail) || entry.userId} · {formatFullDate(entry.createdAt)}
+                              </div>
+                            </div>
+                            <div className="shrink-0 text-left text-xs text-gray-500 lg:text-right">
+                              <div className="font-semibold">{entry.planName || '未记录套餐'} / {entry.groupName || group?.name || '未记录分组'}</div>
+                              <div className="mt-1 font-mono">{entry.apiModel || '无模型快照'}</div>
+                              {entry.finishedAt && <div className="mt-1">完成 {formatFullDate(entry.finishedAt)}</div>}
+                              <div className="mt-1 font-black text-fuchsia-600 dark:text-fuchsia-300">耗时 {formatDurationMs(entry.elapsedMs)}</div>
+                            </div>
+                          </div>
+
+                          {entry.kind === 'image' ? (
+                            <div className="mt-4">
+                              {entry.imageUrls.length > 0 ? (
+                                <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                                  {entry.imageUrls.map((url, index) => (
+                                    <a key={`${entry.id}:${url}`} href={url} target="_blank" rel="noreferrer" className="group block overflow-hidden rounded-lg border border-gray-100 bg-gray-50 dark:border-white/[0.06] dark:bg-gray-950">
+                                      <img src={url} alt={`生成图片 ${index + 1}`} loading="lazy" referrerPolicy="no-referrer" className="aspect-square w-full object-cover transition group-hover:scale-[1.02]" />
+                                      <div className="truncate px-2 py-1.5 font-mono text-[11px] text-gray-400">{url}</div>
+                                    </a>
+                                  ))}
+                                </div>
+                              ) : (
+                                <div className="rounded-lg border border-dashed border-gray-200 bg-gray-50 p-4 text-sm text-gray-500 dark:border-white/[0.08] dark:bg-gray-950">
+                                  这条图片记录没有原始 URL；本地图片 ID：{entry.imageIds.length > 0 ? entry.imageIds.join('、') : '未记录'}
+                                </div>
+                              )}
+                            </div>
+                          ) : (
+                            <div className="mt-4 grid gap-3 lg:grid-cols-2">
+                              <div className="rounded-lg bg-gray-50 p-3 dark:bg-gray-950">
+                                <div className="text-xs font-black text-gray-500 dark:text-gray-400">用户输入</div>
+                                <div className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-words text-sm leading-6">{entry.prompt || '未记录'}</div>
+                              </div>
+                              <div className="rounded-lg bg-gray-50 p-3 dark:bg-gray-950">
+                                <div className="text-xs font-black text-gray-500 dark:text-gray-400">助手回复</div>
+                                <div className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-words text-sm leading-6">{entry.assistantText || '未记录'}</div>
+                              </div>
+                            </div>
+                          )}
+
+                          <div className="mt-4 grid gap-2 text-xs sm:grid-cols-2 xl:grid-cols-6">
+                            <div className="rounded-md bg-gray-50 p-3 dark:bg-white/[0.04]">
+                              <div className="font-semibold text-gray-500 dark:text-gray-400">用户</div>
+                              <div className="mt-1 truncate font-black">{(user?.displayName ?? entry.userDisplayName) || '未知用户'}</div>
+                              <div className="mt-1 truncate text-gray-400">{(user?.email ?? entry.userEmail) || entry.userId}</div>
+                            </div>
+                            <div className="rounded-md bg-gray-50 p-3 dark:bg-white/[0.04]">
+                              <div className="font-semibold text-gray-500 dark:text-gray-400">任务 / 轮次</div>
+                              <div className="mt-1 truncate font-mono">{entry.taskId || entry.roundId || '无'}</div>
+                              <div className="mt-1 truncate text-gray-400">{entry.conversationId || '无对话 ID'}</div>
+                            </div>
+                            <div className="rounded-md bg-gray-50 p-3 dark:bg-white/[0.04]">
+                              <div className="font-semibold text-gray-500 dark:text-gray-400">耗时</div>
+                              <div className="mt-1 truncate font-black">{formatDurationMs(entry.elapsedMs)}</div>
+                              <div className="mt-1 truncate text-gray-400">{entry.finishedAt ? '从提交到完成' : '尚无完成时间'}</div>
+                            </div>
+                            <div className="rounded-md bg-gray-50 p-3 dark:bg-white/[0.04]">
+                              <div className="font-semibold text-gray-500 dark:text-gray-400">接口</div>
+                              <div className="mt-1 truncate font-black">{entry.apiProvider || '未记录'}{entry.apiMode ? ` · ${entry.apiMode}` : ''}</div>
+                              <div className="mt-1 truncate text-gray-400">{entry.apiProfileName || '无配置名'}</div>
+                            </div>
+                            <div className="rounded-md bg-gray-50 p-3 dark:bg-white/[0.04]">
+                              <div className="font-semibold text-gray-500 dark:text-gray-400">输入图片</div>
+                              <div className="mt-1 truncate font-mono">{entry.inputImageIds.length ? entry.inputImageIds.join('、') : '无'}</div>
+                            </div>
+                            <div className="rounded-md bg-gray-50 p-3 dark:bg-white/[0.04]">
+                              <div className="font-semibold text-gray-500 dark:text-gray-400">输出</div>
+                              <div className="mt-1 truncate font-mono">{entry.kind === 'chat' ? (entry.outputTaskIds.join('、') || '无图片任务') : (entry.imageIds.join('、') || `${entry.imageUrls.length} 个 URL`)}</div>
+                            </div>
+                          </div>
+                        </article>
+                      )
+                    })
+                  )}
+                </div>
+
+                <div className="flex flex-col gap-3 rounded-lg border border-gray-200 bg-white px-4 py-3 text-sm shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04] sm:flex-row sm:items-center sm:justify-between">
+                  <div className="text-gray-500 dark:text-gray-400">
+                    第 <span className="font-black text-gray-900 dark:text-gray-100">{contentCurrentPage}</span> / {contentTotalPages} 页
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setContentPage((page) => Math.max(1, page - 1))}
+                      disabled={contentCurrentPage <= 1 || contentBusy}
+                      className="rounded-md border border-gray-200 px-3 py-2 font-bold text-gray-600 transition hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40 dark:border-white/[0.08] dark:text-gray-300 dark:hover:bg-white/[0.06]"
+                    >
+                      上一页
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setContentPage((page) => Math.min(contentTotalPages, page + 1))}
+                      disabled={contentCurrentPage >= contentTotalPages || contentBusy}
+                      className="rounded-md bg-gray-900 px-3 py-2 font-bold text-white transition hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-40 dark:bg-white dark:text-gray-950"
+                    >
+                      下一页
+                    </button>
+                  </div>
+                </div>
               </div>
             )}
 

@@ -1,4 +1,4 @@
-import type { AppSettings, AuthSession, BillingLedgerEntry, BillingLedgerType, BillingUsageSource, EmailSettings, EmailVerificationState, ManagedUser, QuotaDeductionPriority, RewardCode, RewardState, UserGroup, UserPlan } from '../types'
+import type { AppSettings, AuthSession, BillingLedgerEntry, BillingLedgerType, BillingUsageSource, ContentAuditEntry, ContentAuditKind, ContentAuditSource, EmailSettings, EmailVerificationState, ManagedUser, QuotaDeductionPriority, RewardCode, RewardState, SystemSettings, UserGroup, UserPlan } from '../types'
 
 export interface BackendState {
   groups: UserGroup[]
@@ -9,6 +9,7 @@ export interface BackendState {
   setupRequired: boolean
   apiSettings: AppSettings | null
   adminApiSettings: AppSettings | null
+  systemSettings: SystemSettings
   emailSettings: EmailSettings | null
   emailVerification?: EmailVerificationState
   rewardState: RewardState
@@ -32,6 +33,30 @@ export interface LedgerPage {
   page: number
   pageSize: number
   totalPages: number
+}
+
+export interface ContentAuditQuery {
+  query?: string
+  kind?: ContentAuditKind | 'all'
+  source?: ContentAuditSource | 'all'
+  userId?: string
+  groupId?: string
+  from?: number | null
+  to?: number | null
+  page?: number
+  pageSize?: number
+}
+
+export interface ContentAuditPage {
+  entries: ContentAuditEntry[]
+  total: number
+  page: number
+  pageSize: number
+  totalPages: number
+}
+
+export type ContentAuditInput = Omit<ContentAuditEntry, 'id' | 'clientRecordId' | 'userId' | 'userEmail' | 'userDisplayName' | 'planId' | 'planName' | 'groupId' | 'groupName'> & {
+  id: string
 }
 
 export type RewardCodeInput = Omit<RewardCode, 'id' | 'redeemedCount' | 'createdAt' | 'updatedAt'>
@@ -68,6 +93,25 @@ export function backendFetchLedger(query: LedgerQuery, session?: AuthSession | n
   if (query.pageSize) params.set('pageSize', String(query.pageSize))
   const suffix = params.toString()
   return request<LedgerPage>(`/ledger${suffix ? `?${suffix}` : ''}`, { method: 'GET', session })
+}
+
+export function backendFetchContentAudit(query: ContentAuditQuery, session?: AuthSession | null) {
+  const params = new URLSearchParams()
+  if (query.query?.trim()) params.set('query', query.query.trim())
+  if (query.kind && query.kind !== 'all') params.set('kind', query.kind)
+  if (query.source && query.source !== 'all') params.set('source', query.source)
+  if (query.userId) params.set('userId', query.userId)
+  if (query.groupId) params.set('groupId', query.groupId)
+  if (query.from) params.set('from', String(query.from))
+  if (query.to) params.set('to', String(query.to))
+  if (query.page) params.set('page', String(query.page))
+  if (query.pageSize) params.set('pageSize', String(query.pageSize))
+  const suffix = params.toString()
+  return request<ContentAuditPage>(`/content-audit${suffix ? `?${suffix}` : ''}`, { method: 'GET', session })
+}
+
+export function backendCreateContentAuditRecord(input: ContentAuditInput, session?: AuthSession | null) {
+  return request<{ ok: true }>('/content-audit', { method: 'POST', body: JSON.stringify(input), session })
 }
 
 export function backendLogin(email: string, password: string) {
@@ -112,6 +156,10 @@ export function backendSyncManagementApiConfig(input: { url?: string; authToken?
 
 export function backendUpdateEmailSettings(settings: EmailSettings, session?: AuthSession | null) {
   return request<BackendState>('/settings/email', { method: 'PATCH', body: JSON.stringify({ settings }), session })
+}
+
+export function backendUpdateSystemSettings(settings: SystemSettings, session?: AuthSession | null) {
+  return request<BackendState>('/settings/system', { method: 'PATCH', body: JSON.stringify({ settings }), session })
 }
 
 export function backendGrantUserQuota(userId: string, amount: number, note: string, session?: AuthSession | null) {

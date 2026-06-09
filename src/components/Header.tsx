@@ -53,6 +53,7 @@ export default function Header() {
   const currentTotalQuotaBalance = (currentUser?.quotaBalance ?? 0) + currentGroupQuotaBalance
   const canOpenBackend = Boolean(currentUser)
   const canOpenAgent = canManagedUserUseAgent(currentUser)
+  const siteName = useStore((s) => s.systemSettings.siteName)
 
   useEffect(() => {
     if (appMode === 'agent') {
@@ -169,9 +170,10 @@ export default function Header() {
                     href="https://github.com/CookSleep/gpt_image_playground"
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="hidden text-lg font-bold tracking-tight text-gray-800 transition-colors hover:text-gray-600 dark:text-gray-100 dark:hover:text-gray-300 sm:inline"
+                    title={siteName}
+                    className="hidden max-w-[320px] truncate text-lg font-bold tracking-tight text-gray-800 transition-colors hover:text-gray-600 dark:text-gray-100 dark:hover:text-gray-300 sm:inline-block md:max-w-[420px] lg:max-w-[520px]"
                   >
-                    GPT Image Playground
+                    {siteName}
                   </a>
                 </>
               ) : (
@@ -179,9 +181,10 @@ export default function Header() {
                   href="https://github.com/CookSleep/gpt_image_playground"
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-[17px] sm:text-lg font-bold tracking-tight text-gray-800 dark:text-gray-100 hover:text-gray-600 dark:hover:text-gray-300 transition-colors"
+                  title={siteName}
+                  className="inline-block max-w-[52vw] truncate align-top text-[17px] font-bold tracking-tight text-gray-800 transition-colors hover:text-gray-600 dark:text-gray-100 dark:hover:text-gray-300 sm:max-w-[420px] sm:text-lg lg:max-w-[520px]"
                 >
-                  GPT Image Playground
+                  {siteName}
                 </a>
               )}
               {hasUpdate && latestRelease && (

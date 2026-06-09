@@ -114,6 +114,10 @@ export interface AppSettings {
   activeProfileId: string
 }
 
+export interface SystemSettings {
+  siteName: string
+}
+
 // ===== 任务参数 =====
 
 export interface TaskParams {
@@ -157,6 +161,8 @@ export type UserRole = 'admin' | 'member'
 export type BillingLedgerType = 'credit' | 'debit' | 'payment' | 'adjustment'
 export type BillingUsageSource = 'gallery' | 'agent' | 'admin'
 export type QuotaDeductionPriority = 'group_first' | 'personal_first'
+export type ContentAuditKind = 'image' | 'chat'
+export type ContentAuditSource = 'gallery' | 'agent'
 
 export interface UserPlan {
   id: string
@@ -254,6 +260,38 @@ export interface BillingLedgerEntry {
   apiBaseUrl: string
   note: string
   createdAt: number
+}
+
+export interface ContentAuditEntry {
+  id: string
+  clientRecordId: string
+  userId: string
+  userEmail: string
+  userDisplayName: string
+  kind: ContentAuditKind
+  source: ContentAuditSource
+  taskId: string
+  conversationId: string
+  roundId: string
+  messageId: string
+  prompt: string
+  assistantText: string
+  imageUrls: string[]
+  imageIds: string[]
+  inputImageIds: string[]
+  outputTaskIds: string[]
+  apiProvider: string
+  apiMode: string
+  apiModel: string
+  apiProfileName: string
+  planId: string
+  planName: string
+  groupId: string
+  groupName: string
+  metadata: Record<string, unknown>
+  elapsedMs: number | null
+  createdAt: number
+  finishedAt: number | null
 }
 
 export interface RewardCode {

@@ -35,6 +35,7 @@ export default function App() {
   const setAppMode = useStore((s) => s.setAppMode)
   const filterFavorite = useStore((s) => s.filterFavorite)
   const activeFavoriteCollectionId = useStore((s) => s.activeFavoriteCollectionId)
+  const siteName = useStore((s) => s.systemSettings.siteName)
   const currentUser = users.find((user) => user.id === authSession?.userId) ?? null
   useDockerApiUrlMigrationNotice()
   useGlobalClickSuppression()
@@ -87,6 +88,10 @@ export default function App() {
       setAppMode('gallery')
     }
   }, [appMode, currentUser, setAppMode])
+
+  useEffect(() => {
+    document.title = siteName || '造像台'
+  }, [siteName])
 
   if (!authReady) {
     return (
