@@ -1,4 +1,4 @@
-import type { AppSettings, AuthSession, BillingLedgerEntry, ManagedUser, UserGroup, UserPlan } from '../types'
+import type { AppSettings, AuthSession, BillingLedgerEntry, BillingLedgerType, BillingUsageSource, ManagedUser, UserGroup, UserPlan } from '../types'
 
 export interface BackendState {
   groups: UserGroup[]
@@ -9,6 +9,26 @@ export interface BackendState {
   setupRequired: boolean
   apiSettings: AppSettings | null
   adminApiSettings: AppSettings | null
+}
+
+export interface LedgerQuery {
+  query?: string
+  source?: BillingUsageSource | 'all'
+  type?: BillingLedgerType | 'all'
+  userId?: string
+  groupId?: string
+  from?: number | null
+  to?: number | null
+  page?: number
+  pageSize?: number
+}
+
+export interface LedgerPage {
+  entries: BillingLedgerEntry[]
+  total: number
+  page: number
+  pageSize: number
+  totalPages: number
 }
 
 async function request<T>(path: string, options: RequestInit & { session?: AuthSession | null } = {}): Promise<T> {
@@ -28,6 +48,21 @@ async function request<T>(path: string, options: RequestInit & { session?: AuthS
 
 export function fetchBackendState(session?: AuthSession | null) {
   return request<BackendState>('/state', { method: 'GET', session })
+}
+
+export function backendFetchLedger(query: LedgerQuery, session?: AuthSession | null) {
+  const params = new URLSearchParams()
+  if (query.query?.trim()) params.set('query', query.query.trim())
+  if (query.source && query.source !== 'all') params.set('source', query.source)
+  if (query.type && query.type !== 'all') params.set('type', query.type)
+  if (query.userId) params.set('userId', query.userId)
+  if (query.groupId) params.set('groupId', query.groupId)
+  if (query.from) params.set('from', String(query.from))
+  if (query.to) params.set('to', String(query.to))
+  if (query.page) params.set('page', String(query.page))
+  if (query.pageSize) params.set('pageSize', String(query.pageSize))
+  const suffix = params.toString()
+  return request<LedgerPage>(`/ledger${suffix ? `?${suffix}` : ''}`, { method: 'GET', session })
 }
 
 export function backendLogin(email: string, password: string) {

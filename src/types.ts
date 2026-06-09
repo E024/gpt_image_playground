@@ -203,7 +203,18 @@ export interface BillingLedgerEntry {
   type: BillingLedgerType
   source: BillingUsageSource
   amount: number
+  units: number
+  unitCost: number
+  balanceBefore: number
   balanceAfter: number
+  planId: string
+  planName: string
+  groupId: string
+  groupName: string
+  apiProvider: string
+  apiMode: string
+  apiModel: string
+  apiBaseUrl: string
   note: string
   createdAt: number
 }

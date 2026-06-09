@@ -1,11 +1,26 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useStore } from '../store'
 import { getActiveApiProfile, normalizeSettings } from '../lib/apiProfiles'
-import type { ApiMode, ApiProfile, AppSettings, ManagedUser, UserGroup, UserPlan } from '../types'
+import { backendFetchLedger, type LedgerPage } from '../lib/backendApi'
+import type { ApiMode, ApiProfile, AppSettings, BillingLedgerEntry, BillingLedgerType, BillingUsageSource, ManagedUser, UserGroup, UserPlan } from '../types'
 
 type AdminSection = 'overview' | 'groups' | 'plans' | 'users' | 'ledger' | 'settings'
 type NavItem = { id: AdminSection; label: string; description: string; adminOnly?: boolean }
 const DEFAULT_GROUP_ID = 'default'
+const LEDGER_PAGE_SIZES = [10, 20, 50, 100]
+const ledgerSourceLabels: Record<BillingUsageSource | 'all', string> = {
+  all: '全部来源',
+  gallery: '画廊生成',
+  agent: 'Agent 对话',
+  admin: '后台调整',
+}
+const ledgerTypeLabels: Record<BillingLedgerType | 'all', string> = {
+  all: '全部类型',
+  credit: '发放',
+  debit: '扣费',
+  payment: '付款',
+  adjustment: '校准',
+}
 
 function formatMoney(value: number) {
   return new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(value)
@@ -14,6 +29,34 @@ function formatMoney(value: number) {
 function formatDate(value: number | null) {
   if (!value) return '从未'
   return new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(value)
+}
+
+function formatFullDate(value: number | null) {
+  if (!value) return '未知时间'
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).format(value)
+}
+
+function toDateTimeLocal(value: number) {
+  const date = new Date(value)
+  const pad = (next: number) => String(next).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+function fromDateTimeLocal(value: string) {
+  if (!value) return null
+  const time = new Date(value).getTime()
+  return Number.isFinite(time) ? time : null
+}
+
+function getLedgerAmountLabel(entry: BillingLedgerEntry) {
+  return `${entry.type === 'debit' ? '-' : '+'}${entry.amount} 点`
 }
 
 function NumberField({
@@ -80,6 +123,18 @@ export default function AdminDashboard() {
   const [groupDrafts, setGroupDrafts] = useState<Record<string, UserGroup>>({})
   const [planDrafts, setPlanDrafts] = useState<Record<string, UserPlan>>({})
   const [apiDraft, setApiDraft] = useState<AppSettings>(() => normalizeSettings(adminApiSettings ?? settings))
+  const [ledgerQuery, setLedgerQuery] = useState('')
+  const [ledgerSource, setLedgerSource] = useState<BillingUsageSource | 'all'>('all')
+  const [ledgerType, setLedgerType] = useState<BillingLedgerType | 'all'>('all')
+  const [ledgerUserId, setLedgerUserId] = useState('all')
+  const [ledgerGroupId, setLedgerGroupId] = useState('all')
+  const [ledgerFrom, setLedgerFrom] = useState('')
+  const [ledgerTo, setLedgerTo] = useState('')
+  const [ledgerPage, setLedgerPage] = useState(1)
+  const [ledgerPageSize, setLedgerPageSize] = useState(10)
+  const [ledgerResult, setLedgerResult] = useState<LedgerPage | null>(null)
+  const [ledgerBusy, setLedgerBusy] = useState(false)
+  const [ledgerError, setLedgerError] = useState('')
 
   const visibleLedger = isAdmin ? ledger : ledger.filter((entry) => entry.userId === currentUser?.id)
   const selectedGroup = groups.find((group) => group.id === selectedGroupId) ?? currentGroup ?? groups[0] ?? null
@@ -97,6 +152,12 @@ export default function AdminDashboard() {
   const canEditPlans = isAdmin
   const activeApiProfile = getActiveApiProfile(apiDraft)
   const getGroupName = (groupId: string) => groups.find((group) => group.id === groupId)?.name ?? '未知分组'
+  const ledgerEntries = ledgerResult?.entries ?? visibleLedger.slice(0, ledgerPageSize)
+  const ledgerTotal = ledgerResult?.total ?? ledgerEntries.length
+  const ledgerTotalPages = ledgerResult?.totalPages ?? 1
+  const ledgerCurrentPage = ledgerResult?.page ?? ledgerPage
+  const ledgerStart = ledgerTotal === 0 ? 0 : (ledgerCurrentPage - 1) * ledgerPageSize + 1
+  const ledgerEnd = ledgerTotal === 0 ? 0 : Math.min(ledgerStart + ledgerEntries.length - 1, ledgerTotal)
 
   useEffect(() => {
     setApiDraft(normalizeSettings(adminApiSettings ?? settings))
@@ -115,6 +176,50 @@ export default function AdminDashboard() {
     if (visiblePlans.some((plan) => plan.id === selectedPlanId)) return
     setSelectedPlanId(isAdmin ? visiblePlans[0]?.id ?? '' : currentPlan?.id ?? '')
   }, [currentPlan?.id, isAdmin, selectedPlanId, visiblePlans])
+
+  useEffect(() => {
+    setLedgerPage(1)
+  }, [ledgerQuery, ledgerSource, ledgerType, ledgerUserId, ledgerGroupId, ledgerFrom, ledgerTo, ledgerPageSize])
+
+  useEffect(() => {
+    if (!isAdmin) {
+      if (ledgerUserId !== 'all') setLedgerUserId('all')
+      if (ledgerGroupId !== 'all') setLedgerGroupId('all')
+    }
+  }, [isAdmin, ledgerGroupId, ledgerUserId])
+
+  useEffect(() => {
+    if (section !== 'ledger' || !currentUser || !session) return
+    let cancelled = false
+    setLedgerBusy(true)
+    setLedgerError('')
+    void backendFetchLedger({
+      query: ledgerQuery,
+      source: ledgerSource,
+      type: ledgerType,
+      userId: isAdmin && ledgerUserId !== 'all' ? ledgerUserId : '',
+      groupId: isAdmin && ledgerGroupId !== 'all' ? ledgerGroupId : '',
+      from: fromDateTimeLocal(ledgerFrom),
+      to: fromDateTimeLocal(ledgerTo),
+      page: ledgerPage,
+      pageSize: ledgerPageSize,
+    }, session)
+      .then((result) => {
+        if (!cancelled) setLedgerResult(result)
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setLedgerError(error instanceof Error ? error.message : '读取流水失败')
+          setLedgerResult(null)
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLedgerBusy(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [currentUser, isAdmin, ledgerFrom, ledgerGroupId, ledgerPage, ledgerPageSize, ledgerQuery, ledgerSource, ledgerTo, ledgerType, ledgerUserId, section, session])
 
   const stats = useMemo(() => {
     const mrr = users.reduce((sum, user) => sum + (plans.find((plan) => plan.id === user.planId)?.monthlyPrice ?? 0), 0)
@@ -242,6 +347,39 @@ export default function AdminDashboard() {
       delete next[user.id]
       return next
     })
+  }
+
+  const applyLedgerRange = (range: 'today' | 'week' | 'month' | 'all') => {
+    if (range === 'all') {
+      setLedgerFrom('')
+      setLedgerTo('')
+      return
+    }
+    const now = new Date()
+    const end = now.getTime()
+    const start = new Date(now)
+    if (range === 'today') {
+      start.setHours(0, 0, 0, 0)
+    } else if (range === 'week') {
+      start.setDate(now.getDate() - 6)
+      start.setHours(0, 0, 0, 0)
+    } else {
+      start.setDate(1)
+      start.setHours(0, 0, 0, 0)
+    }
+    setLedgerFrom(toDateTimeLocal(start.getTime()))
+    setLedgerTo(toDateTimeLocal(end))
+  }
+
+  const clearLedgerFilters = () => {
+    setLedgerQuery('')
+    setLedgerSource('all')
+    setLedgerType('all')
+    setLedgerUserId('all')
+    setLedgerGroupId('all')
+    setLedgerFrom('')
+    setLedgerTo('')
+    setLedgerPage(1)
   }
 
   return (
@@ -751,30 +889,221 @@ export default function AdminDashboard() {
             )}
 
             {section === 'ledger' && (
-              <div className="rounded-lg border border-gray-200 bg-white p-4 shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
-                <h2 className="text-sm font-black">{isAdmin ? '最近流水' : '我的消费流水'}</h2>
-                <div className="mt-3 max-h-[620px] overflow-auto">
-                  {visibleLedger.length === 0 ? (
-                    <div className="rounded-lg border border-dashed border-gray-200 p-6 text-sm text-gray-500 dark:border-white/[0.08]">还没有流水。</div>
+              <div className="space-y-4">
+                <div className="rounded-lg border border-gray-200 bg-white shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
+                  <div className="border-b border-gray-200 px-4 py-4 dark:border-white/[0.08]">
+                    <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+                      <div>
+                        <div className="text-xs font-black uppercase tracking-[0.18em] text-cyan-600 dark:text-cyan-400">Ledger Lens</div>
+                        <h2 className="mt-1 text-lg font-black">{isAdmin ? '全站调用账本' : '我的调用账本'}</h2>
+                        <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">每条记录都保留扣费公式、套餐快照和调用配置，方便对账。</p>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2 text-xs sm:flex">
+                        {[
+                          ['today', '今天'],
+                          ['week', '近 7 天'],
+                          ['month', '本月'],
+                          ['all', '全部'],
+                        ].map(([range, label]) => (
+                          <button
+                            key={range}
+                            type="button"
+                            onClick={() => applyLedgerRange(range as 'today' | 'week' | 'month' | 'all')}
+                            className="rounded-md border border-gray-200 px-2.5 py-1.5 font-bold text-gray-600 transition hover:border-cyan-300 hover:text-cyan-700 dark:border-white/[0.08] dark:text-gray-300 dark:hover:border-cyan-500 dark:hover:text-cyan-300"
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid gap-3 p-4 lg:grid-cols-12">
+                    <label className="block lg:col-span-4">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">搜索</span>
+                      <input
+                        value={ledgerQuery}
+                        onChange={(event) => setLedgerQuery(event.target.value)}
+                        placeholder="用户、邮箱、套餐、模型、备注、流水号"
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      />
+                    </label>
+                    <label className="block lg:col-span-2">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">来源</span>
+                      <select
+                        value={ledgerSource}
+                        onChange={(event) => setLedgerSource(event.target.value as BillingUsageSource | 'all')}
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      >
+                        {Object.entries(ledgerSourceLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                      </select>
+                    </label>
+                    <label className="block lg:col-span-2">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">类型</span>
+                      <select
+                        value={ledgerType}
+                        onChange={(event) => setLedgerType(event.target.value as BillingLedgerType | 'all')}
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      >
+                        {Object.entries(ledgerTypeLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                      </select>
+                    </label>
+                    <label className="block lg:col-span-2">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">开始时间</span>
+                      <input
+                        type="datetime-local"
+                        value={ledgerFrom}
+                        onChange={(event) => setLedgerFrom(event.target.value)}
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      />
+                    </label>
+                    <label className="block lg:col-span-2">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">结束时间</span>
+                      <input
+                        type="datetime-local"
+                        value={ledgerTo}
+                        onChange={(event) => setLedgerTo(event.target.value)}
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      />
+                    </label>
+                    {isAdmin && (
+                      <>
+                        <label className="block lg:col-span-3">
+                          <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">用户</span>
+                          <select
+                            value={ledgerUserId}
+                            onChange={(event) => setLedgerUserId(event.target.value)}
+                            className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                          >
+                            <option value="all">全部用户</option>
+                            {users.map((user) => <option key={user.id} value={user.id}>{user.displayName} · {user.email}</option>)}
+                          </select>
+                        </label>
+                        <label className="block lg:col-span-3">
+                          <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">分组</span>
+                          <select
+                            value={ledgerGroupId}
+                            onChange={(event) => setLedgerGroupId(event.target.value)}
+                            className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                          >
+                            <option value="all">全部分组</option>
+                            {groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}
+                          </select>
+                        </label>
+                      </>
+                    )}
+                    <label className="block lg:col-span-2">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">每页</span>
+                      <select
+                        value={ledgerPageSize}
+                        onChange={(event) => setLedgerPageSize(Number(event.target.value))}
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      >
+                        {LEDGER_PAGE_SIZES.map((size) => <option key={size} value={size}>{size} 条</option>)}
+                      </select>
+                    </label>
+                    <div className="flex items-end gap-2 lg:col-span-4">
+                      <button
+                        type="button"
+                        onClick={clearLedgerFilters}
+                        className="rounded-md border border-gray-200 px-3 py-2 text-sm font-bold text-gray-600 transition hover:bg-gray-50 dark:border-white/[0.08] dark:text-gray-300 dark:hover:bg-white/[0.06]"
+                      >
+                        清空筛选
+                      </button>
+                      <div className="text-xs leading-5 text-gray-500 dark:text-gray-400">
+                        {ledgerBusy ? '账本镜头正在对焦...' : `显示 ${ledgerStart}-${ledgerEnd} / ${ledgerTotal} 条`}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {ledgerError && (
+                  <div className="rounded-lg border border-rose-200 bg-rose-50 p-4 text-sm font-semibold text-rose-700 dark:border-rose-500/20 dark:bg-rose-500/10 dark:text-rose-200">
+                    {ledgerError}
+                  </div>
+                )}
+
+                <div className="space-y-3">
+                  {ledgerEntries.length === 0 && !ledgerBusy ? (
+                    <div className="rounded-lg border border-dashed border-gray-200 bg-white p-8 text-sm text-gray-500 shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
+                      <div className="text-base font-black text-gray-900 dark:text-gray-100">这段时间的账本很安静</div>
+                      <p className="mt-2">换一个时间范围或清空筛选，看看其他调用轨迹。</p>
+                    </div>
                   ) : (
-                    <div className="space-y-2">
-                      {visibleLedger.slice(0, 80).map((entry) => {
-                        const user = users.find((item) => item.id === entry.userId)
-                        return (
-                          <div key={entry.id} className="flex items-center justify-between gap-3 rounded-lg border border-gray-100 px-3 py-2 text-sm dark:border-white/[0.06]">
+                    ledgerEntries.map((entry) => {
+                      const user = users.find((item) => item.id === entry.userId)
+                      const amountTone = entry.type === 'debit' ? 'text-rose-500' : 'text-emerald-600 dark:text-emerald-400'
+                      return (
+                        <article key={entry.id} className="rounded-lg border border-gray-200 bg-white p-4 shadow-sm transition hover:border-cyan-200 dark:border-white/[0.08] dark:bg-white/[0.04] dark:hover:border-cyan-500/50">
+                          <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
                             <div className="min-w-0">
-                              <div className="truncate font-bold">{entry.note}</div>
-                              <div className="text-xs text-gray-500">{isAdmin ? `${user?.displayName ?? '未知用户'} · ` : ''}{formatDate(entry.createdAt)}</div>
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className="rounded-md bg-gray-900 px-2 py-1 text-xs font-black text-white dark:bg-white dark:text-gray-950">{ledgerSourceLabels[entry.source]}</span>
+                                <span className="rounded-md bg-gray-100 px-2 py-1 text-xs font-bold text-gray-600 dark:bg-white/[0.06] dark:text-gray-300">{ledgerTypeLabels[entry.type]}</span>
+                                <span className="font-mono text-xs text-gray-400">#{entry.id.slice(0, 8)}</span>
+                              </div>
+                              <h3 className="mt-2 truncate text-base font-black">{entry.note || ledgerSourceLabels[entry.source]}</h3>
+                              <div className="mt-1 text-xs text-gray-500">
+                                {isAdmin ? `${user?.displayName ?? '未知用户'} · ${user?.email ?? entry.userId} · ` : ''}{formatFullDate(entry.createdAt)}
+                              </div>
                             </div>
-                            <div className={`shrink-0 text-right font-black ${entry.type === 'debit' ? 'text-rose-500' : 'text-emerald-600 dark:text-emerald-400'}`}>
-                              {entry.type === 'debit' ? '-' : '+'}{entry.amount}
-                              <div className="text-xs font-medium text-gray-400">余 {entry.balanceAfter}</div>
+                            <div className={`shrink-0 text-left text-2xl font-black lg:text-right ${amountTone}`}>
+                              {getLedgerAmountLabel(entry)}
+                              <div className="mt-1 text-xs font-semibold text-gray-400">余额 {entry.balanceBefore} → {entry.balanceAfter}</div>
                             </div>
                           </div>
-                        )
-                      })}
-                    </div>
+
+                          <div className="mt-4 grid gap-2 text-xs sm:grid-cols-2 xl:grid-cols-4">
+                            <div className="rounded-md bg-gray-50 p-3 dark:bg-white/[0.04]">
+                              <div className="font-semibold text-gray-500 dark:text-gray-400">扣费公式</div>
+                              <div className="mt-1 font-black">{entry.units > 0 ? `${entry.units} × ${entry.unitCost} = ${entry.amount} 点` : `${entry.amount} 点`}</div>
+                            </div>
+                            <div className="rounded-md bg-gray-50 p-3 dark:bg-white/[0.04]">
+                              <div className="font-semibold text-gray-500 dark:text-gray-400">套餐 / 分组</div>
+                              <div className="mt-1 truncate font-black">{entry.planName || '未记录套餐'} / {entry.groupName || '未记录分组'}</div>
+                            </div>
+                            <div className="rounded-md bg-gray-50 p-3 dark:bg-white/[0.04]">
+                              <div className="font-semibold text-gray-500 dark:text-gray-400">模型</div>
+                              <div className="mt-1 truncate font-black">{entry.apiModel || '无模型快照'}</div>
+                            </div>
+                            <div className="rounded-md bg-gray-50 p-3 dark:bg-white/[0.04]">
+                              <div className="font-semibold text-gray-500 dark:text-gray-400">接口</div>
+                              <div className="mt-1 truncate font-black">{entry.apiProvider || 'admin'}{entry.apiMode ? ` · ${entry.apiMode}` : ''}</div>
+                            </div>
+                          </div>
+                          {entry.apiBaseUrl && (
+                            <div className="mt-2 truncate rounded-md border border-gray-100 px-3 py-2 font-mono text-xs text-gray-500 dark:border-white/[0.06] dark:text-gray-400">
+                              {entry.apiBaseUrl}
+                            </div>
+                          )}
+                        </article>
+                      )
+                    })
                   )}
+                </div>
+
+                <div className="flex flex-col gap-3 rounded-lg border border-gray-200 bg-white px-4 py-3 text-sm shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04] sm:flex-row sm:items-center sm:justify-between">
+                  <div className="text-gray-500 dark:text-gray-400">
+                    第 <span className="font-black text-gray-900 dark:text-gray-100">{ledgerCurrentPage}</span> / {ledgerTotalPages} 页
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setLedgerPage((page) => Math.max(1, page - 1))}
+                      disabled={ledgerCurrentPage <= 1 || ledgerBusy}
+                      className="rounded-md border border-gray-200 px-3 py-2 font-bold text-gray-600 transition hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40 dark:border-white/[0.08] dark:text-gray-300 dark:hover:bg-white/[0.06]"
+                    >
+                      上一页
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setLedgerPage((page) => Math.min(ledgerTotalPages, page + 1))}
+                      disabled={ledgerCurrentPage >= ledgerTotalPages || ledgerBusy}
+                      className="rounded-md bg-gray-900 px-3 py-2 font-bold text-white transition hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-40 dark:bg-white dark:text-gray-950"
+                    >
+                      下一页
+                    </button>
+                  </div>
                 </div>
               </div>
             )}

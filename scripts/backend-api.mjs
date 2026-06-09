@@ -24,6 +24,9 @@ const DEFAULT_API_TIMEOUT = 300
 const DEFAULT_STREAM_PARTIAL_IMAGES = 1
 const DEFAULT_AGENT_MAX_TOOL_ROUNDS = 15
 const BACKEND_UPSTREAM_BASE_URL = '/backend-api/upstream'
+const LEDGER_PAGE_SIZES = new Set([10, 20, 50, 100])
+const LEDGER_TYPES = new Set(['credit', 'debit', 'payment', 'adjustment'])
+const LEDGER_SOURCES = new Set(['gallery', 'agent', 'admin'])
 
 mkdirSync(dirname(dbPath), { recursive: true })
 const db = new DatabaseSync(dbPath)
@@ -70,7 +73,18 @@ CREATE TABLE IF NOT EXISTS billing_ledger (
   type TEXT NOT NULL CHECK (type IN ('credit','debit','payment','adjustment')),
   source TEXT NOT NULL CHECK (source IN ('gallery','agent','admin')),
   amount INTEGER NOT NULL,
+  units INTEGER NOT NULL DEFAULT 0,
+  unit_cost INTEGER NOT NULL DEFAULT 0,
+  balance_before INTEGER NOT NULL DEFAULT 0,
   balance_after INTEGER NOT NULL,
+  plan_id TEXT NOT NULL DEFAULT '',
+  plan_name TEXT NOT NULL DEFAULT '',
+  group_id TEXT NOT NULL DEFAULT '',
+  group_name TEXT NOT NULL DEFAULT '',
+  api_provider TEXT NOT NULL DEFAULT '',
+  api_mode TEXT NOT NULL DEFAULT '',
+  api_model TEXT NOT NULL DEFAULT '',
+  api_base_url TEXT NOT NULL DEFAULT '',
   note TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
 );
@@ -92,6 +106,17 @@ ensureDefaultGroup()
 ensureColumn('plans', 'group_id', `group_id TEXT NOT NULL DEFAULT '${DEFAULT_GROUP_ID}'`)
 ensureColumn('users', 'group_id', `group_id TEXT NOT NULL DEFAULT '${DEFAULT_GROUP_ID}'`)
 ensureColumn('users', 'can_use_agent', 'can_use_agent INTEGER NOT NULL DEFAULT 1')
+ensureColumn('billing_ledger', 'units', 'units INTEGER NOT NULL DEFAULT 0')
+ensureColumn('billing_ledger', 'unit_cost', 'unit_cost INTEGER NOT NULL DEFAULT 0')
+ensureColumn('billing_ledger', 'balance_before', 'balance_before INTEGER NOT NULL DEFAULT 0')
+ensureColumn('billing_ledger', 'plan_id', "plan_id TEXT NOT NULL DEFAULT ''")
+ensureColumn('billing_ledger', 'plan_name', "plan_name TEXT NOT NULL DEFAULT ''")
+ensureColumn('billing_ledger', 'group_id', "group_id TEXT NOT NULL DEFAULT ''")
+ensureColumn('billing_ledger', 'group_name', "group_name TEXT NOT NULL DEFAULT ''")
+ensureColumn('billing_ledger', 'api_provider', "api_provider TEXT NOT NULL DEFAULT ''")
+ensureColumn('billing_ledger', 'api_mode', "api_mode TEXT NOT NULL DEFAULT ''")
+ensureColumn('billing_ledger', 'api_model', "api_model TEXT NOT NULL DEFAULT ''")
+ensureColumn('billing_ledger', 'api_base_url', "api_base_url TEXT NOT NULL DEFAULT ''")
 
 const planCount = db.prepare('SELECT COUNT(*) AS count FROM plans').get().count
 if (planCount === 0) {
@@ -468,7 +493,18 @@ function rowToLedger(row) {
     type: row.type,
     source: row.source,
     amount: row.amount,
+    units: row.units,
+    unitCost: row.unit_cost,
+    balanceBefore: row.balance_before,
     balanceAfter: row.balance_after,
+    planId: row.plan_id,
+    planName: row.plan_name,
+    groupId: row.group_id,
+    groupName: row.group_name,
+    apiProvider: row.api_provider,
+    apiMode: row.api_mode,
+    apiModel: row.api_model,
+    apiBaseUrl: row.api_base_url,
     note: row.note,
     createdAt: row.created_at,
   }
@@ -507,6 +543,163 @@ function getFirstPlanForGroup(groupId) {
 function getUser(userId) {
   const row = db.prepare('SELECT * FROM users WHERE id = ?').get(userId)
   return row ? rowToUser(row) : null
+}
+
+function getLedgerSnapshot({ user, plan, group, profile }) {
+  return {
+    planId: plan?.id ?? user?.planId ?? '',
+    planName: plan?.name ?? '',
+    groupId: group?.id ?? user?.groupId ?? '',
+    groupName: group?.name ?? '',
+    apiProvider: typeof profile?.provider === 'string' ? profile.provider : '',
+    apiMode: typeof profile?.apiMode === 'string' ? profile.apiMode : '',
+    apiModel: typeof profile?.model === 'string' ? profile.model : '',
+    apiBaseUrl: typeof profile?.baseUrl === 'string' ? profile.baseUrl.trim() : '',
+  }
+}
+
+function insertLedgerEntry(input) {
+  const snapshot = getLedgerSnapshot(input)
+  db.prepare(`
+    INSERT INTO billing_ledger (
+      id,
+      user_id,
+      type,
+      source,
+      amount,
+      units,
+      unit_cost,
+      balance_before,
+      balance_after,
+      plan_id,
+      plan_name,
+      group_id,
+      group_name,
+      api_provider,
+      api_mode,
+      api_model,
+      api_base_url,
+      note,
+      created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    genId(),
+    input.userId,
+    input.type,
+    input.source,
+    input.amount,
+    input.units ?? 0,
+    input.unitCost ?? 0,
+    input.balanceBefore ?? 0,
+    input.balanceAfter,
+    snapshot.planId,
+    snapshot.planName,
+    snapshot.groupId,
+    snapshot.groupName,
+    snapshot.apiProvider,
+    snapshot.apiMode,
+    snapshot.apiModel,
+    snapshot.apiBaseUrl,
+    String(input.note || '').slice(0, 240),
+    input.createdAt ?? Date.now(),
+  )
+}
+
+function normalizeLedgerPageSize(value) {
+  const pageSize = Math.floor(Number(value))
+  return LEDGER_PAGE_SIZES.has(pageSize) ? pageSize : 10
+}
+
+function normalizeLedgerPage(value) {
+  const page = Math.floor(Number(value))
+  return Number.isFinite(page) && page > 0 ? page : 1
+}
+
+function normalizeLedgerTime(value) {
+  const time = Number(value)
+  return Number.isFinite(time) && time > 0 ? time : null
+}
+
+function getLedgerPage(actor, filters = {}) {
+  const admin = canManage(actor)
+  const pageSize = normalizeLedgerPageSize(filters.pageSize)
+  const requestedPage = normalizeLedgerPage(filters.page)
+  const clauses = []
+  const values = []
+
+  if (admin) {
+    if (typeof filters.userId === 'string' && filters.userId.trim()) {
+      clauses.push('billing_ledger.user_id = ?')
+      values.push(filters.userId.trim())
+    }
+    if (typeof filters.groupId === 'string' && filters.groupId.trim()) {
+      clauses.push('billing_ledger.group_id = ?')
+      values.push(filters.groupId.trim())
+    }
+  } else {
+    clauses.push('billing_ledger.user_id = ?')
+    values.push(actor.id)
+  }
+
+  if (LEDGER_SOURCES.has(filters.source)) {
+    clauses.push('billing_ledger.source = ?')
+    values.push(filters.source)
+  }
+  if (LEDGER_TYPES.has(filters.type)) {
+    clauses.push('billing_ledger.type = ?')
+    values.push(filters.type)
+  }
+
+  const from = normalizeLedgerTime(filters.from)
+  const to = normalizeLedgerTime(filters.to)
+  if (from) {
+    clauses.push('billing_ledger.created_at >= ?')
+    values.push(from)
+  }
+  if (to) {
+    clauses.push('billing_ledger.created_at <= ?')
+    values.push(to)
+  }
+
+  const query = typeof filters.query === 'string' ? filters.query.trim() : ''
+  if (query) {
+    const like = `%${query}%`
+    clauses.push(`(
+      billing_ledger.id LIKE ?
+      OR billing_ledger.note LIKE ?
+      OR billing_ledger.plan_name LIKE ?
+      OR billing_ledger.group_name LIKE ?
+      OR billing_ledger.api_provider LIKE ?
+      OR billing_ledger.api_mode LIKE ?
+      OR billing_ledger.api_model LIKE ?
+      OR users.display_name LIKE ?
+      OR users.email LIKE ?
+    )`)
+    values.push(like, like, like, like, like, like, like, like, like)
+  }
+
+  const fromClause = 'FROM billing_ledger LEFT JOIN users ON users.id = billing_ledger.user_id'
+  const whereClause = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : ''
+  const total = db.prepare(`SELECT COUNT(*) AS count ${fromClause}${whereClause}`).get(...values).count
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+  const page = Math.min(requestedPage, totalPages)
+  const offset = (page - 1) * pageSize
+  const rows = db.prepare(`
+    SELECT billing_ledger.*
+    ${fromClause}
+    ${whereClause}
+    ORDER BY billing_ledger.created_at DESC, billing_ledger.id DESC
+    LIMIT ? OFFSET ?
+  `).all(...values, pageSize, offset)
+
+  return {
+    entries: rows.map(rowToLedger),
+    total,
+    page,
+    pageSize,
+    totalPages,
+  }
 }
 
 function hasAdmin() {
@@ -564,11 +757,7 @@ function getState(actor, authSession = null) {
     : actor
       ? [actor]
       : []
-  const ledger = admin
-    ? db.prepare('SELECT * FROM billing_ledger ORDER BY created_at DESC LIMIT 200').all().map(rowToLedger)
-    : actor
-      ? db.prepare('SELECT * FROM billing_ledger WHERE user_id = ? ORDER BY created_at DESC LIMIT 200').all(actor.id).map(rowToLedger)
-      : []
+  const ledger = actor ? getLedgerPage(actor, { page: 1, pageSize: 10 }).entries : []
   const plans = admin
     ? getPlans()
     : !actor
@@ -709,8 +898,21 @@ const server = http.createServer(async (req, res) => {
       const userId = genId()
       db.prepare('INSERT INTO users (id, email, display_name, role, group_id, plan_id, quota_balance, total_quota_used, can_use_agent, password_hash, password_salt, created_at, updated_at, last_login_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?, ?, ?, ?)')
         .run(userId, email, String(body.displayName || email.split('@')[0]).trim().slice(0, 48), hasAdmin() ? 'member' : 'admin', DEFAULT_GROUP_ID, plan.id, plan.monthly_quota, hashPassword(String(body.password), salt), salt, now, now, now)
-      db.prepare('INSERT INTO billing_ledger (id, user_id, type, source, amount, balance_after, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(genId(), userId, 'credit', 'admin', plan.monthly_quota, plan.monthly_quota, `注册发放 ${plan.name} 起始额度`, now)
+      insertLedgerEntry({
+        userId,
+        user: { groupId: DEFAULT_GROUP_ID, planId: plan.id },
+        type: 'credit',
+        source: 'admin',
+        amount: plan.monthly_quota,
+        units: 1,
+        unitCost: plan.monthly_quota,
+        balanceBefore: 0,
+        balanceAfter: plan.monthly_quota,
+        plan,
+        group: getGroup(DEFAULT_GROUP_ID),
+        note: `注册发放 ${plan.name} 起始额度`,
+        createdAt: now,
+      })
       const user = getUser(userId)
       return json(res, 200, getState(user, createSession(userId)))
     }
@@ -738,6 +940,20 @@ const server = http.createServer(async (req, res) => {
       return await proxyUpstream(req, res, actor, path.slice('/upstream/'.length), url.search)
     }
 
+    if (req.method === 'GET' && path === '/ledger') {
+      return json(res, 200, getLedgerPage(actor, {
+        query: url.searchParams.get('query') ?? '',
+        source: url.searchParams.get('source') ?? '',
+        type: url.searchParams.get('type') ?? '',
+        userId: url.searchParams.get('userId') ?? '',
+        groupId: url.searchParams.get('groupId') ?? '',
+        from: url.searchParams.get('from') ?? '',
+        to: url.searchParams.get('to') ?? '',
+        page: url.searchParams.get('page') ?? '',
+        pageSize: url.searchParams.get('pageSize') ?? '',
+      }))
+    }
+
     if (req.method === 'POST' && path === '/usage/charge') {
       const body = await readJson(req)
       const source = body.source === 'agent' ? 'agent' : 'gallery'
@@ -751,13 +967,28 @@ const server = http.createServer(async (req, res) => {
       const plan = db.prepare('SELECT * FROM plans WHERE id = ? AND group_id = ?').get(user.planId, user.groupId)
       if (!plan) return json(res, 400, { error: '当前套餐不属于用户分组，请联系管理员重新分配套餐。' })
       const unitCost = source === 'agent' ? plan.agent_turn_cost : plan.gallery_unit_cost
-      const cost = normalizePositiveInteger(body.units, 1) * unitCost
+      const units = normalizePositiveInteger(body.units, 1)
+      const cost = units * unitCost
       if (user.quotaBalance < cost) return json(res, 402, { error: `额度不足：本次需要 ${cost} 点，当前剩余 ${user.quotaBalance} 点` })
       const balanceAfter = user.quotaBalance - cost
       const now = Date.now()
       db.prepare('UPDATE users SET quota_balance = ?, total_quota_used = total_quota_used + ?, updated_at = ? WHERE id = ?').run(balanceAfter, cost, now, user.id)
-      db.prepare('INSERT INTO billing_ledger (id, user_id, type, source, amount, balance_after, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(genId(), user.id, 'debit', source, cost, balanceAfter, String(body.note || ''), now)
+      insertLedgerEntry({
+        userId: user.id,
+        user,
+        type: 'debit',
+        source,
+        amount: cost,
+        units,
+        unitCost,
+        balanceBefore: user.quotaBalance,
+        balanceAfter,
+        plan,
+        group: getGroup(user.groupId),
+        profile: activeProfile,
+        note: String(body.note || ''),
+        createdAt: now,
+      })
       return json(res, 200, getState(getUser(user.id), authSession))
     }
 
@@ -834,8 +1065,21 @@ const server = http.createServer(async (req, res) => {
       const balanceAfter = user.quotaBalance + amount
       const now = Date.now()
       db.prepare('UPDATE users SET quota_balance = ?, updated_at = ? WHERE id = ?').run(balanceAfter, now, user.id)
-      db.prepare('INSERT INTO billing_ledger (id, user_id, type, source, amount, balance_after, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(genId(), user.id, 'credit', 'admin', amount, balanceAfter, String(body.note || '管理员发放额度'), now)
+      insertLedgerEntry({
+        userId: user.id,
+        user,
+        type: 'credit',
+        source: 'admin',
+        amount,
+        units: 1,
+        unitCost: amount,
+        balanceBefore: user.quotaBalance,
+        balanceAfter,
+        plan: getPlan(user.planId),
+        group: getGroup(user.groupId),
+        note: String(body.note || '管理员发放额度'),
+        createdAt: now,
+      })
       return json(res, 200, getState(getUser(actor.id), authSession))
     }
 
@@ -846,8 +1090,21 @@ const server = http.createServer(async (req, res) => {
       const balanceAfter = Math.floor(normalizeNonNegativeNumber(body.balance, 0))
       const now = Date.now()
       db.prepare('UPDATE users SET quota_balance = ?, updated_at = ? WHERE id = ?').run(balanceAfter, now, user.id)
-      db.prepare('INSERT INTO billing_ledger (id, user_id, type, source, amount, balance_after, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(genId(), user.id, 'adjustment', 'admin', Math.abs(balanceAfter - user.quotaBalance), balanceAfter, String(body.note || '管理员校准额度'), now)
+      insertLedgerEntry({
+        userId: user.id,
+        user,
+        type: 'adjustment',
+        source: 'admin',
+        amount: Math.abs(balanceAfter - user.quotaBalance),
+        units: 0,
+        unitCost: 0,
+        balanceBefore: user.quotaBalance,
+        balanceAfter,
+        plan: getPlan(user.planId),
+        group: getGroup(user.groupId),
+        note: String(body.note || '管理员校准额度'),
+        createdAt: now,
+      })
       return json(res, 200, getState(getUser(actor.id), authSession))
     }
 
