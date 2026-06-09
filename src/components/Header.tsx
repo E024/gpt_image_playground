@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { useStore } from '../store'
+import { canManagedUserUseAgent, useStore } from '../store'
 import { useVersionCheck } from '../hooks/useVersionCheck'
 import { useTooltip } from '../hooks/useTooltip'
 import { dismissAllTooltips } from '../lib/tooltipDismiss'
@@ -41,6 +41,14 @@ export default function Header() {
   const [showHistoryModal, setShowHistoryModal] = useState(false)
   const historyButtonRef = useRef<HTMLButtonElement>(null)
   const createConversation = useStore((s) => s.createAgentConversation)
+  const users = useStore((s) => s.users)
+  const plans = useStore((s) => s.plans)
+  const authSession = useStore((s) => s.authSession)
+  const logout = useStore((s) => s.logout)
+  const currentUser = users.find((user) => user.id === authSession?.userId) ?? null
+  const currentPlan = plans.find((plan) => plan.id === currentUser?.planId) ?? plans[0]
+  const canOpenBackend = Boolean(currentUser)
+  const canOpenAgent = canManagedUserUseAgent(currentUser)
 
   useEffect(() => {
     if (appMode === 'agent') {
@@ -243,15 +251,37 @@ export default function Header() {
             >
               画廊
             </button>
-            <button
-              type="button"
-              onClick={() => setAppMode('agent')}
-              className={`px-4 py-1.5 rounded-lg text-sm transition-colors ${appMode === 'agent' ? 'bg-white dark:bg-white/10 text-gray-900 dark:text-white shadow-sm font-medium' : 'text-gray-500 hover:text-gray-800 dark:hover:text-gray-200'}`}
-            >
-              Agent
-            </button>
+            {canOpenAgent && (
+              <button
+                type="button"
+                onClick={() => setAppMode('agent')}
+                className={`px-4 py-1.5 rounded-lg text-sm transition-colors ${appMode === 'agent' ? 'bg-white dark:bg-white/10 text-gray-900 dark:text-white shadow-sm font-medium' : 'text-gray-500 hover:text-gray-800 dark:hover:text-gray-200'}`}
+              >
+                Agent
+              </button>
+            )}
+            {canOpenBackend && (
+              <button
+                type="button"
+                onClick={() => setAppMode('admin')}
+                className={`px-4 py-1.5 rounded-lg text-sm transition-colors ${appMode === 'admin' ? 'bg-white dark:bg-white/10 text-gray-900 dark:text-white shadow-sm font-medium' : 'text-gray-500 hover:text-gray-800 dark:hover:text-gray-200'}`}
+              >
+                后台
+              </button>
+            )}
           </div>
           <div className="flex items-center gap-1 shrink-0">
+            {currentUser && (
+              <div className="hidden md:flex items-center gap-2 rounded-lg border border-gray-200 bg-white/70 px-2.5 py-1.5 text-xs dark:border-white/[0.08] dark:bg-white/[0.04]">
+                <div className="min-w-0">
+                  <div className="max-w-28 truncate font-bold text-gray-800 dark:text-gray-100" title={currentUser.displayName}>{currentUser.displayName}</div>
+                  <div className="text-gray-400">{currentPlan?.name ?? '未分配套餐'}</div>
+                </div>
+                <div className="rounded-md bg-cyan-50 px-2 py-1 font-black text-cyan-700 dark:bg-cyan-500/10 dark:text-cyan-300">
+                  {currentUser.quotaBalance} 点
+                </div>
+              </div>
+            )}
             {!isPwaInstalled && (
               <div
                 className="relative"
@@ -305,10 +335,16 @@ export default function Header() {
                 设置
               </ViewportTooltip>
             </div>
+            <button
+              onClick={logout}
+              className="hidden rounded-lg px-2.5 py-2 text-xs font-bold text-gray-500 transition hover:bg-gray-100 hover:text-gray-800 dark:hover:bg-gray-900 dark:hover:text-gray-200 sm:block"
+            >
+              退出
+            </button>
           </div>
         </div>
         <div className={`safe-area-x sm:hidden overflow-hidden transition-all duration-300 ease-in-out ${appMode === 'gallery' && scrollDirection === 'down' ? 'max-h-0 opacity-0 pb-0' : 'max-h-20 opacity-100 pb-2'}`}>
-          <div className="grid grid-cols-2 gap-1 rounded-xl border border-gray-200 dark:border-white/[0.08] bg-gray-100/70 dark:bg-white/[0.04] p-1 mx-2">
+          <div className={`grid ${canOpenBackend && canOpenAgent ? 'grid-cols-3' : canOpenBackend || canOpenAgent ? 'grid-cols-2' : 'grid-cols-1'} gap-1 rounded-xl border border-gray-200 dark:border-white/[0.08] bg-gray-100/70 dark:bg-white/[0.04] p-1 mx-2`}>
             <button
               type="button"
               onClick={() => setAppMode('gallery')}
@@ -316,13 +352,24 @@ export default function Header() {
             >
               画廊
             </button>
-            <button
-              type="button"
-              onClick={() => setAppMode('agent')}
-              className={`px-4 py-1.5 rounded-lg text-sm transition-colors ${appMode === 'agent' ? 'bg-white dark:bg-white/10 text-gray-900 dark:text-white shadow-sm font-medium' : 'text-gray-500 hover:text-gray-800 dark:hover:text-gray-200'}`}
-            >
-              Agent
-            </button>
+            {canOpenAgent && (
+              <button
+                type="button"
+                onClick={() => setAppMode('agent')}
+                className={`px-4 py-1.5 rounded-lg text-sm transition-colors ${appMode === 'agent' ? 'bg-white dark:bg-white/10 text-gray-900 dark:text-white shadow-sm font-medium' : 'text-gray-500 hover:text-gray-800 dark:hover:text-gray-200'}`}
+              >
+                Agent
+              </button>
+            )}
+            {canOpenBackend && (
+              <button
+                type="button"
+                onClick={() => setAppMode('admin')}
+                className={`px-4 py-1.5 rounded-lg text-sm transition-colors ${appMode === 'admin' ? 'bg-white dark:bg-white/10 text-gray-900 dark:text-white shadow-sm font-medium' : 'text-gray-500 hover:text-gray-800 dark:hover:text-gray-200'}`}
+              >
+                后台
+              </button>
+            )}
           </div>
         </div>
       </header>

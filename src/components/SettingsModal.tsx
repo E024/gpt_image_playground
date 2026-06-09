@@ -326,7 +326,7 @@ export default function SettingsModal() {
   const [profileImportUrlTooltipVisible, setProfileImportUrlTooltipVisible] = useState(false)
   const [duplicateProfileTooltipVisible, setDuplicateProfileTooltipVisible] = useState(false)
   const [llmPromptTooltipVisible, setLlmPromptTooltipVisible] = useState(false)
-  const [activeTab, setActiveTab] = useState<SettingsTab>('api')
+  const [activeTab, setActiveTab] = useState<SettingsTab>('general')
   const [exportConfig, setExportConfig] = useState(true)
   const [exportTasks, setExportTasks] = useState(true)
   const [importConfig, setImportConfig] = useState(true)
@@ -439,7 +439,12 @@ export default function SettingsModal() {
   }, [activeProfile.id, activeProfile.timeout])
 
   useEffect(() => {
-    if (showSettings && settingsTabRequest) setActiveTab(settingsTabRequest)
+    if (showSettings && (activeTab === 'api' || activeTab === 'agent')) setActiveTab('general')
+  }, [activeTab, showSettings])
+
+  useEffect(() => {
+    if (!showSettings || !settingsTabRequest) return
+    setActiveTab(settingsTabRequest === 'api' || settingsTabRequest === 'agent' ? 'general' : settingsTabRequest)
   }, [settingsTabRequest, showSettings])
 
   const updateProfileMenuMaxHeight = useCallback(() => {
@@ -1150,15 +1155,6 @@ export default function SettingsModal() {
           <div className="w-full sm:w-48 shrink-0 flex flex-col border-b sm:border-b-0 sm:border-r border-gray-100 dark:border-white/[0.08] bg-gray-50/50 dark:bg-white/[0.02]">
             <nav className="flex-1 overflow-x-auto sm:overflow-y-auto custom-scrollbar p-3 space-x-1 sm:space-x-0 sm:space-y-1 flex sm:flex-col">
               <button
-                onClick={() => setActiveTab('api')}
-                className={`whitespace-nowrap flex-shrink-0 flex items-center gap-2.5 px-3 py-2.5 text-sm rounded-xl transition-colors ${activeTab === 'api' ? 'bg-white dark:bg-white/[0.08] shadow-sm text-blue-600 dark:text-blue-400 font-medium' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100/80 dark:hover:bg-white/[0.04]'}`}
-              >
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
-                </svg>
-                API 配置
-              </button>
-              <button
                 onClick={() => setActiveTab('general')}
                 className={`whitespace-nowrap flex-shrink-0 flex items-center gap-2.5 px-3 py-2.5 text-sm rounded-xl transition-colors ${activeTab === 'general' ? 'bg-white dark:bg-white/[0.08] shadow-sm text-blue-600 dark:text-blue-400 font-medium' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100/80 dark:hover:bg-white/[0.04]'}`}
               >
@@ -1166,17 +1162,6 @@ export default function SettingsModal() {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6l4 2m6-2a10 10 0 11-20 0 10 10 0 0120 0z" />
                 </svg>
                 习惯配置
-              </button>
-              <button
-                onClick={() => setActiveTab('agent')}
-                className={`whitespace-nowrap flex-shrink-0 flex items-center gap-2.5 px-3 py-2.5 text-sm rounded-xl transition-colors ${activeTab === 'agent' ? 'bg-white dark:bg-white/[0.08] shadow-sm text-blue-600 dark:text-blue-400 font-medium' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100/80 dark:hover:bg-white/[0.04]'}`}
-              >
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8V4H8" />
-                  <rect width="16" height="12" x="4" y="8" rx="2" strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} />
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2 14h2M20 14h2M15 13v2M9 13v2" />
-                </svg>
-                Agent 配置
               </button>
               <button
                 onClick={() => setActiveTab('data')}

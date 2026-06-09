@@ -42,8 +42,17 @@ export default defineConfig(({ command }) => {
                     '',
                   ),
               },
+              '/backend-api': {
+                target: 'http://127.0.0.1:3018',
+                changeOrigin: true,
+              },
             }
-          : undefined,
+          : {
+              '/backend-api': {
+                target: 'http://127.0.0.1:3018',
+                changeOrigin: true,
+              },
+            },
     },
   }
 })

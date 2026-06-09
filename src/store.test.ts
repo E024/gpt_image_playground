@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { strToU8, zipSync } from 'fflate'
 import { DEFAULT_PARAMS } from './types'
 import { createDefaultFalProfile, createDefaultOpenAIProfile, DEFAULT_RESPONSES_MODEL, DEFAULT_SETTINGS, normalizeSettings } from './lib/apiProfiles'
-import type { AgentConversation, ExportData, StoredImage, StoredImageThumbnail, TaskRecord } from './types'
+import type { AgentConversation, AuthSession, ExportData, ManagedUser, StoredImage, StoredImageThumbnail, TaskRecord, UserGroup, UserPlan } from './types'
 import { getSelectedImageMentionLabel } from './lib/promptImageMentions'
 vi.mock('./lib/db', () => {
   const tasks = new Map<string, TaskRecord>()
@@ -127,6 +127,58 @@ import { cleanStaleAgentInputDrafts, clearFailedTasks, deleteAgentRoundFromConve
 
 const imageA = { id: 'image-a', dataUrl: 'data:image/png;base64,a' }
 const imageB = { id: 'image-b', dataUrl: 'data:image/png;base64,b' }
+const testPlan: UserPlan = {
+  id: 'starter',
+  groupId: 'default',
+  name: 'Starter Spark',
+  description: '测试套餐',
+  monthlyPrice: 0,
+  monthlyQuota: 1000,
+  galleryUnitCost: 1,
+  agentTurnCost: 1,
+  accent: 'sky',
+}
+const testGroup: UserGroup = {
+  id: 'default',
+  name: '默认分组',
+  description: '测试分组',
+  accent: 'cyan',
+  createdAt: 1,
+  updatedAt: 1,
+}
+const testAuthSession: AuthSession = {
+  userId: 'test-user',
+  token: 'test-session-token',
+  startedAt: 1,
+  expiresAt: 4_102_444_800_000,
+}
+const testUser: ManagedUser = {
+  id: testAuthSession.userId,
+  email: 'test@example.com',
+  displayName: 'Test User',
+  role: 'member',
+  groupId: testGroup.id,
+  planId: testPlan.id,
+  quotaBalance: 1000,
+  totalQuotaUsed: 0,
+  canUseAgent: true,
+  createdAt: 1,
+  updatedAt: 1,
+  lastLoginAt: 1,
+}
+
+beforeEach(() => {
+  useStore.setState({
+    groups: [testGroup],
+    users: [testUser],
+    plans: [testPlan],
+    billingLedger: [],
+    authSession: testAuthSession,
+    authReady: true,
+    setupRequired: false,
+    chargeCurrentUserQuota: vi.fn(async () => true),
+  })
+})
 
 describe('error toast messages', () => {
   it('drops long error detail after the failure title', () => {
@@ -135,6 +187,45 @@ describe('error toast messages', () => {
 
   it('uses a generic message for long raw errors without a title', () => {
     expect(getErrorToastMessage(`invalid request ${'x'.repeat(90)}`)).toBe('操作失败，请查看详情')
+  })
+})
+
+describe('backend group state normalization', () => {
+  it('keeps a user plan inside the user group when backend state contains a stale cross-group plan id', async () => {
+    const studioGroup: UserGroup = {
+      id: 'studio-group',
+      name: 'Studio Group',
+      description: '独立套餐分组',
+      accent: 'emerald',
+      createdAt: 2,
+      updatedAt: 2,
+    }
+    const studioPlan: UserPlan = {
+      ...testPlan,
+      id: 'studio-plan',
+      groupId: studioGroup.id,
+      name: 'Studio Plan',
+    }
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      groups: [testGroup, studioGroup],
+      plans: [testPlan, studioPlan],
+      users: [{ ...testUser, groupId: studioGroup.id, planId: testPlan.id }],
+      billingLedger: [],
+      authSession: testAuthSession,
+      setupRequired: false,
+      apiSettings: null,
+      adminApiSettings: null,
+    }), { status: 200 })))
+
+    try {
+      await useStore.getState().syncBackendState()
+
+      const [user] = useStore.getState().users
+      expect(user.groupId).toBe(studioGroup.id)
+      expect(user.planId).toBe(studioPlan.id)
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 })
 
@@ -2066,6 +2157,7 @@ describe('reused task API profile', () => {
   })
 
   it('clears temporary reuse when switching current settings to the reused API profile', async () => {
+    useStore.setState({ users: [{ ...testUser, role: 'admin' }] })
     await reuseConfig(task({ apiProvider: 'fal', apiProfileId: falProfile.id }))
 
     useStore.getState().setSettings({ activeProfileId: falProfile.id })
@@ -2074,6 +2166,12 @@ describe('reused task API profile', () => {
     expect(state.settings.activeProfileId).toBe(falProfile.id)
     expect(state.reusedTaskApiProfileId).toBeNull()
     expect(state.reusedTaskApiProfileMissing).toBe(false)
+  })
+
+  it('keeps backend-managed API profile locked for members', () => {
+    useStore.getState().setSettings({ activeProfileId: falProfile.id })
+
+    expect(useStore.getState().settings.activeProfileId).toBe(openaiProfile.id)
   })
 
   it('normalizes reused params to the current API profile when temporary reuse is disabled', async () => {

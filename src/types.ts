@@ -1,7 +1,7 @@
 // ===== 设置 =====
 
 export type ApiMode = 'images' | 'responses'
-export type AppMode = 'gallery' | 'agent'
+export type AppMode = 'gallery' | 'agent' | 'admin'
 export type ReferenceImageEditAction = 'ask' | 'replace-reference' | 'add-mask'
 export const ZIP_DOWNLOAD_ROUTE_VALUES = [
   'task-selection',
@@ -146,6 +146,66 @@ export interface MaskDraft {
   targetImageId: string
   maskDataUrl: string
   updatedAt: number
+}
+
+// ===== 本地账号 / 套餐 / 额度 =====
+
+export type UserRole = 'admin' | 'member'
+export type BillingLedgerType = 'credit' | 'debit' | 'payment' | 'adjustment'
+export type BillingUsageSource = 'gallery' | 'agent' | 'admin'
+
+export interface UserPlan {
+  id: string
+  groupId: string
+  name: string
+  description: string
+  monthlyPrice: number
+  monthlyQuota: number
+  galleryUnitCost: number
+  agentTurnCost: number
+  accent: string
+}
+
+export interface UserGroup {
+  id: string
+  name: string
+  description: string
+  accent: string
+  createdAt: number
+  updatedAt: number
+}
+
+export interface ManagedUser {
+  id: string
+  email: string
+  displayName: string
+  role: UserRole
+  groupId: string
+  planId: string
+  quotaBalance: number
+  totalQuotaUsed: number
+  canUseAgent: boolean
+  createdAt: number
+  updatedAt: number
+  lastLoginAt: number | null
+}
+
+export interface AuthSession {
+  userId: string
+  token: string
+  startedAt: number
+  expiresAt: number
+}
+
+export interface BillingLedgerEntry {
+  id: string
+  userId: string
+  type: BillingLedgerType
+  source: BillingUsageSource
+  amount: number
+  balanceAfter: number
+  note: string
+  createdAt: number
 }
 
 // ===== 任务记录 =====

@@ -1,11 +1,13 @@
 import { useEffect } from 'react'
-import { initStore } from './store'
+import { canManagedUserUseAgent, initStore } from './store'
 import { useStore } from './store'
 import { buildSettingsFromUrlParams, clearUrlSettingParams, hasUrlSettingParams } from './lib/urlSettings'
 import { mergeImportedSettings } from './lib/apiProfiles'
 import { getCustomProviderConfigUrl, loadCustomProviderSettingsFromUrl } from './lib/customProviderConfigUrl'
 import { useDockerApiUrlMigrationNotice } from './hooks/useDockerApiUrlMigrationNotice'
 import Header from './components/Header'
+import AuthLanding from './components/AuthLanding'
+import AdminDashboard from './components/AdminDashboard'
 import SearchBar from './components/SearchBar'
 import TaskGrid from './components/TaskGrid'
 import AgentWorkspace from './components/AgentWorkspace'
@@ -25,9 +27,15 @@ let customProviderConfigUrlImportStarted = false
 
 export default function App() {
   const setSettings = useStore((s) => s.setSettings)
+  const syncBackendState = useStore((s) => s.syncBackendState)
   const appMode = useStore((s) => s.appMode)
+  const authSession = useStore((s) => s.authSession)
+  const authReady = useStore((s) => s.authReady)
+  const users = useStore((s) => s.users)
+  const setAppMode = useStore((s) => s.setAppMode)
   const filterFavorite = useStore((s) => s.filterFavorite)
   const activeFavoriteCollectionId = useStore((s) => s.activeFavoriteCollectionId)
+  const currentUser = users.find((user) => user.id === authSession?.userId) ?? null
   useDockerApiUrlMigrationNotice()
   useGlobalClickSuppression()
 
@@ -60,7 +68,8 @@ export default function App() {
     }
 
     initStore()
-  }, [setSettings])
+    void syncBackendState()
+  }, [setSettings, syncBackendState])
 
   useEffect(() => {
     const preventPageImageDrag = (e: DragEvent) => {
@@ -73,10 +82,38 @@ export default function App() {
     return () => document.removeEventListener('dragstart', preventPageImageDrag)
   }, [])
 
+  useEffect(() => {
+    if (appMode === 'agent' && !canManagedUserUseAgent(currentUser)) {
+      setAppMode('gallery')
+    }
+  }, [appMode, currentUser, setAppMode])
+
+  if (!authReady) {
+    return (
+      <>
+        <main className="flex min-h-screen items-center justify-center bg-zinc-950 text-sm font-semibold text-zinc-300">
+          正在校验会话...
+        </main>
+        <Toast />
+      </>
+    )
+  }
+
+  if (!authSession) {
+    return (
+      <>
+        <AuthLanding />
+        <Toast />
+      </>
+    )
+  }
+
   return (
     <>
       <Header />
-      {appMode === 'agent' ? (
+      {appMode === 'admin' ? (
+        <AdminDashboard />
+      ) : appMode === 'agent' ? (
         <AgentWorkspace />
       ) : (
         <main data-home-main data-drag-select-surface className="pb-48">
@@ -86,7 +123,7 @@ export default function App() {
           </div>
         </main>
       )}
-      <InputBar />
+      {appMode !== 'admin' && <InputBar />}
       <DetailModal />
       <Lightbox />
       <SettingsModal />

@@ -16,6 +16,11 @@ import type {
   ExportData,
   ResponsesApiResponse,
   ResponsesOutputItem,
+  AuthSession,
+  BillingLedgerEntry,
+  ManagedUser,
+  UserGroup,
+  UserPlan,
 } from './types'
 import { DEFAULT_AGENT_MAX_TOOL_ROUNDS, DEFAULT_PARAMS } from './types'
 import { DEFAULT_SETTINGS, getActiveApiProfile, getCustomProviderDefinition, mergeImportedSettings, normalizeSettings, validateApiProfile } from './lib/apiProfiles'
@@ -52,6 +57,24 @@ import { validateMaskMatchesImage } from './lib/canvasImage'
 import { orderInputImagesForMask } from './lib/mask'
 import { getChangedParams, normalizeParamsForSettings } from './lib/paramCompatibility'
 import { createTransparentOutputMeta, getTransparentRequestParams, removeKeyedBackgroundFromDataUrl } from './lib/transparentImage'
+import {
+  backendChargeQuota,
+  backendCreateGroup,
+  backendCreatePlan,
+  backendDeleteGroup,
+  backendDeletePlan,
+  backendGrantUserQuota,
+  backendLogin,
+  backendLogout,
+  backendRegister,
+  backendSetUserQuota,
+  backendUpdateApiSettings,
+  backendUpdateGroup,
+  backendUpdatePlan,
+  backendUpdateUser,
+  fetchBackendState,
+  type BackendState,
+} from './lib/backendApi'
 import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate'
 
 export const ALL_FAVORITES_COLLECTION_ID = '__all_favorites__'
@@ -85,6 +108,71 @@ const OPENAI_INTERRUPTED_ERROR = '请求中断'
 const AGENT_STOPPED_MESSAGE = '已停止生成。'
 const AGENT_CONVERSATION_TITLE_MAX_LENGTH = 28
 const ERROR_TOAST_MAX_LENGTH = 80
+const DEFAULT_GROUP_ID = 'default'
+const DEFAULT_PLAN_ID = 'starter'
+const DEFAULT_GROUPS: UserGroup[] = [
+  {
+    id: DEFAULT_GROUP_ID,
+    name: '默认分组',
+    description: '现有用户和套餐的默认分组。',
+    accent: 'cyan',
+    createdAt: 1,
+    updatedAt: 1,
+  },
+]
+const DEFAULT_PLANS: UserPlan[] = [
+  {
+    id: DEFAULT_PLAN_ID,
+    groupId: DEFAULT_GROUP_ID,
+    name: 'Starter Spark',
+    description: '轻量试用，适合探索提示词和少量素材。',
+    monthlyPrice: 0,
+    monthlyQuota: 80,
+    galleryUnitCost: 4,
+    agentTurnCost: 6,
+    accent: 'sky',
+  },
+  {
+    id: 'studio',
+    groupId: DEFAULT_GROUP_ID,
+    name: 'Studio Flow',
+    description: '稳定创作额度，适合日常批量生成和迭代。',
+    monthlyPrice: 29,
+    monthlyQuota: 650,
+    galleryUnitCost: 3,
+    agentTurnCost: 5,
+    accent: 'emerald',
+  },
+  {
+    id: 'atelier',
+    groupId: DEFAULT_GROUP_ID,
+    name: 'Atelier Prime',
+    description: '高频工作室额度，适合团队素材生产。',
+    monthlyPrice: 99,
+    monthlyQuota: 2600,
+    galleryUnitCost: 2,
+    agentTurnCost: 4,
+    accent: 'amber',
+  },
+]
+const BACKEND_MANAGED_SETTING_KEYS: Array<keyof AppSettings> = [
+  'baseUrl',
+  'apiKey',
+  'model',
+  'timeout',
+  'apiMode',
+  'codexCli',
+  'apiProxy',
+  'streamImages',
+  'streamPartialImages',
+  'customProviders',
+  'providerOrder',
+  'reuseTaskApiProfileTemporarily',
+  'agentMaxToolRounds',
+  'agentWebSearch',
+  'profiles',
+  'activeProfileId',
+]
 type ToastType = 'info' | 'success' | 'error'
 type AgentInputDraft = {
   prompt: string
@@ -92,6 +180,35 @@ type AgentInputDraft = {
   maskDraft: MaskDraft | null
   maskEditorImageId: string | null
   updatedAt?: number
+}
+
+function getCurrentManagedUser(state: Pick<AppState, 'users' | 'authSession'>): ManagedUser | null {
+  return state.users.find((user) => user.id === state.authSession?.userId) ?? null
+}
+
+export function canManagedUserUseAgent(user: ManagedUser | null | undefined) {
+  return Boolean(user && (user.role === 'admin' || user.canUseAgent !== false))
+}
+
+function canCurrentUserUseAgent(state: Pick<AppState, 'users' | 'authSession'>) {
+  return canManagedUserUseAgent(getCurrentManagedUser(state))
+}
+
+function canCurrentUserManageBackendSettings(state: Pick<AppState, 'users' | 'authSession'>) {
+  return getCurrentManagedUser(state)?.role === 'admin'
+}
+
+function preserveBackendManagedSettings(previous: AppSettings, next: AppSettings, canManage: boolean) {
+  if (canManage) return next
+  const preserved = { ...next }
+  for (const key of BACKEND_MANAGED_SETTING_KEYS) {
+    ;(preserved as Record<keyof AppSettings, unknown>)[key] = previous[key]
+  }
+  return normalizeSettings(preserved)
+}
+
+function getPersistableSettings(settings: AppSettings) {
+  return preserveBackendManagedSettings(DEFAULT_SETTINGS, normalizeSettings(settings), false)
 }
 
 export function getErrorToastMessage(message: string): string {
@@ -663,7 +780,7 @@ function getLatestAgentConversation(conversations: AgentConversation[]) {
 }
 
 export function getPersistedState(state: AppState) {
-  const settings = normalizeSettings(state.settings)
+  const settings = getPersistableSettings(state.settings)
   const galleryInputDraft = getPersistableGalleryInputDraft(state)
   return {
     settings,
@@ -675,7 +792,8 @@ export function getPersistedState(state: AppState) {
         }
       : {}),
     dismissedCodexCliPrompts: state.dismissedCodexCliPrompts,
-    appMode: state.appMode,
+    appMode: state.authSession ? state.appMode : 'gallery',
+    authSession: state.authSession,
     galleryInputDraft: settings.persistInputOnRestart && galleryInputDraft
       ? { ...galleryInputDraft, inputImages: galleryInputDraft.inputImages.map((img) => ({ id: img.id, dataUrl: '' })) }
       : null,
@@ -707,7 +825,7 @@ function mergePersistedState(persistedState: unknown, currentState: AppState): A
   if (!persistedState || typeof persistedState !== 'object') return currentState
 
   const persisted = persistedState as Partial<AppState>
-  const settings = normalizeSettings(persisted.settings ?? currentState.settings)
+  const settings = getPersistableSettings(normalizeSettings(persisted.settings ?? currentState.settings))
   const hasPersistedAgentConversations = Array.isArray(persisted.agentConversations)
   if (hasPersistedAgentConversations && normalizeAgentConversations(persisted.agentConversations).length > 0) {
     agentConversationMigrationPending = true
@@ -719,7 +837,8 @@ function mergePersistedState(persistedState: unknown, currentState: AppState): A
     typeof persisted.activeAgentConversationId === 'string' && (!hasPersistedAgentConversations || agentConversations.some((conversation) => conversation.id === persisted.activeAgentConversationId))
       ? persisted.activeAgentConversationId
       : agentConversations[0]?.id ?? null
-  const appMode = persisted.appMode === 'agent' ? 'agent' : 'gallery'
+  const authSession = normalizeAuthSession(persisted.authSession)
+  const appMode = authSession && (persisted.appMode === 'agent' || persisted.appMode === 'admin') ? persisted.appMode : 'gallery'
   const galleryInputDraft = settings.persistInputOnRestart
     ? normalizeAgentInputDraft(persisted.galleryInputDraft ?? {
         prompt: persisted.prompt,
@@ -764,6 +883,13 @@ function mergePersistedState(persistedState: unknown, currentState: AppState): A
     agentAssetPanelCollapsed: Boolean(persisted.agentAssetPanelCollapsed),
     favoriteCollections,
     defaultFavoriteCollectionId,
+    groups: currentState.groups,
+    plans: currentState.plans,
+    users: [],
+    authSession,
+    authReady: !authSession,
+    setupRequired: currentState.setupRequired,
+    billingLedger: [],
     activeFavoriteCollectionId: null,
     favoritePickerTaskIds: null,
     supportPromptDismissed: Boolean(persisted.supportPromptDismissed),
@@ -786,8 +912,33 @@ interface AppState {
   // 设置
   settings: AppSettings
   setSettings: (s: Partial<AppSettings>) => void
+  adminApiSettings: AppSettings | null
+  updateApiSettings: (settings: AppSettings) => Promise<void>
   dismissedCodexCliPrompts: string[]
   dismissCodexCliPrompt: (key: string) => void
+
+  // 本地账号 / 后台管理
+  groups: UserGroup[]
+  users: ManagedUser[]
+  plans: UserPlan[]
+  billingLedger: BillingLedgerEntry[]
+  authSession: AuthSession | null
+  authReady: boolean
+  setupRequired: boolean
+  login: (email: string, password: string) => Promise<boolean>
+  register: (input: { email: string; password: string; displayName: string }) => Promise<boolean>
+  syncBackendState: () => Promise<void>
+  logout: () => void
+  createGroup: (input: Omit<UserGroup, 'id' | 'createdAt' | 'updatedAt'>) => void
+  updateGroup: (groupId: string, patch: Partial<Omit<UserGroup, 'id' | 'createdAt' | 'updatedAt'>>) => void
+  deleteGroup: (groupId: string) => void
+  updateManagedUser: (userId: string, patch: Partial<Pick<ManagedUser, 'displayName' | 'role' | 'groupId' | 'planId' | 'canUseAgent'>>) => void
+  grantUserQuota: (userId: string, amount: number, note?: string) => void
+  setUserQuotaBalance: (userId: string, balance: number, note?: string) => void
+  createPlan: (input: Omit<UserPlan, 'id'>) => void
+  updatePlan: (planId: string, patch: Partial<Omit<UserPlan, 'id'>>) => void
+  deletePlan: (planId: string) => void
+  chargeCurrentUserQuota: (source: 'gallery' | 'agent', units: number, note: string) => Promise<boolean>
 
   // 输入
   prompt: string
@@ -964,6 +1115,164 @@ export async function deleteImageIfUnreferenced(imageId: string) {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
+}
+
+function normalizeEmail(value: string) {
+  return value.trim().toLowerCase()
+}
+
+function normalizeGroups(value: unknown): UserGroup[] {
+  if (!Array.isArray(value)) return DEFAULT_GROUPS
+  const groups: UserGroup[] = []
+  const ids = new Set<string>()
+  for (const item of value) {
+    if (!isRecord(item)) continue
+    const id = typeof item.id === 'string' && item.id.trim() ? item.id.trim() : ''
+    const name = typeof item.name === 'string' && item.name.trim() ? item.name.trim() : ''
+    if (!id || !name || ids.has(id)) continue
+    ids.add(id)
+    groups.push({
+      id,
+      name: name.slice(0, 40),
+      description: typeof item.description === 'string' ? item.description : '',
+      accent: typeof item.accent === 'string' ? item.accent : 'cyan',
+      createdAt: normalizeTimestamp(item.createdAt),
+      updatedAt: normalizeTimestamp(item.updatedAt),
+    })
+  }
+  return groups.some((group) => group.id === DEFAULT_GROUP_ID) ? groups : [...DEFAULT_GROUPS, ...groups]
+}
+
+function normalizePlans(value: unknown, groups: UserGroup[]): UserPlan[] {
+  if (!Array.isArray(value)) return DEFAULT_PLANS
+  const plans: UserPlan[] = []
+  const ids = new Set<string>()
+  const groupIds = new Set(groups.map((group) => group.id))
+  for (const item of value) {
+    if (!isRecord(item)) continue
+    const id = typeof item.id === 'string' && item.id.trim() ? item.id.trim() : ''
+    const name = typeof item.name === 'string' && item.name.trim() ? item.name.trim() : ''
+    if (!id || !name || ids.has(id)) continue
+    ids.add(id)
+    const groupId = typeof item.groupId === 'string' && groupIds.has(item.groupId) ? item.groupId : DEFAULT_GROUP_ID
+    plans.push({
+      id,
+      groupId,
+      name,
+      description: typeof item.description === 'string' ? item.description : '',
+      monthlyPrice: normalizeNonNegativeNumber(item.monthlyPrice, 0),
+      monthlyQuota: normalizeNonNegativeInteger(item.monthlyQuota, 0),
+      galleryUnitCost: Math.max(1, normalizeNonNegativeInteger(item.galleryUnitCost, 1)),
+      agentTurnCost: Math.max(1, normalizeNonNegativeInteger(item.agentTurnCost, 1)),
+      accent: typeof item.accent === 'string' ? item.accent : 'sky',
+    })
+  }
+  return plans
+}
+
+function normalizeUsers(value: unknown, plans: UserPlan[], groups: UserGroup[]): ManagedUser[] {
+  if (!Array.isArray(value)) return []
+  const users: ManagedUser[] = []
+  const emails = new Set<string>()
+  const plansById = new Map(plans.map((plan) => [plan.id, plan]))
+  const groupIds = new Set(groups.map((group) => group.id))
+  for (const item of value) {
+    if (!isRecord(item)) continue
+    const id = typeof item.id === 'string' && item.id.trim() ? item.id : ''
+    const email = typeof item.email === 'string' ? normalizeEmail(item.email) : ''
+    const displayName = typeof item.displayName === 'string' && item.displayName.trim() ? item.displayName.trim() : email
+    if (!id || !email || emails.has(email)) continue
+    emails.add(email)
+    const role = item.role === 'admin' ? 'admin' : 'member'
+    const groupId = typeof item.groupId === 'string' && groupIds.has(item.groupId) ? item.groupId : DEFAULT_GROUP_ID
+    const requestedPlan = typeof item.planId === 'string' ? plansById.get(item.planId) : null
+    const fallbackPlan = plans.find((plan) => plan.groupId === groupId) ?? plans[0]
+    const planId = requestedPlan?.groupId === groupId ? requestedPlan.id : fallbackPlan?.id ?? DEFAULT_PLAN_ID
+    users.push({
+      id,
+      email,
+      displayName: displayName.slice(0, 48),
+      role,
+      groupId,
+      planId,
+      quotaBalance: normalizeNonNegativeInteger(item.quotaBalance, 0),
+      totalQuotaUsed: normalizeNonNegativeInteger(item.totalQuotaUsed, 0),
+      canUseAgent: typeof item.canUseAgent === 'boolean' ? item.canUseAgent : true,
+      createdAt: normalizeTimestamp(item.createdAt),
+      updatedAt: normalizeTimestamp(item.updatedAt),
+      lastLoginAt: typeof item.lastLoginAt === 'number' ? item.lastLoginAt : null,
+    })
+  }
+  return users
+}
+
+function normalizeBillingLedger(value: unknown, users: ManagedUser[]): BillingLedgerEntry[] {
+  if (!Array.isArray(value)) return []
+  const userIds = new Set(users.map((user) => user.id))
+  return value
+    .map((item): BillingLedgerEntry | null => {
+      if (!isRecord(item)) return null
+      const id = typeof item.id === 'string' && item.id.trim() ? item.id : ''
+      const userId = typeof item.userId === 'string' && userIds.has(item.userId) ? item.userId : ''
+      if (!id || !userId) return null
+      const type = item.type === 'credit' || item.type === 'debit' || item.type === 'payment' || item.type === 'adjustment'
+        ? item.type
+        : 'adjustment'
+      const source = item.source === 'gallery' || item.source === 'agent' || item.source === 'admin' ? item.source : 'admin'
+      return {
+        id,
+        userId,
+        type,
+        source,
+        amount: normalizeNonNegativeInteger(item.amount, 0),
+        balanceAfter: normalizeNonNegativeInteger(item.balanceAfter, 0),
+        note: typeof item.note === 'string' ? item.note.slice(0, 160) : '',
+        createdAt: normalizeTimestamp(item.createdAt),
+      }
+    })
+    .filter((entry): entry is BillingLedgerEntry => entry != null)
+}
+
+function normalizeAuthSession(value: unknown): AuthSession | null {
+  if (!isRecord(value) || typeof value.userId !== 'string') return null
+  if (typeof value.token !== 'string' || !value.token) return null
+  return {
+    userId: value.userId,
+    token: value.token,
+    startedAt: normalizeTimestamp(value.startedAt),
+    expiresAt: normalizeTimestamp(value.expiresAt),
+  }
+}
+
+function normalizeNonNegativeNumber(value: unknown, fallback: number) {
+  const next = Number(value)
+  return Number.isFinite(next) && next >= 0 ? next : fallback
+}
+
+function normalizeNonNegativeInteger(value: unknown, fallback: number) {
+  return Math.floor(normalizeNonNegativeNumber(value, fallback))
+}
+
+function normalizeTimestamp(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : Date.now()
+}
+
+function applyBackendStatePatch(state: BackendState) {
+  const groups = normalizeGroups(state.groups)
+  const plans = normalizePlans(state.plans, groups)
+  const users = normalizeUsers(state.users, plans, groups)
+  const apiSettings = state.apiSettings ? normalizeSettings(state.apiSettings) : undefined
+  useStore.setState({
+    groups,
+    users,
+    plans,
+    billingLedger: normalizeBillingLedger(state.billingLedger, users),
+    authSession: state.authSession ? normalizeAuthSession(state.authSession) : null,
+    authReady: true,
+    setupRequired: Boolean(state.setupRequired),
+    ...(apiSettings ? { settings: apiSettings } : {}),
+    adminApiSettings: state.adminApiSettings ? normalizeSettings(state.adminApiSettings) : null,
+  })
 }
 
 function normalizeInputImages(value: unknown): InputImage[] {
@@ -1147,6 +1456,22 @@ export const useStore = create<AppState>()(
       // Mode
       appMode: 'gallery',
       setAppMode: (appMode) => {
+        if (appMode === 'admin') {
+          const state = get()
+          const agentInputDrafts = saveActiveAgentInputDrafts(state)
+          const galleryInputDraft = saveGalleryInputDraft(state)
+          set({
+            appMode,
+            agentInputDrafts,
+            galleryInputDraft,
+            agentMobileHeaderVisible: true,
+            selectedTaskIds: [],
+            selectedFavoriteCollectionIds: [],
+            agentEditingRoundId: null,
+          })
+          return
+        }
+
         if (appMode === 'gallery') {
           const state = get()
           const agentInputDrafts = saveActiveAgentInputDrafts(state)
@@ -1165,6 +1490,10 @@ export const useStore = create<AppState>()(
         }
 
         const state = get()
+        if (!canCurrentUserUseAgent(state)) {
+          state.showToast('当前账号未开通 Agent 权限', 'error')
+          return
+        }
         const settings = normalizeSettings(state.settings)
         const activeProfile = getActiveApiProfile(settings)
 
@@ -1184,25 +1513,35 @@ export const useStore = create<AppState>()(
         }
 
         if (activeProfile.provider === 'openai' && activeProfile.apiMode !== 'responses') {
+          const isAdmin = getCurrentManagedUser(state)?.role === 'admin'
+          if (!isAdmin) {
+            state.showToast('Agent 需要管理员在后台配置 Responses API', 'error')
+            return
+          }
           state.setConfirmDialog({
             title: '需要 Responses API 配置',
-            message: `当前配置「${activeProfile.name}」使用的是 Images API，仅支持生成图片，无 Agent 模式需要的对话能力。\n\n请前往 API 配置页，将当前配置调整为 Responses API，或切换/新建一个支持 Responses API 的配置。`,
-            confirmText: '去设置',
+            message: `当前后台配置「${activeProfile.name}」使用的是 Images API，仅支持生成图片，无 Agent 模式需要的对话能力。\n\n请前往后台的 API 配置，将当前配置调整为 Responses API。`,
+            confirmText: '去后台',
             cancelText: '取消',
             action: () => {
-              useStore.getState().setShowSettings(true, 'api')
+              useStore.getState().setAppMode('admin')
             },
           })
           return
         }
 
+        const isAdmin = getCurrentManagedUser(state)?.role === 'admin'
+        if (!isAdmin) {
+          state.showToast('Agent 需要管理员在后台配置 OpenAI Responses API', 'error')
+          return
+        }
         state.setConfirmDialog({
           title: '配置不支持 Agent 模式',
-          message: `当前配置「${activeProfile.name}」所属的服务商暂不支持 Agent 模式。Agent 模式需要使用支持 Responses API 的 OpenAI 配置。\n\n请前往 API 配置页，切换或新建一个支持 Responses API 的配置。`,
-          confirmText: '去设置',
+          message: `当前后台配置「${activeProfile.name}」所属的服务商暂不支持 Agent 模式。Agent 模式需要使用支持 Responses API 的 OpenAI 配置。\n\n请前往后台的 API 配置切换。`,
+          confirmText: '去后台',
           cancelText: '取消',
           action: () => {
-            useStore.getState().setShowSettings(true, 'api')
+            useStore.getState().setAppMode('admin')
           },
         })
       },
@@ -1241,7 +1580,11 @@ export const useStore = create<AppState>()(
               : profile,
           )
         }
-        const settings = normalizeSettings(merged)
+        const settings = preserveBackendManagedSettings(
+          previous,
+          normalizeSettings(merged),
+          canCurrentUserManageBackendSettings(st),
+        )
         const shouldClearReusedProfile = st.reusedTaskApiProfileId && settings.activeProfileId === st.reusedTaskApiProfileId
         return {
           settings,
@@ -1250,12 +1593,169 @@ export const useStore = create<AppState>()(
             : {}),
         }
       }),
+      adminApiSettings: null,
+      updateApiSettings: async (settings) => {
+        try {
+          applyBackendStatePatch(await backendUpdateApiSettings(normalizeSettings(settings), get().authSession))
+          get().showToast('API 与 Agent 配置已保存', 'success')
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '保存 API 配置失败', 'error')
+        }
+      },
       dismissedCodexCliPrompts: [],
       dismissCodexCliPrompt: (key) => set((st) => ({
         dismissedCodexCliPrompts: st.dismissedCodexCliPrompts.includes(key)
           ? st.dismissedCodexCliPrompts
           : [...st.dismissedCodexCliPrompts, key],
       })),
+
+      // Local auth / billing
+      groups: DEFAULT_GROUPS,
+      users: [],
+      plans: DEFAULT_PLANS,
+      billingLedger: [],
+      authSession: null,
+      authReady: true,
+      setupRequired: true,
+      login: async (email, password) => {
+        try {
+          const state = await backendLogin(email, password)
+          applyBackendStatePatch(state)
+          get().showToast('欢迎回到画廊控制台', 'success')
+          return true
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '登录失败', 'error')
+          return false
+        }
+      },
+      register: async ({ email, password, displayName }) => {
+        try {
+          const state = await backendRegister({ email, password, displayName })
+          applyBackendStatePatch(state)
+          const current = state.users.find((user) => user.id === state.authSession?.userId)
+          get().showToast(current?.role === 'admin' ? '首位用户已设为管理员' : '账号已创建', 'success')
+          return true
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '注册失败', 'error')
+          return false
+        }
+      },
+      syncBackendState: async () => {
+        set({ authReady: false })
+        try {
+          const localState = get()
+          applyBackendStatePatch(await fetchBackendState(localState.authSession))
+        } catch (error) {
+          set({
+            groups: DEFAULT_GROUPS,
+            users: [],
+            billingLedger: [],
+            authSession: null,
+            adminApiSettings: null,
+            settings: getPersistableSettings(get().settings),
+            authReady: true,
+          })
+          get().showToast(error instanceof Error ? `后端连接失败：${error.message}` : '后端连接失败', 'error')
+        }
+      },
+      logout: () => {
+        const session = get().authSession
+        set({
+          authSession: null,
+          groups: DEFAULT_GROUPS,
+          users: [],
+          billingLedger: [],
+          appMode: 'gallery',
+          adminApiSettings: null,
+          settings: getPersistableSettings(get().settings),
+        })
+        if (session) void backendLogout(session).catch((error) => {
+          console.warn('Failed to revoke backend session:', error)
+        })
+      },
+      createGroup: async (input) => {
+        try {
+          applyBackendStatePatch(await backendCreateGroup(input, get().authSession))
+          get().showToast('分组已创建', 'success')
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '创建分组失败', 'error')
+        }
+      },
+      updateGroup: async (groupId, patch) => {
+        try {
+          applyBackendStatePatch(await backendUpdateGroup(groupId, patch, get().authSession))
+          get().showToast('分组已更新', 'success')
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '更新分组失败', 'error')
+        }
+      },
+      deleteGroup: async (groupId) => {
+        try {
+          applyBackendStatePatch(await backendDeleteGroup(groupId, get().authSession))
+          get().showToast('分组已删除', 'success')
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '删除分组失败', 'error')
+        }
+      },
+      updateManagedUser: async (userId, patch) => {
+        try {
+          applyBackendStatePatch(await backendUpdateUser(userId, patch, get().authSession))
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '更新用户失败', 'error')
+        }
+      },
+      grantUserQuota: async (userId, amount, note = '管理员发放额度') => {
+        try {
+          applyBackendStatePatch(await backendGrantUserQuota(userId, amount, note, get().authSession))
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '发放额度失败', 'error')
+        }
+      },
+      setUserQuotaBalance: async (userId, balance, note = '管理员校准额度') => {
+        try {
+          applyBackendStatePatch(await backendSetUserQuota(userId, balance, note, get().authSession))
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '设置额度失败', 'error')
+        }
+      },
+      createPlan: async (input) => {
+        try {
+          applyBackendStatePatch(await backendCreatePlan(input, get().authSession))
+          get().showToast('套餐已创建', 'success')
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '创建套餐失败', 'error')
+        }
+      },
+      updatePlan: async (planId, patch) => {
+        try {
+          applyBackendStatePatch(await backendUpdatePlan(planId, patch, get().authSession))
+          get().showToast('套餐已更新', 'success')
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '更新套餐失败', 'error')
+        }
+      },
+      deletePlan: async (planId) => {
+        try {
+          applyBackendStatePatch(await backendDeletePlan(planId, get().authSession))
+          get().showToast('套餐已删除', 'success')
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '删除套餐失败', 'error')
+        }
+      },
+      chargeCurrentUserQuota: async (source, units, note) => {
+        const state = get()
+        if (!state.authSession) {
+          state.showToast('请先登录再开始创作', 'error')
+          return false
+        }
+        try {
+          applyBackendStatePatch(await backendChargeQuota({ source, units, note }, state.authSession))
+          return true
+        } catch (error) {
+          state.showToast(error instanceof Error ? error.message : '扣除额度失败', 'error')
+          return false
+        }
+      },
 
       // Input
       prompt: '',
@@ -1571,9 +2071,13 @@ export const useStore = create<AppState>()(
       settingsTabRequest: null,
       setShowSettings: (showSettings, settingsTabRequest) => {
         if (showSettings) dismissAllTooltips()
+        const canOpenBackendTab = canCurrentUserManageBackendSettings(get())
+        const safeTab = canOpenBackendTab || (settingsTabRequest !== 'api' && settingsTabRequest !== 'agent')
+          ? settingsTabRequest
+          : 'general'
         set({
           showSettings,
-          ...(settingsTabRequest ? { settingsTabRequest } : {}),
+          ...(safeTab ? { settingsTabRequest: safeTab } : {}),
           ...(!showSettings ? { settingsTabRequest: null } : {}),
         })
       },
@@ -2310,6 +2814,10 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
   const taskParams = shouldUseTransparentOutput
     ? getTransparentRequestParams(normalizedParams)
     : { ...normalizedParams, transparent_output: false }
+  const galleryUnits = Math.max(1, taskParams.n)
+  if (!(await useStore.getState().chargeCurrentUserQuota('gallery', galleryUnits, `画廊生成 x${galleryUnits}`))) {
+    return
+  }
   const transparentMeta = taskParams.transparent_output
     ? createTransparentOutputMeta(prompt.trim())
     : null
@@ -3103,6 +3611,11 @@ async function buildAgentApiInput(conversation: AgentConversation, currentRound:
 export async function submitAgentMessage() {
   const state = useStore.getState()
   const { settings, prompt, inputImages, maskDraft, params, showToast } = state
+  if (!canCurrentUserUseAgent(state)) {
+    showToast('当前账号未开通 Agent 权限', 'error')
+    state.setAppMode('gallery')
+    return
+  }
   const normalizedSettings = normalizeSettings(settings)
   const activeProfile = getActiveApiProfile(normalizedSettings)
 
@@ -3184,6 +3697,9 @@ export async function submitAgentMessage() {
     n: DEFAULT_PARAMS.n,
     transparent_output: false,
   }
+  if (!(await state.chargeCurrentUserQuota('agent', 1, 'Agent 对话轮次'))) {
+    return
+  }
   const round: AgentRound = {
     id: roundId,
     index: shouldAppendToEditingRound && editingRound ? editingRound.index : parentPath.length + 1,
@@ -3254,6 +3770,11 @@ export async function submitAgentMessage() {
 export async function regenerateAgentAssistantMessage(conversationId: string, roundId: string) {
   const state = useStore.getState()
   const { settings, params, showToast } = state
+  if (!canCurrentUserUseAgent(state)) {
+    showToast('当前账号未开通 Agent 权限', 'error')
+    state.setAppMode('gallery')
+    return
+  }
   const normalizedSettings = normalizeSettings(settings)
   const activeProfile = getActiveApiProfile(normalizedSettings)
 
@@ -3289,6 +3810,9 @@ export async function regenerateAgentAssistantMessage(conversationId: string, ro
     ...normalizeParamsForSettings(params, requestSettings, { hasInputImages: inputImageIds.length > 0 }),
     n: DEFAULT_PARAMS.n,
     transparent_output: false,
+  }
+  if (!(await state.chargeCurrentUserQuota('agent', 1, 'Agent 重新生成'))) {
+    return
   }
   const now = Date.now()
   if (sourceRound.status === 'error') {
@@ -4794,7 +5318,7 @@ export async function exportData(options: ExportOptions = { exportConfig: true, 
       exportedAt: new Date(exportedAt).toISOString(),
     }
 
-    if (options.exportConfig) manifest.settings = settings
+    if (options.exportConfig) manifest.settings = getPersistableSettings(settings)
     if (options.exportTasks) {
       manifest.tasks = tasks
       manifest.favoriteCollections = favoriteCollections
