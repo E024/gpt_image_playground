@@ -61,6 +61,9 @@ export type ContentAuditInput = Omit<ContentAuditEntry, 'id' | 'clientRecordId' 
 }
 
 export type RewardCodeInput = Omit<RewardCode, 'id' | 'redeemedCount' | 'createdAt' | 'updatedAt'>
+export type ManagedUserInput = Pick<ManagedUser, 'email' | 'displayName' | 'role' | 'groupId' | 'planId' | 'quotaBalance' | 'canUseAgent' | 'quotaDeductionPriority'> & {
+  password: string
+}
 
 export interface BackendImageUploadInput {
   dataUrl: string
@@ -155,8 +158,12 @@ export function backendDeleteGroup(groupId: string, session?: AuthSession | null
   return request<BackendState>(`/groups/${encodeURIComponent(groupId)}`, { method: 'DELETE', session })
 }
 
-export function backendUpdateUser(userId: string, patch: Partial<Pick<ManagedUser, 'displayName' | 'role' | 'groupId' | 'planId' | 'canUseAgent' | 'quotaDeductionPriority'>>, session?: AuthSession | null) {
+export function backendUpdateUser(userId: string, patch: Partial<Pick<ManagedUser, 'email' | 'displayName' | 'role' | 'groupId' | 'planId' | 'canUseAgent' | 'quotaDeductionPriority'> & { password: string }>, session?: AuthSession | null) {
   return request<BackendState>(`/users/${encodeURIComponent(userId)}`, { method: 'PATCH', body: JSON.stringify(patch), session })
+}
+
+export function backendCreateUser(input: ManagedUserInput, session?: AuthSession | null) {
+  return request<BackendState>('/users', { method: 'POST', body: JSON.stringify(input), session })
 }
 
 export function backendUpdateMyQuotaPriority(quotaDeductionPriority: QuotaDeductionPriority, session?: AuthSession | null) {

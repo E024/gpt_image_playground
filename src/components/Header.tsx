@@ -167,26 +167,20 @@ export default function Header() {
               {showFavoriteCollectionTitle ? (
                 <>
                   <span className="min-w-0 truncate text-[17px] font-bold tracking-tight text-gray-800 dark:text-gray-100 sm:hidden" title={favoriteCollectionTitle}>{favoriteCollectionTitle}</span>
-                  <a
-                    href="https://github.com/CookSleep/gpt_image_playground"
-                    target="_blank"
-                    rel="noopener noreferrer"
+                  <span
                     title={siteName}
-                    className="hidden max-w-[320px] truncate text-lg font-bold tracking-tight text-gray-800 transition-colors hover:text-gray-600 dark:text-gray-100 dark:hover:text-gray-300 sm:inline-block md:max-w-[420px] lg:max-w-[520px]"
+                    className="hidden max-w-[320px] truncate text-lg font-bold tracking-tight text-gray-800 dark:text-gray-100 sm:inline-block md:max-w-[420px] lg:max-w-[520px]"
                   >
                     {siteName}
-                  </a>
+                  </span>
                 </>
               ) : (
-                <a
-                  href="https://github.com/CookSleep/gpt_image_playground"
-                  target="_blank"
-                  rel="noopener noreferrer"
+                <span
                   title={siteName}
-                  className="inline-block max-w-[52vw] truncate align-top text-[17px] font-bold tracking-tight text-gray-800 transition-colors hover:text-gray-600 dark:text-gray-100 dark:hover:text-gray-300 sm:max-w-[420px] sm:text-lg lg:max-w-[520px]"
+                  className="inline-block max-w-[52vw] truncate align-top text-[17px] font-bold tracking-tight text-gray-800 dark:text-gray-100 sm:max-w-[420px] sm:text-lg lg:max-w-[520px]"
                 >
                   {siteName}
-                </a>
+                </span>
               )}
               {hasUpdate && latestRelease && (
                 <a

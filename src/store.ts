@@ -68,6 +68,7 @@ import { createTransparentOutputMeta, getTransparentRequestParams, removeKeyedBa
 import {
   backendChargeQuota,
   backendCheckIn,
+  backendCreateUser,
   backendCreateContentAuditRecord,
   backendCreateGroup,
   backendCreatePlan,
@@ -96,6 +97,7 @@ import {
   type RewardCodeInput,
   type BackendState,
   type ContentAuditInput,
+  type ManagedUserInput,
 } from './lib/backendApi'
 import { DEFAULT_EMAIL_SETTINGS } from './lib/emailSettings'
 import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate'
@@ -1028,7 +1030,8 @@ interface AppState {
   createGroup: (input: Omit<UserGroup, 'id' | 'createdAt' | 'updatedAt'>) => void
   updateGroup: (groupId: string, patch: Partial<Omit<UserGroup, 'id' | 'createdAt' | 'updatedAt'>>) => void
   deleteGroup: (groupId: string) => void
-  updateManagedUser: (userId: string, patch: Partial<Pick<ManagedUser, 'displayName' | 'role' | 'groupId' | 'planId' | 'canUseAgent' | 'quotaDeductionPriority'>>) => void
+  createManagedUser: (input: ManagedUserInput) => void
+  updateManagedUser: (userId: string, patch: Partial<Pick<ManagedUser, 'email' | 'displayName' | 'role' | 'groupId' | 'planId' | 'canUseAgent' | 'quotaDeductionPriority'> & { password: string }>) => void
   updateMyQuotaDeductionPriority: (priority: QuotaDeductionPriority) => Promise<void>
   grantUserQuota: (userId: string, amount: number, note?: string) => void
   setUserQuotaBalance: (userId: string, balance: number, note?: string) => void
@@ -2027,6 +2030,14 @@ export const useStore = create<AppState>()(
           get().showToast('分组已删除', 'success')
         } catch (error) {
           get().showToast(error instanceof Error ? error.message : '删除分组失败', 'error')
+        }
+      },
+      createManagedUser: async (input) => {
+        try {
+          applyBackendStatePatch(await backendCreateUser(input, get().authSession))
+          get().showToast('用户已创建，可直接登录', 'success')
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '创建用户失败', 'error')
         }
       },
       updateManagedUser: async (userId, patch) => {

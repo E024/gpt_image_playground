@@ -2055,6 +2055,100 @@ function getExistingGroupId(value) {
   return db.prepare('SELECT 1 FROM groups WHERE id = ?').get(groupId) ? groupId : null
 }
 
+function getPlanIdForGroup(groupId, requestedPlanId, fallbackPlanId = '') {
+  const requested = typeof requestedPlanId === 'string' && requestedPlanId.trim() ? requestedPlanId.trim() : ''
+  if (requested && db.prepare('SELECT 1 FROM plans WHERE id = ? AND group_id = ?').get(requested, groupId)) return requested
+  if (fallbackPlanId && db.prepare('SELECT 1 FROM plans WHERE id = ? AND group_id = ?').get(fallbackPlanId, groupId)) return fallbackPlanId
+  return getFirstPlanForGroup(groupId)?.id ?? ''
+}
+
+function normalizeManagedUserInput(input, fallback = {}) {
+  const email = normalizeEmail(input.email ?? fallback.email)
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) fail(400, '请输入有效邮箱')
+
+  const requestedGroupId = typeof input.groupId === 'string' && input.groupId.trim()
+    ? input.groupId.trim()
+    : fallback.groupId ?? DEFAULT_GROUP_ID
+  const groupId = getExistingGroupId(requestedGroupId)
+  if (!groupId) fail(400, '目标分组不存在')
+
+  const planId = getPlanIdForGroup(groupId, input.planId, fallback.planId)
+  if (!planId) fail(400, '目标分组还没有套餐，先给该分组创建套餐。')
+  const plan = getPlan(planId)
+
+  return {
+    email,
+    displayName: String(input.displayName ?? fallback.displayName ?? email.split('@')[0]).trim().slice(0, 48) || email,
+    role: input.role === 'admin' ? 'admin' : input.role === 'member' ? 'member' : fallback.role === 'admin' ? 'admin' : 'member',
+    groupId,
+    planId,
+    quotaBalance: normalizeNonNegativeInteger(input.quotaBalance ?? fallback.quotaBalance ?? plan?.monthlyQuota ?? plan?.monthly_quota ?? 0, 0),
+    quotaDeductionPriority: normalizeQuotaDeductionPriority(input.quotaDeductionPriority, fallback.quotaDeductionPriority ?? 'group_first'),
+    canUseAgent: normalizeBoolean(input.canUseAgent, fallback.canUseAgent ?? true),
+  }
+}
+
+function createManagedUser(input, actor) {
+  const body = normalizeManagedUserInput(input)
+  const password = String(input.password || '')
+  if (password.length < 8) fail(400, '密码至少 8 位')
+  if (db.prepare('SELECT 1 FROM users WHERE email = ?').get(body.email)) fail(409, '这个邮箱已经存在')
+
+  const now = Date.now()
+  const userId = genId()
+  const salt = randomBytes(16).toString('hex')
+  const group = getStrictGroup(body.groupId)
+  const plan = getPlan(body.planId)
+  withImmediateTransaction(() => {
+    db.prepare(`
+      INSERT INTO users (
+        id, email, display_name, role, group_id, plan_id, quota_balance, quota_deduction_priority,
+        total_quota_used, can_use_agent, password_hash, password_salt, created_at, updated_at, last_login_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, NULL)
+    `).run(
+      userId,
+      body.email,
+      body.displayName,
+      body.role,
+      body.groupId,
+      body.planId,
+      body.quotaBalance,
+      body.quotaDeductionPriority,
+      body.canUseAgent ? 1 : 0,
+      hashPassword(password, salt),
+      salt,
+      now,
+      now,
+    )
+
+    if (body.quotaBalance > 0) {
+      insertLedgerEntry({
+        userId,
+        user: { ...body, id: userId },
+        type: 'credit',
+        source: 'admin',
+        amount: body.quotaBalance,
+        units: 1,
+        unitCost: body.quotaBalance,
+        balanceBefore: 0,
+        balanceAfter: body.quotaBalance,
+        personalAmount: body.quotaBalance,
+        personalBalanceBefore: 0,
+        personalBalanceAfter: body.quotaBalance,
+        groupAmount: 0,
+        groupBalanceBefore: group?.quotaBalance ?? 0,
+        groupBalanceAfter: group?.quotaBalance ?? 0,
+        deductionPriority: body.quotaDeductionPriority,
+        plan,
+        group,
+        note: `管理员 ${actor.email} 创建用户并发放起始额度`,
+        createdAt: now,
+      })
+    }
+  })
+}
+
 function escapeHtml(value) {
   return String(value ?? '')
     .replace(/&/g, '&amp;')
@@ -2791,6 +2885,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     const userMatch = path.match(/^\/users\/([^/]+)(?:\/(grant-quota|quota))?$/)
+    if (req.method === 'POST' && path === '/users') {
+      createManagedUser(await readJson(req), actor)
+      return json(res, 200, getState(getUser(actor.id), authSession))
+    }
+
     if (userMatch && req.method === 'PATCH' && !userMatch[2]) {
       const body = await readJson(req)
       const user = getUser(userMatch[1])
@@ -2798,21 +2897,21 @@ const server = http.createServer(async (req, res) => {
       const adminCount = db.prepare("SELECT COUNT(*) AS count FROM users WHERE role = 'admin'").get().count
       const nextRole = user.role === 'admin' && body.role === 'member' && adminCount <= 1 ? 'admin' : body.role === 'admin' ? 'admin' : body.role === 'member' ? 'member' : user.role
       if (user.role === 'admin' && body.role === 'member' && adminCount <= 1) return json(res, 400, { error: '至少保留一位管理员' })
-      const requestedGroupId = typeof body.groupId === 'string' ? body.groupId : ''
-      const groupId = requestedGroupId ? getExistingGroupId(requestedGroupId) : user.groupId
-      if (!groupId) return json(res, 400, { error: '目标分组不存在' })
-      const requestedPlanId = typeof body.planId === 'string' ? body.planId : ''
-      const currentPlanInGroup = db.prepare('SELECT 1 FROM plans WHERE id = ? AND group_id = ?').get(user.planId, groupId)
-      const requestedPlanInGroup = requestedPlanId
-        ? db.prepare('SELECT 1 FROM plans WHERE id = ? AND group_id = ?').get(requestedPlanId, groupId)
-        : null
-      const fallbackPlan = currentPlanInGroup ? user.planId : getFirstPlanForGroup(groupId)?.id
-      if (!requestedPlanInGroup && !fallbackPlan) return json(res, 400, { error: '目标分组还没有套餐，先给该分组创建套餐。' })
-      const planId = requestedPlanInGroup ? requestedPlanId : fallbackPlan
-      const canUseAgent = typeof body.canUseAgent === 'boolean' ? body.canUseAgent : user.canUseAgent
-      const quotaDeductionPriority = normalizeQuotaDeductionPriority(body.quotaDeductionPriority, user.quotaDeductionPriority)
-      db.prepare('UPDATE users SET display_name = ?, role = ?, group_id = ?, plan_id = ?, can_use_agent = ?, quota_deduction_priority = ?, updated_at = ? WHERE id = ?')
-        .run(String(body.displayName || user.displayName).trim().slice(0, 48), nextRole, groupId, planId, canUseAgent ? 1 : 0, quotaDeductionPriority, Date.now(), user.id)
+      const next = normalizeManagedUserInput({ ...body, role: nextRole }, user)
+      const duplicateEmail = next.email !== user.email ? db.prepare('SELECT 1 FROM users WHERE email = ? AND id <> ?').get(next.email, user.id) : null
+      if (duplicateEmail) return json(res, 409, { error: '这个邮箱已经存在' })
+
+      const password = typeof body.password === 'string' ? body.password : ''
+      if (password && password.length < 8) return json(res, 400, { error: '密码至少 8 位' })
+      const now = Date.now()
+      if (password) {
+        const salt = randomBytes(16).toString('hex')
+        db.prepare('UPDATE users SET email = ?, display_name = ?, role = ?, group_id = ?, plan_id = ?, can_use_agent = ?, quota_deduction_priority = ?, password_hash = ?, password_salt = ?, updated_at = ? WHERE id = ?')
+          .run(next.email, next.displayName, next.role, next.groupId, next.planId, next.canUseAgent ? 1 : 0, next.quotaDeductionPriority, hashPassword(password, salt), salt, now, user.id)
+      } else {
+        db.prepare('UPDATE users SET email = ?, display_name = ?, role = ?, group_id = ?, plan_id = ?, can_use_agent = ?, quota_deduction_priority = ?, updated_at = ? WHERE id = ?')
+          .run(next.email, next.displayName, next.role, next.groupId, next.planId, next.canUseAgent ? 1 : 0, next.quotaDeductionPriority, now, user.id)
+      }
       return json(res, 200, getState(getUser(actor.id), authSession))
     }
 

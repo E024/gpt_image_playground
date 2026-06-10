@@ -5,6 +5,7 @@ import { buildSettingsFromUrlParams, clearUrlSettingParams, hasUrlSettingParams 
 import { mergeImportedSettings } from './lib/apiProfiles'
 import { getCustomProviderConfigUrl, loadCustomProviderSettingsFromUrl } from './lib/customProviderConfigUrl'
 import { useDockerApiUrlMigrationNotice } from './hooks/useDockerApiUrlMigrationNotice'
+import { getAppModeFromPath, getRoutedUrl } from './lib/appRoutes'
 import Header from './components/Header'
 import AuthLanding from './components/AuthLanding'
 import AdminDashboard from './components/AdminDashboard'
@@ -90,6 +91,32 @@ export default function App() {
       setAppMode('gallery')
     }
   }, [agentEnabled, appMode, currentUser, setAppMode])
+
+  useEffect(() => {
+    if (!authReady || !authSession) return
+
+    const applyRouteMode = () => {
+      const routeMode = getAppModeFromPath(window.location.pathname)
+      if (routeMode && routeMode !== useStore.getState().appMode) {
+        useStore.getState().setAppMode(routeMode)
+      }
+    }
+
+    applyRouteMode()
+    window.addEventListener('popstate', applyRouteMode)
+    return () => window.removeEventListener('popstate', applyRouteMode)
+  }, [authReady, authSession])
+
+  useEffect(() => {
+    if (!authReady || !authSession) return
+    const nextUrl = getRoutedUrl(appMode)
+    const currentUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`
+    if (currentUrl === nextUrl) return
+
+    const routeMode = getAppModeFromPath(window.location.pathname)
+    const method = routeMode ? 'pushState' : 'replaceState'
+    window.history[method](null, '', nextUrl)
+  }, [appMode, authReady, authSession])
 
   useEffect(() => {
     document.title = siteName || '造像台'

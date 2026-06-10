@@ -9,7 +9,7 @@ import {
   normalizeSettings,
   switchApiProfileProvider,
 } from '../lib/apiProfiles'
-import { backendFetchContentAudit, backendFetchLedger, type ContentAuditPage, type LedgerPage, type RewardCodeInput } from '../lib/backendApi'
+import { backendFetchContentAudit, backendFetchLedger, type ContentAuditPage, type LedgerPage, type ManagedUserInput, type RewardCodeInput } from '../lib/backendApi'
 import { getEmailSettingsDraft } from '../lib/emailSettings'
 import type { ApiMode, ApiProfile, ApiProvider, AppSettings, BillingLedgerEntry, BillingLedgerType, BillingUsageSource, ContentAuditEntry, ContentAuditKind, ContentAuditSource, EmailSettings, ImageStorageSettings, ManagedUser, QuotaDeductionPriority, RewardCode, RewardState, SystemSettings, UserGroup, UserPlan } from '../types'
 import { PlusIcon, TrashIcon } from './icons'
@@ -353,6 +353,7 @@ export default function AdminDashboard() {
   const setAppMode = useStore((s) => s.setAppMode)
   const setConfirmDialog = useStore((s) => s.setConfirmDialog)
   const setLightboxImageId = useStore((s) => s.setLightboxImageId)
+  const createManagedUser = useStore((s) => s.createManagedUser)
   const updateManagedUser = useStore((s) => s.updateManagedUser)
   const updateMyQuotaDeductionPriority = useStore((s) => s.updateMyQuotaDeductionPriority)
   const grantUserQuota = useStore((s) => s.grantUserQuota)
@@ -386,6 +387,18 @@ export default function AdminDashboard() {
   const [selectedGroupId, setSelectedGroupId] = useState(currentGroup?.id ?? groups[0]?.id ?? DEFAULT_GROUP_ID)
   const [selectedPlanId, setSelectedPlanId] = useState(currentPlan?.id ?? plans[0]?.id ?? '')
   const [quotaDrafts, setQuotaDrafts] = useState<Record<string, string>>({})
+  const [userDrafts, setUserDrafts] = useState<Record<string, { email?: string; displayName?: string; password?: string }>>({})
+  const [newUserDraft, setNewUserDraft] = useState<ManagedUserInput>(() => ({
+    email: '',
+    displayName: '',
+    password: '',
+    role: 'member',
+    groupId: groups[0]?.id ?? DEFAULT_GROUP_ID,
+    planId: plans.find((plan) => plan.groupId === (groups[0]?.id ?? DEFAULT_GROUP_ID))?.id ?? plans[0]?.id ?? '',
+    quotaBalance: plans.find((plan) => plan.groupId === (groups[0]?.id ?? DEFAULT_GROUP_ID))?.monthlyQuota ?? plans[0]?.monthlyQuota ?? 100,
+    canUseAgent: true,
+    quotaDeductionPriority: 'group_first',
+  }))
   const [groupDrafts, setGroupDrafts] = useState<Record<string, UserGroup>>({})
   const [planDrafts, setPlanDrafts] = useState<Record<string, UserPlan>>({})
   const [selectedRewardCodeId, setSelectedRewardCodeId] = useState(rewardState.rewardCodes[0]?.id ?? '')
@@ -453,6 +466,57 @@ export default function AdminDashboard() {
   const ledgerStart = ledgerTotal === 0 ? 0 : (ledgerCurrentPage - 1) * ledgerPageSize + 1
   const ledgerEnd = ledgerTotal === 0 ? 0 : Math.min(ledgerStart + ledgerEntries.length - 1, ledgerTotal)
   const contentEntries = contentResult?.entries ?? []
+
+  const updateNewUserDraft = (patch: Partial<ManagedUserInput>) => {
+    setNewUserDraft((draft) => {
+      const nextGroupId = patch.groupId ?? draft.groupId
+      const groupPlans = plans.filter((plan) => plan.groupId === nextGroupId)
+      const nextPlanId = patch.planId ?? (groupPlans.some((plan) => plan.id === draft.planId) ? draft.planId : groupPlans[0]?.id ?? '')
+      const nextPlan = plans.find((plan) => plan.id === nextPlanId)
+      return {
+        ...draft,
+        ...patch,
+        groupId: nextGroupId,
+        planId: nextPlanId,
+        quotaBalance: patch.quotaBalance ?? (patch.groupId ? nextPlan?.monthlyQuota ?? draft.quotaBalance : draft.quotaBalance),
+      }
+    })
+  }
+
+  const handleCreateManagedUser = () => {
+    createManagedUser(newUserDraft)
+    const groupId = newUserDraft.groupId || groups[0]?.id || DEFAULT_GROUP_ID
+    const plan = plans.find((item) => item.groupId === groupId) ?? plans[0]
+    setNewUserDraft({
+      email: '',
+      displayName: '',
+      password: '',
+      role: 'member',
+      groupId,
+      planId: plan?.id ?? '',
+      quotaBalance: plan?.monthlyQuota ?? 100,
+      canUseAgent: true,
+      quotaDeductionPriority: 'group_first',
+    })
+  }
+
+  const commitUserIdentityDraft = (user: ManagedUser) => {
+    const draft = userDrafts[user.id]
+    if (!draft) return
+    const patch: Partial<Pick<ManagedUser, 'email' | 'displayName'>> = {}
+    const email = draft.email?.trim()
+    const displayName = draft.displayName?.trim()
+    if (email && email !== user.email) patch.email = email
+    if (displayName && displayName !== user.displayName) patch.displayName = displayName
+    if (Object.keys(patch).length > 0) updateManagedUser(user.id, patch)
+  }
+
+  const commitUserPasswordDraft = (user: ManagedUser) => {
+    const password = userDrafts[user.id]?.password?.trim() ?? ''
+    if (!password) return
+    updateManagedUser(user.id, { password })
+    setUserDrafts((drafts) => ({ ...drafts, [user.id]: { ...drafts[user.id], password: '' } }))
+  }
   const contentTotal = contentResult?.total ?? contentEntries.length
   const contentTotalPages = contentResult?.totalPages ?? 1
   const contentCurrentPage = contentResult?.page ?? contentPage
@@ -2107,8 +2171,106 @@ export default function AdminDashboard() {
             )}
 
             {section === 'users' && isAdmin && (
-              <div className="overflow-auto rounded-lg border border-gray-200 bg-white shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
-                <table className="min-w-full divide-y divide-gray-200 text-sm dark:divide-white/[0.08]">
+              <div className="space-y-4">
+                <div className="rounded-lg border border-gray-200 bg-white p-4 shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
+                  <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+                    <div>
+                      <div className="text-xs font-black uppercase tracking-[0.18em] text-cyan-600 dark:text-cyan-400">Direct Provision</div>
+                      <h2 className="mt-1 text-lg font-black">新增已激活用户</h2>
+                      <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">管理员创建的账号不走邮箱验证，保存后即可使用邮箱和密码登录。</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleCreateManagedUser}
+                      className="inline-flex items-center justify-center gap-1.5 rounded-md bg-gray-900 px-3 py-2 text-sm font-black text-white transition hover:bg-gray-700 dark:bg-white dark:text-gray-950"
+                    >
+                      <PlusIcon className="h-4 w-4" />
+                      创建用户
+                    </button>
+                  </div>
+                  <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                    <label className="block">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">邮箱</span>
+                      <input
+                        value={newUserDraft.email}
+                        onChange={(event) => updateNewUserDraft({ email: event.target.value })}
+                        placeholder="user@example.com"
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      />
+                    </label>
+                    <label className="block">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">显示名</span>
+                      <input
+                        value={newUserDraft.displayName}
+                        onChange={(event) => updateNewUserDraft({ displayName: event.target.value })}
+                        placeholder="留空则使用邮箱前缀"
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      />
+                    </label>
+                    <label className="block">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">初始密码</span>
+                      <input
+                        type="password"
+                        value={newUserDraft.password}
+                        onChange={(event) => updateNewUserDraft({ password: event.target.value })}
+                        placeholder="至少 8 位"
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      />
+                    </label>
+                    <label className="block">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">角色</span>
+                      <select
+                        value={newUserDraft.role}
+                        onChange={(event) => updateNewUserDraft({ role: event.target.value as ManagedUser['role'] })}
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      >
+                        <option value="member">成员</option>
+                        <option value="admin">管理员</option>
+                      </select>
+                    </label>
+                    <label className="block">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">分组</span>
+                      <select
+                        value={newUserDraft.groupId}
+                        onChange={(event) => updateNewUserDraft({ groupId: event.target.value })}
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      >
+                        {groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}
+                      </select>
+                    </label>
+                    <label className="block">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">套餐</span>
+                      <select
+                        value={newUserDraft.planId}
+                        onChange={(event) => updateNewUserDraft({ planId: event.target.value })}
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      >
+                        {plans.filter((plan) => plan.groupId === newUserDraft.groupId).map((plan) => <option key={plan.id} value={plan.id}>{plan.name}</option>)}
+                      </select>
+                    </label>
+                    <NumberField label="个人初始积分" value={newUserDraft.quotaBalance} min={0} onChange={(value) => updateNewUserDraft({ quotaBalance: value })} />
+                    <label className="block">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">扣费顺序</span>
+                      <select
+                        value={newUserDraft.quotaDeductionPriority}
+                        onChange={(event) => updateNewUserDraft({ quotaDeductionPriority: event.target.value as QuotaDeductionPriority })}
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      >
+                        {Object.entries(quotaPriorityLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                      </select>
+                    </label>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => updateNewUserDraft({ canUseAgent: !newUserDraft.canUseAgent })}
+                    className={`mt-3 rounded-md px-3 py-2 text-xs font-black transition ${newUserDraft.canUseAgent ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300' : 'bg-gray-100 text-gray-500 dark:bg-white/[0.06] dark:text-gray-400'}`}
+                  >
+                    Agent 权限：{newUserDraft.canUseAgent ? '默认授权' : '关闭'}
+                  </button>
+                </div>
+
+                <div className="overflow-auto rounded-lg border border-gray-200 bg-white shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
+                  <table className="min-w-full divide-y divide-gray-200 text-sm dark:divide-white/[0.08]">
                   <thead className="bg-gray-50 text-xs text-gray-500 dark:bg-white/[0.03] dark:text-gray-400">
                     <tr>
                       <th className="px-4 py-3 text-left font-bold">用户</th>
@@ -2128,11 +2290,22 @@ export default function AdminDashboard() {
                       const userGroup = groups.find((group) => group.id === user.groupId) ?? groups[0]
                       const userPlans = plans.filter((plan) => plan.groupId === userGroup?.id)
                       const selectedUserPlanId = userPlans.some((plan) => plan.id === user.planId) ? user.planId : userPlans[0]?.id ?? ''
+                      const userDraft = userDrafts[user.id] ?? {}
                       return (
                         <tr key={user.id}>
                           <td className="px-4 py-3">
-                            <div className="font-bold">{user.displayName}</div>
-                            <div className="text-xs text-gray-500">{user.email}</div>
+                            <input
+                              value={userDraft.displayName ?? user.displayName}
+                              onChange={(event) => setUserDrafts((drafts) => ({ ...drafts, [user.id]: { ...drafts[user.id], displayName: event.target.value } }))}
+                              onBlur={() => commitUserIdentityDraft(user)}
+                              className="w-40 rounded-md border border-transparent bg-transparent px-2 py-1 font-bold outline-none transition focus:border-cyan-300 focus:bg-white dark:focus:bg-gray-950"
+                            />
+                            <input
+                              value={userDraft.email ?? user.email}
+                              onChange={(event) => setUserDrafts((drafts) => ({ ...drafts, [user.id]: { ...drafts[user.id], email: event.target.value } }))}
+                              onBlur={() => commitUserIdentityDraft(user)}
+                              className="mt-1 w-48 rounded-md border border-transparent bg-transparent px-2 py-1 text-xs text-gray-500 outline-none transition focus:border-cyan-300 focus:bg-white dark:focus:bg-gray-950"
+                            />
                           </td>
                           <td className="px-4 py-3">
                             <select
@@ -2202,7 +2375,22 @@ export default function AdminDashboard() {
                           <td className="px-4 py-3">{user.totalQuotaUsed} 点</td>
                           <td className="px-4 py-3 text-gray-500">{formatDate(user.lastLoginAt)}</td>
                           <td className="px-4 py-3">
-                            <button onClick={() => grantUserQuota(user.id, 100, '后台快速补发 100 点')} className="rounded-md bg-cyan-600 px-2.5 py-1.5 text-xs font-bold text-white transition hover:bg-cyan-500">
+                            <div className="flex min-w-44 items-center gap-2">
+                              <input
+                                type="password"
+                                value={userDraft.password ?? ''}
+                                onChange={(event) => setUserDrafts((drafts) => ({ ...drafts, [user.id]: { ...drafts[user.id], password: event.target.value } }))}
+                                onKeyDown={(event) => {
+                                  if (event.key === 'Enter') commitUserPasswordDraft(user)
+                                }}
+                                placeholder="新密码"
+                                className="w-24 rounded-md border border-gray-200 bg-white px-2 py-1 text-xs outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                              />
+                              <button onClick={() => commitUserPasswordDraft(user)} className="rounded-md bg-gray-900 px-2.5 py-1.5 text-xs font-bold text-white transition hover:bg-gray-700 dark:bg-white dark:text-gray-950">
+                                改密
+                              </button>
+                            </div>
+                            <button onClick={() => grantUserQuota(user.id, 100, '后台快速补发 100 点')} className="mt-2 rounded-md bg-cyan-600 px-2.5 py-1.5 text-xs font-bold text-white transition hover:bg-cyan-500">
                               +100
                             </button>
                           </td>
@@ -2211,6 +2399,7 @@ export default function AdminDashboard() {
                     })}
                   </tbody>
                 </table>
+                </div>
               </div>
             )}
 
