@@ -19,6 +19,28 @@ docker compose up -d
 http://localhost:4017
 ```
 
+生产域名反向代理时，只代理前端端口：
+
+```text
+https://你的域名  ->  http://127.0.0.1:4017
+```
+
+不要把 `3018` 后端端口直接暴露给公网；compose 默认只让后端在 Docker 网络内被前端访问。宝塔/Nginx 反代到 `4017` 时，需要保留这些请求头：
+
+```nginx
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Host $host;
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header Authorization $http_authorization;
+proxy_set_header Cookie $http_cookie;
+proxy_set_header X-Session-Token $http_x_session_token;
+proxy_buffering off;
+```
+
+如果宝塔开启了反向代理缓存，请对 `/backend-api/` 关闭缓存。登录态接口已经返回 `Cache-Control: no-store`，代理层也不应缓存这些响应。
+
 常用命令：
 
 ```powershell

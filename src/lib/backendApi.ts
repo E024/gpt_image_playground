@@ -87,8 +87,9 @@ async function request<T>(path: string, options: RequestInit & { session?: AuthS
   if (options.session) {
     headers.set('Authorization', `Bearer ${options.session.token}`)
     headers.set('X-User-Id', options.session.userId)
+    headers.set('X-Session-Token', options.session.token)
   }
-  const response = await fetch(`/backend-api${path}`, { ...options, headers })
+  const response = await fetch(`/backend-api${path}`, { ...options, headers, credentials: 'same-origin' })
   const payload = await response.json().catch(() => ({}))
   if (!response.ok) {
     throw new Error(typeof payload.error === 'string' ? payload.error : `请求失败：${response.status}`)

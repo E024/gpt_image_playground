@@ -1949,6 +1949,7 @@ export default function AdminDashboard() {
                         type="password"
                         value={activeApiProfile.apiKey}
                         onChange={(event) => updateApiProfileDraft({ apiKey: event.target.value })}
+                        placeholder={activeApiProfile.hasApiKey ? '已保存 Key，留空不修改' : '请输入 API Key'}
                         className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
                       />
                     </label>

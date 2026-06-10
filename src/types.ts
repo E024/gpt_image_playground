@@ -72,6 +72,7 @@ export interface ApiProfile {
   provider: ApiProvider
   baseUrl: string
   apiKey: string
+  hasApiKey?: boolean
   model: string
   timeout: number
   apiMode: ApiMode

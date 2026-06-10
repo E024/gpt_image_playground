@@ -13,8 +13,8 @@ services:
       SITE_NAME: 造像台
     volumes:
       - ./docker-data/backend:/data
-    ports:
-      - "3018:3018"
+    expose:
+      - "3018"
 
   frontend:
     build:

@@ -10,6 +10,7 @@ const host = process.env.BACKEND_API_HOST || '127.0.0.1'
 const dbPath = resolve(process.env.BACKEND_SQLITE_PATH || 'data/backend.sqlite')
 const AUTH_HASH_VERSION = 'sha256-v1'
 const SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1000
+const AUTH_COOKIE_NAME = 'zxt_session'
 const DEFAULT_GROUP_ID = 'default'
 const ACCENT_VALUES = new Set(['cyan', 'sky', 'violet', 'fuchsia', 'rose', 'amber', 'emerald', 'lime', 'indigo', 'slate'])
 const QUOTA_DEDUCTION_PRIORITIES = new Set(['group_first', 'personal_first'])
@@ -320,14 +321,44 @@ function html(res, status, body) {
   res.end(body)
 }
 
-function json(res, status, payload) {
+function json(res, status, payload, extraHeaders = {}) {
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-User-Id, X-Session-Token',
     'Access-Control-Allow-Methods': 'GET, POST, PATCH, PUT, DELETE, OPTIONS',
+    'Cache-Control': 'no-store',
+    ...extraHeaders,
   })
   res.end(JSON.stringify(payload))
+}
+
+function parseCookies(req) {
+  const header = req.headers.cookie
+  if (typeof header !== 'string' || !header) return {}
+  const cookies = {}
+  for (const part of header.split(';')) {
+    const index = part.indexOf('=')
+    if (index <= 0) continue
+    const name = part.slice(0, index).trim()
+    const value = part.slice(index + 1).trim()
+    if (!name) continue
+    try {
+      cookies[name] = decodeURIComponent(value)
+    } catch {
+      cookies[name] = value
+    }
+  }
+  return cookies
+}
+
+function createAuthCookie(token, expiresAt) {
+  const maxAge = Math.max(0, Math.floor((expiresAt - Date.now()) / 1000))
+  return `${AUTH_COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; Max-Age=${maxAge}; HttpOnly; SameSite=Lax`
+}
+
+function clearAuthCookie() {
+  return `${AUTH_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`
 }
 
 function readRawBody(req) {
@@ -475,6 +506,66 @@ function setApiSettings(settings) {
     VALUES ('api_settings', ?, ?)
     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
   `).run(JSON.stringify(settings), Date.now())
+}
+
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value))
+}
+
+function redactApiSettings(settings = getApiSettings()) {
+  const safe = cloneJson(settings)
+  const redactProfile = (profile) => {
+    if (!isRecord(profile)) return profile
+    return {
+      ...profile,
+      apiKey: '',
+      hasApiKey: typeof profile.apiKey === 'string' && profile.apiKey.trim().length > 0,
+    }
+  }
+  safe.apiKey = ''
+  safe.hasApiKey = typeof settings.apiKey === 'string' && settings.apiKey.trim().length > 0
+  safe.profiles = Array.isArray(safe.profiles) ? safe.profiles.map(redactProfile) : []
+  return safe
+}
+
+function mergeApiSettingsSecrets(input, current = getApiSettings()) {
+  if (!isRecord(input)) return input
+  const next = cloneJson(input)
+  const currentProfiles = new Map(
+    Array.isArray(current.profiles)
+      ? current.profiles
+        .filter(isRecord)
+        .map((profile) => [String(profile.id || ''), profile])
+      : [],
+  )
+
+  if (Array.isArray(next.profiles)) {
+    next.profiles = next.profiles.map((profile) => {
+      if (!isRecord(profile)) return profile
+      const { hasApiKey: _hasApiKey, ...cleanProfile } = profile
+      const currentProfile = currentProfiles.get(String(profile.id || ''))
+      if (typeof cleanProfile.apiKey === 'string' && cleanProfile.apiKey.trim().length > 0) return cleanProfile
+      return {
+        ...cleanProfile,
+        apiKey: typeof currentProfile?.apiKey === 'string' ? currentProfile.apiKey : '',
+      }
+    })
+  }
+  delete next.hasApiKey
+
+  const activeProfile = Array.isArray(next.profiles)
+    ? next.profiles.find((profile) => isRecord(profile) && profile.id === next.activeProfileId) ?? next.profiles[0]
+    : null
+  if (isRecord(activeProfile)) {
+    next.apiKey = typeof activeProfile.apiKey === 'string' ? activeProfile.apiKey : ''
+  } else if (typeof next.apiKey !== 'string' || next.apiKey.trim().length === 0) {
+    next.apiKey = typeof current.apiKey === 'string' ? current.apiKey : ''
+  }
+  return next
+}
+
+function updateApiSettings(input) {
+  setApiSettings(mergeApiSettingsSecrets(input))
 }
 
 function parseEmailSettings(value) {
@@ -690,6 +781,29 @@ function redactStorageSettings(settings = getStorageSettings()) {
     r2: {
       ...r2,
       hasSecretAccessKey: Boolean(secretAccessKey),
+    },
+  }
+}
+
+function getPublicImageStorageSettings(settings = getStorageSettings()) {
+  return {
+    enabled: Boolean(settings.enabled),
+    primary: 'pressdown',
+    fallback: 'none',
+    pressdown: {
+      enabled: false,
+      signatureUrl: '',
+      displayMode: 'cloud',
+    },
+    r2: {
+      enabled: false,
+      accountId: '',
+      accessKeyId: '',
+      hasSecretAccessKey: false,
+      bucket: '',
+      prefix: '',
+      publicHost: '',
+      presignTtlSeconds: 3600,
     },
   }
 }
@@ -1821,14 +1935,81 @@ function createSession(userId) {
   return { userId, token, startedAt: now, expiresAt }
 }
 
-function getBearerToken(req) {
+function getRequestTokens(req) {
+  const tokens = []
+  const pushToken = (value, source) => {
+    if (typeof value !== 'string') return
+    const token = value.trim()
+    if (token && !tokens.some((item) => item.token === token)) tokens.push({ token, source })
+  }
   const authorization = req.headers.authorization
   if (typeof authorization === 'string') {
     const match = authorization.match(/^Bearer\s+(.+)$/i)
-    if (match) return match[1]
+    if (match) pushToken(match[1], 'authorization')
   }
-  const headerToken = req.headers['x-session-token']
-  return typeof headerToken === 'string' ? headerToken : ''
+  pushToken(req.headers['x-session-token'], 'header')
+  pushToken(parseCookies(req)[AUTH_COOKIE_NAME], 'cookie')
+  return tokens
+}
+
+function getBearerToken(req) {
+  return getRequestTokens(req)[0]?.token || ''
+}
+
+function getPublicEmailSettings() {
+  if (getUserCount() > 0) return null
+  const settings = getEmailSettings()
+  const configured = Boolean(settings.enabled && settings.smtpHost && settings.smtpPort && settings.fromEmail)
+  if (!configured) return null
+  return {
+    enabled: true,
+    smtpHost: 'configured',
+    smtpPort: 1,
+    smtpSecure: false,
+    smtpUser: '',
+    fromEmail: 'configured',
+    fromName: '',
+    brandName: getSystemSettings().siteName,
+    appBaseUrl: '',
+    verificationExpiresMinutes: DEFAULT_EMAIL_VERIFICATION_EXPIRES_MINUTES,
+    verificationSubject: '',
+    verificationText: '',
+    verificationHtml: '',
+    hasSmtpPassword: Boolean(settings.smtpPassword),
+  }
+}
+
+function getPublicState() {
+  return {
+    groups: [],
+    plans: [],
+    users: [],
+    billingLedger: [],
+    authSession: null,
+    setupRequired: getUserCount() === 0,
+    apiSettings: null,
+    adminApiSettings: null,
+    systemSettings: getSystemSettings(),
+    emailSettings: getPublicEmailSettings(),
+    imageStorageSettings: getPublicImageStorageSettings({ ...createDefaultStorageSettings(), enabled: false }),
+    rewardState: {
+      checkin: {
+        enabled: false,
+        quotaAmount: 0,
+        cooldownHours: 24,
+        perIpDailyLimit: 0,
+        brandTitle: '',
+        brandDescription: '',
+        lastCheckinAt: null,
+        nextAvailableAt: null,
+        canCheckIn: false,
+        updatedAt: 0,
+      },
+      rewardCodes: [],
+      myRedemptions: [],
+      myCheckins: [],
+    },
+  }
 }
 
 function getState(actor, authSession = null) {
@@ -1861,39 +2042,41 @@ function getState(actor, authSession = null) {
     authSession,
     setupRequired,
     apiSettings: actor ? createRuntimeApiSettings(adminApiSettings, authSession) : null,
-    adminApiSettings: admin ? adminApiSettings : null,
+    adminApiSettings: admin ? redactApiSettings(adminApiSettings) : null,
     systemSettings: getSystemSettings(),
     emailSettings: admin || setupRequired ? redactEmailSettings() : null,
-    imageStorageSettings: admin ? redactStorageSettings() : redactStorageSettings(),
+    imageStorageSettings: admin ? redactStorageSettings() : getPublicImageStorageSettings(),
     rewardState: getRewardState(actor),
   }
 }
 
 function requireActor(req) {
-  const token = getBearerToken(req)
-  if (!token) return { actor: null, authSession: null }
+  const tokens = getRequestTokens(req)
+  if (!tokens.length) return { actor: null, authSession: null }
   const now = Date.now()
-  const row = db.prepare(`
-    SELECT users.*, sessions.created_at AS session_created_at, sessions.expires_at AS session_expires_at
-    FROM sessions
-    JOIN users ON users.id = sessions.user_id
-    WHERE sessions.token_hash = ? AND sessions.expires_at > ?
-    LIMIT 1
-  `).get(hashToken(token), now)
-  if (!row) return { actor: null, authSession: null }
-  const requestedUserId = req.headers['x-user-id']
-  if (typeof requestedUserId === 'string' && requestedUserId !== row.id) {
-    return { actor: null, authSession: null }
+  const sessionQuery = db.prepare(`
+      SELECT users.*, sessions.created_at AS session_created_at, sessions.expires_at AS session_expires_at
+      FROM sessions
+      JOIN users ON users.id = sessions.user_id
+      WHERE sessions.token_hash = ? AND sessions.expires_at > ?
+      LIMIT 1
+    `)
+  for (const { token, source } of tokens) {
+    const row = sessionQuery.get(hashToken(token), now)
+    if (!row) continue
+    const requestedUserId = req.headers['x-user-id']
+    if (source !== 'cookie' && typeof requestedUserId === 'string' && requestedUserId !== row.id) continue
+    return {
+      actor: rowToUser(row),
+      authSession: {
+        userId: row.id,
+        token,
+        startedAt: row.session_created_at,
+        expiresAt: row.session_expires_at,
+      },
+    }
   }
-  return {
-    actor: rowToUser(row),
-    authSession: {
-      userId: row.id,
-      token,
-      startedAt: row.session_created_at,
-      expiresAt: row.session_expires_at,
-    },
-  }
+  return { actor: null, authSession: null }
 }
 
 function normalizeEmail(value) {
@@ -2183,7 +2366,10 @@ function getRequestBaseUrl(req, settings) {
       // Referer is advisory; fall through to Host.
     }
   }
-  return `http://${req.headers.host || `${host}:${port}`}`.replace(/\/+$/, '')
+  const forwardedProto = getHeaderValue(req.headers, 'x-forwarded-proto').split(',')[0]?.trim()
+  const forwardedHost = getHeaderValue(req.headers, 'x-forwarded-host').split(',')[0]?.trim()
+  const protocol = forwardedProto === 'https' || forwardedProto === 'http' ? forwardedProto : 'http'
+  return `${protocol}://${forwardedHost || req.headers.host || `${host}:${port}`}`.replace(/\/+$/, '')
 }
 
 function assertEmailConfigured(settings) {
@@ -2324,7 +2510,7 @@ async function startEmailRegistration(req, body) {
   }
 
   return {
-    ...getState(null, null),
+    ...getPublicState(),
     emailVerification: {
       required: true,
       email,
@@ -2696,7 +2882,7 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'GET' && path === '/state') {
       const { actor, authSession } = requireActor(req)
-      return json(res, 200, getState(actor, authSession))
+      return json(res, 200, actor ? getState(actor, authSession) : getPublicState())
     }
 
     if (req.method === 'POST' && path === '/bootstrap-from-client') {
@@ -2736,19 +2922,25 @@ const server = http.createServer(async (req, res) => {
       const now = Date.now()
       db.prepare('UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?').run(now, now, row.id)
       const user = getUser(row.id)
-      return json(res, 200, getState(user, createSession(row.id)))
+      const authSession = createSession(row.id)
+      return json(res, 200, getState(user, authSession), {
+        'Set-Cookie': createAuthCookie(authSession.token, authSession.expiresAt),
+      })
     }
 
     if (req.method === 'POST' && path === '/auth/logout') {
-      const token = getBearerToken(req)
-      if (token) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashToken(token))
-      return json(res, 200, getState(null, null))
+      for (const { token } of getRequestTokens(req)) {
+        db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashToken(token))
+      }
+      return json(res, 200, getPublicState(), {
+        'Set-Cookie': clearAuthCookie(),
+      })
     }
 
     if (req.method === 'PATCH' && path === '/settings/email' && getUserCount() === 0) {
       const body = await readJson(req)
       updateEmailSettings(isRecord(body.settings) ? body.settings : body)
-      return json(res, 200, getState(null, null))
+      return json(res, 200, getPublicState())
     }
 
     const { actor, authSession } = requireActor(req)
@@ -2918,7 +3110,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'PATCH' && path === '/settings/api') {
       const body = await readJson(req)
       const settings = isRecord(body.settings) ? body.settings : body
-      setApiSettings(settings)
+      updateApiSettings(settings)
       return json(res, 200, getState(getUser(actor.id), authSession))
     }
 
