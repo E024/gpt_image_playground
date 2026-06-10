@@ -12,6 +12,7 @@ import { downloadImageEntriesAsZip, downloadImageIds, getImageZipEntries } from 
 import { isAgentTaskPromptPending } from '../lib/taskPromptDisplay'
 import { replaceImageMentionsForApi } from '../lib/promptImageMentions'
 import { CloseIcon, CodeIcon, CopyIcon, DownloadIcon, EditIcon, LinkIcon, TrashIcon } from './icons'
+import AgentReferenceText from './AgentReferenceText'
 
 import ViewportTooltip from './ViewportTooltip'
 
@@ -209,7 +210,7 @@ export default function DetailModal() {
   const currentImageRatio = currentOutputImageId ? imageRatios[currentOutputImageId] : ''
   const currentImageSize = currentOutputImageId ? imageSizes[currentOutputImageId] : ''
   const currentActualParams = currentOutputImageId ? task.actualParamsByImage?.[currentOutputImageId] : undefined
-  const currentRevisedPrompt = currentOutputImageId ? task.revisedPromptByImage?.[currentOutputImageId]?.trim() : ''
+  const currentRevisedPrompt = currentOutputImageId ? task.revisedPromptByImage?.[currentOutputImageId]?.trim() ?? '' : ''
   // 将 @图N 等 mention 标记和透明背景追加提示词都按实际请求内容比较，
   // 避免仅由本地请求预处理导致的不一致被当作“API 改写”。
   const requestPrompt = task.transparentOutput && task.transparentPrompt
@@ -802,16 +803,18 @@ export default function DetailModal() {
                 <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">输入内容将在响应完成时接收</p>
               </div>
             ) : (
-              <p className="text-sm text-gray-700 dark:text-gray-300 leading-relaxed whitespace-pre-wrap mb-4">
-                {task.prompt || '(无提示词)'}
-              </p>
+              <AgentReferenceText
+                as="p"
+                text={task.prompt}
+                fallback="(无提示词)"
+                className="text-sm text-gray-700 dark:text-gray-300 leading-relaxed whitespace-pre-wrap mb-4"
+              />
             )}
             {showRevisedPrompt && currentRevisedPrompt && (
               <div className="mb-4">
-                <ActualValueBadge
-                  value={currentRevisedPrompt}
-                  className="max-w-full rounded px-2 py-1 text-left text-xs leading-relaxed whitespace-pre-wrap"
-                />
+                <div className="max-w-full rounded bg-amber-50 px-2 py-1 text-left text-xs font-medium leading-relaxed text-amber-700 whitespace-pre-wrap ring-1 ring-amber-200 dark:bg-amber-400/10 dark:text-amber-200 dark:ring-amber-300/20">
+                  <AgentReferenceText text={currentRevisedPrompt} />
+                </div>
               </div>
             )}
 

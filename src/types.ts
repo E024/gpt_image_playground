@@ -94,9 +94,6 @@ export interface AppSettings {
   apiProxy: boolean
   streamImages?: boolean
   streamPartialImages?: number
-  managementConfigUrl?: string
-  managementConfigAuthToken?: string
-  managementConfigUpdatedAt?: number
   customProviders: CustomProviderDefinition[]
   providerOrder?: string[]
   clearInputAfterSubmit: boolean
@@ -116,6 +113,35 @@ export interface AppSettings {
 
 export interface SystemSettings {
   siteName: string
+  agentEnabled: boolean
+}
+
+export type ImageStorageProvider = 'pressdown' | 'r2'
+
+export interface PressdownStorageSettings {
+  enabled: boolean
+  signatureUrl: string
+  displayMode: 'cloud' | 'local'
+}
+
+export interface R2StorageSettings {
+  enabled: boolean
+  accountId: string
+  accessKeyId: string
+  secretAccessKey?: string
+  hasSecretAccessKey?: boolean
+  bucket: string
+  prefix: string
+  publicHost: string
+  presignTtlSeconds: number
+}
+
+export interface ImageStorageSettings {
+  enabled: boolean
+  primary: ImageStorageProvider
+  fallback: ImageStorageProvider | 'none'
+  pressdown: PressdownStorageSettings
+  r2: R2StorageSettings
 }
 
 // ===== 任务参数 =====
@@ -572,6 +598,14 @@ export interface ResponsesOutputItem {
   output_compression?: number
   moderation?: string
   revised_prompt?: string
+  upstream_conversation_id?: string
+  upstream_parent_message_id?: string
+  upstream_account_ref?: string
+  generated_images?: Array<{
+    src?: string
+    original_file_id?: string
+    original_gen_id?: string
+  }>
 }
 
 export interface ResponsesApiResponse {

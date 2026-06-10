@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { AgentRound, TaskRecord } from '../types'
 import { DEFAULT_PARAMS } from '../types'
 import { getSelectedImageMentionLabel, getSelectedTextMentionLabel } from './promptImageMentions'
-import { extractAgentReferenceIds, replaceAgentPromptImageReferencesForApi, resolveAgentPromptImageReferences } from './agentImageReferences'
+import { extractAgentReferenceIds, formatAgentReferenceTagsForDisplay, getAgentReferenceDisplayParts, replaceAgentPromptImageReferencesForApi, resolveAgentPromptImageReferences } from './agentImageReferences'
 
 const round = (patch: Partial<AgentRound>): AgentRound => ({
   id: patch.id ?? `round-${patch.index ?? 1}`,
@@ -39,6 +39,22 @@ describe('agent image references', () => {
     expect(extractAgentReferenceIds('参考 <ref id="round-1-image-2" /> 和 <ref id="round-3-reference-1" />')).toEqual([
       'round-1-image-2',
       'round-3-reference-1',
+    ])
+  })
+
+  it('formats internal XML reference tags for visible UI text', () => {
+    expect(formatAgentReferenceTagsForDisplay('基于 <ref id="round-1-image-2" /> 和 <ref id="round-3-reference-1" /> 生成')).toBe(
+      '基于 @第1轮图2 和 @第3轮参考图1 生成',
+    )
+    expect(formatAgentReferenceTagsForDisplay('忽略 <removed_ref id="round-2-image-1" />')).toBe('忽略 @已删除图片')
+  })
+
+  it('parses internal and visible references for highlighted display', () => {
+    expect(getAgentReferenceDisplayParts('基于 <ref id="round-1-image-2" /> 和 @第3轮参考图1')).toEqual([
+      { type: 'text', text: '基于 ' },
+      { type: 'reference', text: '@第1轮图2' },
+      { type: 'text', text: ' 和 ' },
+      { type: 'reference', text: '@第3轮参考图1', removed: false },
     ])
   })
 

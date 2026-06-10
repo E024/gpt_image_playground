@@ -1,4 +1,4 @@
-import type { AppSettings, AuthSession, BillingLedgerEntry, BillingLedgerType, BillingUsageSource, ContentAuditEntry, ContentAuditKind, ContentAuditSource, EmailSettings, EmailVerificationState, ManagedUser, QuotaDeductionPriority, RewardCode, RewardState, SystemSettings, UserGroup, UserPlan } from '../types'
+import type { AppSettings, AuthSession, BillingLedgerEntry, BillingLedgerType, BillingUsageSource, ContentAuditEntry, ContentAuditKind, ContentAuditSource, EmailSettings, EmailVerificationState, ImageStorageSettings, ManagedUser, QuotaDeductionPriority, RewardCode, RewardState, SystemSettings, UserGroup, UserPlan } from '../types'
 
 export interface BackendState {
   groups: UserGroup[]
@@ -11,6 +11,7 @@ export interface BackendState {
   adminApiSettings: AppSettings | null
   systemSettings: SystemSettings
   emailSettings: EmailSettings | null
+  imageStorageSettings: ImageStorageSettings
   emailVerification?: EmailVerificationState
   rewardState: RewardState
 }
@@ -60,6 +61,22 @@ export type ContentAuditInput = Omit<ContentAuditEntry, 'id' | 'clientRecordId' 
 }
 
 export type RewardCodeInput = Omit<RewardCode, 'id' | 'redeemedCount' | 'createdAt' | 'updatedAt'>
+
+export interface BackendImageUploadInput {
+  dataUrl: string
+  filename?: string
+  contentType?: string
+  source?: 'gallery' | 'agent' | 'upload' | 'generated'
+  taskId?: string
+}
+
+export interface BackendImageUploadResult {
+  uploaded: boolean
+  provider?: 'pressdown' | 'r2'
+  url?: string
+  key?: string
+  fallbackUsed?: boolean
+}
 
 async function request<T>(path: string, options: RequestInit & { session?: AuthSession | null } = {}): Promise<T> {
   const headers = new Headers(options.headers)
@@ -150,16 +167,20 @@ export function backendUpdateApiSettings(settings: AppSettings, session?: AuthSe
   return request<BackendState>('/settings/api', { method: 'PATCH', body: JSON.stringify({ settings }), session })
 }
 
-export function backendSyncManagementApiConfig(input: { url?: string; authToken?: string }, session?: AuthSession | null) {
-  return request<BackendState>('/settings/api/management-config', { method: 'POST', body: JSON.stringify(input), session })
-}
-
 export function backendUpdateEmailSettings(settings: EmailSettings, session?: AuthSession | null) {
   return request<BackendState>('/settings/email', { method: 'PATCH', body: JSON.stringify({ settings }), session })
 }
 
 export function backendUpdateSystemSettings(settings: SystemSettings, session?: AuthSession | null) {
   return request<BackendState>('/settings/system', { method: 'PATCH', body: JSON.stringify({ settings }), session })
+}
+
+export function backendUpdateImageStorageSettings(settings: ImageStorageSettings, session?: AuthSession | null) {
+  return request<BackendState>('/settings/storage', { method: 'PATCH', body: JSON.stringify({ settings }), session })
+}
+
+export function backendUploadImage(input: BackendImageUploadInput, session?: AuthSession | null) {
+  return request<BackendImageUploadResult>('/image-storage/upload', { method: 'POST', body: JSON.stringify(input), session })
 }
 
 export function backendGrantUserQuota(userId: string, amount: number, note: string, session?: AuthSession | null) {

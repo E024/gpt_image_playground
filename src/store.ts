@@ -20,6 +20,7 @@ import type {
   BillingLedgerEntry,
   EmailSettings,
   EmailVerificationState,
+  ImageStorageSettings,
   ManagedUser,
   QuotaDeductionPriority,
   RewardCode,
@@ -53,10 +54,11 @@ import {
   storeImage,
 } from './lib/db'
 import { callImageApi } from './lib/api'
-import { callAgentConversationTitleApi, callAgentResponsesApi, callBatchImageSingle, parseBatchImageCallArguments, type AgentApiResultImage } from './lib/agentApi'
+import { callAgentConversationTitleApi, callAgentResponsesApi, callBatchImageSingle, parseBatchImageCallArguments, type AgentApiResultImage, type AgentReferenceUpstreamState } from './lib/agentApi'
 import { collectAgentRoundOutputImageSlots, extractAgentReferenceIds, getAgentCurrentReferenceId, getAgentGeneratedImageReferenceId, replaceAgentPromptImageReferencesForApi } from './lib/agentImageReferences'
+import { extractAgentMarkdownImages } from './lib/agentMarkdownImages'
 import { showBrowserNotification } from './lib/browserNotification'
-import { IMAGE_FETCH_CORS_HINT } from './lib/imageApiShared'
+import { IMAGE_FETCH_CORS_HINT, fetchImageUrlAsDataUrl } from './lib/imageApiShared'
 import { getFalErrorMessage, getFalQueuedImageResult } from './lib/falAiImageApi'
 import { getCustomQueuedImageResult } from './lib/openaiCompatibleImageApi'
 import { validateMaskMatchesImage } from './lib/canvasImage'
@@ -79,16 +81,17 @@ import {
   backendRegister,
   backendRedeemRewardCode,
   backendSetUserQuota,
-  backendSyncManagementApiConfig,
   backendUpdateCheckinSettings,
   backendUpdateApiSettings,
   backendUpdateEmailSettings,
   backendUpdateGroup,
+  backendUpdateImageStorageSettings,
   backendUpdateSystemSettings,
   backendUpdateMyQuotaPriority,
   backendUpdatePlan,
   backendUpdateRewardCode,
   backendUpdateUser,
+  backendUploadImage,
   fetchBackendState,
   type RewardCodeInput,
   type BackendState,
@@ -113,15 +116,22 @@ let thumbnailBackfillScheduled = false
 const MAX_IMAGE_CACHE_ENTRIES = 8
 const MAX_THUMBNAIL_CACHE_ENTRIES = 80
 const MAX_THUMBNAIL_BACKFILL_CONCURRENT = 4
+const CONTENT_AUDIT_PREVIEW_LIMIT = 4
 const FAL_RECOVERY_POLL_MS = 10_000
 const CUSTOM_RECOVERY_POLL_MS = 10_000
 const SUPPORT_PROMPT_IMAGE_THRESHOLD = 50
 const AGENT_INPUT_DRAFT_RETENTION_MS = 3 * 24 * 60 * 60 * 1000
 const AGENT_ROUND_IMAGE_MENTION_RE = /@(?:第)?(\d+)轮图(\d+)/g
+const OUTPUT_FORMAT_MIME: Record<TaskParams['output_format'], string> = {
+  png: 'image/png',
+  jpeg: 'image/jpeg',
+  webp: 'image/webp',
+}
 const falRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const customRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const openAIWatchdogTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const agentRoundControllers = new Map<string, AbortController>()
+const agentMarkdownImageRepairKeys = new Set<string>()
 let agentConversationPersistenceReady = false
 let agentConversationMigrationPending = false
 const OPENAI_INTERRUPTED_ERROR = '请求中断'
@@ -193,8 +203,30 @@ const DEFAULT_REWARD_STATE: RewardState = {
   myRedemptions: [],
   myCheckins: [],
 }
+
+const DEFAULT_IMAGE_STORAGE_SETTINGS: ImageStorageSettings = {
+  enabled: false,
+  primary: 'pressdown',
+  fallback: 'r2',
+  pressdown: {
+    enabled: false,
+    signatureUrl: 'https://api.pressdown.co/v1/file/notAuthSignature/mannequin',
+    displayMode: 'cloud',
+  },
+  r2: {
+    enabled: false,
+    accountId: '',
+    accessKeyId: '',
+    secretAccessKey: '',
+    bucket: '',
+    prefix: 'images',
+    publicHost: '',
+    presignTtlSeconds: 3600,
+  },
+}
 const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   siteName: '造像台',
+  agentEnabled: true,
 }
 const BACKEND_MANAGED_SETTING_KEYS: Array<keyof AppSettings> = [
   'baseUrl',
@@ -206,9 +238,6 @@ const BACKEND_MANAGED_SETTING_KEYS: Array<keyof AppSettings> = [
   'apiProxy',
   'streamImages',
   'streamPartialImages',
-  'managementConfigUrl',
-  'managementConfigAuthToken',
-  'managementConfigUpdatedAt',
   'customProviders',
   'providerOrder',
   'reuseTaskApiProfileTemporarily',
@@ -234,8 +263,18 @@ export function canManagedUserUseAgent(user: ManagedUser | null | undefined) {
   return Boolean(user && (user.role === 'admin' || user.canUseAgent !== false))
 }
 
-function canCurrentUserUseAgent(state: Pick<AppState, 'users' | 'authSession'>) {
-  return canManagedUserUseAgent(getCurrentManagedUser(state))
+export function isAgentFeatureEnabled(systemSettings: SystemSettings | null | undefined) {
+  return systemSettings?.agentEnabled !== false
+}
+
+function getCurrentUserAgentAccessError(state: Pick<AppState, 'users' | 'authSession' | 'systemSettings'>) {
+  if (!isAgentFeatureEnabled(state.systemSettings)) return 'Agent 功能已由管理员关闭'
+  if (!canManagedUserUseAgent(getCurrentManagedUser(state))) return '当前账号未开通 Agent 权限'
+  return ''
+}
+
+function canCurrentUserUseAgent(state: Pick<AppState, 'users' | 'authSession' | 'systemSettings'>) {
+  return !getCurrentUserAgentAccessError(state)
 }
 
 function canCurrentUserManageBackendSettings(state: Pick<AppState, 'users' | 'authSession'>) {
@@ -937,6 +976,7 @@ function mergePersistedState(persistedState: unknown, currentState: AppState): A
     rewardState: DEFAULT_REWARD_STATE,
     systemSettings: currentState.systemSettings,
     emailSettings: null,
+    imageStorageSettings: DEFAULT_IMAGE_STORAGE_SETTINGS,
     emailVerification: null,
     activeFavoriteCollectionId: null,
     favoritePickerTaskIds: null,
@@ -962,11 +1002,12 @@ interface AppState {
   setSettings: (s: Partial<AppSettings>) => void
   adminApiSettings: AppSettings | null
   updateApiSettings: (settings: AppSettings) => Promise<void>
-  syncManagementApiConfig: (input: { url?: string; authToken?: string }) => Promise<boolean>
   systemSettings: SystemSettings
   updateSystemSettings: (settings: SystemSettings) => Promise<void>
   emailSettings: EmailSettings | null
   updateEmailSettings: (settings: EmailSettings) => Promise<void>
+  imageStorageSettings: ImageStorageSettings
+  updateImageStorageSettings: (settings: ImageStorageSettings) => Promise<void>
   dismissedCodexCliPrompts: string[]
   dismissCodexCliPrompt: (key: string) => void
 
@@ -1406,6 +1447,33 @@ function normalizeRewardState(value: unknown): RewardState {
   }
 }
 
+function normalizeImageStorageSettings(value: unknown): ImageStorageSettings {
+  if (!isRecord(value)) return DEFAULT_IMAGE_STORAGE_SETTINGS
+  const pressdown = isRecord(value.pressdown) ? value.pressdown : {}
+  const r2 = isRecord(value.r2) ? value.r2 : {}
+  return {
+    enabled: typeof value.enabled === 'boolean' ? value.enabled : false,
+    primary: value.primary === 'r2' ? 'r2' : 'pressdown',
+    fallback: value.fallback === 'pressdown' || value.fallback === 'r2' || value.fallback === 'none' ? value.fallback : 'r2',
+    pressdown: {
+      enabled: typeof pressdown.enabled === 'boolean' ? pressdown.enabled : false,
+      signatureUrl: typeof pressdown.signatureUrl === 'string' ? pressdown.signatureUrl : DEFAULT_IMAGE_STORAGE_SETTINGS.pressdown.signatureUrl,
+      displayMode: pressdown.displayMode === 'local' ? 'local' : 'cloud',
+    },
+    r2: {
+      enabled: typeof r2.enabled === 'boolean' ? r2.enabled : false,
+      accountId: typeof r2.accountId === 'string' ? r2.accountId : '',
+      accessKeyId: typeof r2.accessKeyId === 'string' ? r2.accessKeyId : '',
+      secretAccessKey: typeof r2.secretAccessKey === 'string' ? r2.secretAccessKey : '',
+      hasSecretAccessKey: typeof r2.hasSecretAccessKey === 'boolean' ? r2.hasSecretAccessKey : false,
+      bucket: typeof r2.bucket === 'string' ? r2.bucket : '',
+      prefix: typeof r2.prefix === 'string' && r2.prefix.trim() ? r2.prefix : 'images',
+      publicHost: typeof r2.publicHost === 'string' ? r2.publicHost : '',
+      presignTtlSeconds: normalizeNonNegativeInteger(r2.presignTtlSeconds, 3600) || 3600,
+    },
+  }
+}
+
 function normalizeEmailSettings(value: unknown): EmailSettings | null {
   if (!isRecord(value)) return null
   return {
@@ -1432,7 +1500,10 @@ function normalizeSystemSettings(value: unknown): SystemSettings {
   const siteName = typeof value.siteName === 'string' && value.siteName.trim()
     ? value.siteName.trim().slice(0, 80)
     : DEFAULT_SYSTEM_SETTINGS.siteName
-  return { siteName }
+  return {
+    siteName,
+    agentEnabled: value.agentEnabled !== false,
+  }
 }
 
 function normalizeEmailVerification(value: unknown): EmailVerificationState | null {
@@ -1488,6 +1559,7 @@ function applyBackendStatePatch(state: BackendState) {
     adminApiSettings: state.adminApiSettings ? normalizeSettings(state.adminApiSettings) : null,
     systemSettings: normalizeSystemSettings(state.systemSettings),
     emailSettings: normalizeEmailSettings(state.emailSettings),
+    imageStorageSettings: normalizeImageStorageSettings(state.imageStorageSettings),
     emailVerification: normalizeEmailVerification(state.emailVerification),
   })
 }
@@ -1707,8 +1779,9 @@ export const useStore = create<AppState>()(
         }
 
         const state = get()
-        if (!canCurrentUserUseAgent(state)) {
-          state.showToast('当前账号未开通 Agent 权限', 'error')
+        const agentAccessError = getCurrentUserAgentAccessError(state)
+        if (agentAccessError) {
+          state.showToast(agentAccessError, 'error')
           return
         }
         const settings = normalizeSettings(state.settings)
@@ -1813,6 +1886,7 @@ export const useStore = create<AppState>()(
       adminApiSettings: null,
       systemSettings: DEFAULT_SYSTEM_SETTINGS,
       emailSettings: null,
+      imageStorageSettings: DEFAULT_IMAGE_STORAGE_SETTINGS,
       updateApiSettings: async (settings) => {
         try {
           applyBackendStatePatch(await backendUpdateApiSettings(normalizeSettings(settings), get().authSession))
@@ -1821,19 +1895,12 @@ export const useStore = create<AppState>()(
           get().showToast(error instanceof Error ? error.message : '保存 API 配置失败', 'error')
         }
       },
-      syncManagementApiConfig: async (input) => {
-        try {
-          applyBackendStatePatch(await backendSyncManagementApiConfig(input, get().authSession))
-          get().showToast('管理配置已同步', 'success')
-          return true
-        } catch (error) {
-          get().showToast(error instanceof Error ? error.message : '同步管理配置失败', 'error')
-          return false
-        }
-      },
       updateSystemSettings: async (settings) => {
         try {
-          applyBackendStatePatch(await backendUpdateSystemSettings({ siteName: settings.siteName.trim() }, get().authSession))
+          applyBackendStatePatch(await backendUpdateSystemSettings({
+            siteName: settings.siteName.trim(),
+            agentEnabled: settings.agentEnabled !== false,
+          }, get().authSession))
           get().showToast('系统设置已保存', 'success')
         } catch (error) {
           get().showToast(error instanceof Error ? error.message : '保存系统设置失败', 'error')
@@ -1845,6 +1912,14 @@ export const useStore = create<AppState>()(
           get().showToast('邮箱验证配置已保存', 'success')
         } catch (error) {
           get().showToast(error instanceof Error ? error.message : '保存邮箱配置失败', 'error')
+        }
+      },
+      updateImageStorageSettings: async (settings) => {
+        try {
+          applyBackendStatePatch(await backendUpdateImageStorageSettings(settings, get().authSession))
+          get().showToast('图床存储配置已保存', 'success')
+        } catch (error) {
+          get().showToast(error instanceof Error ? error.message : '保存图床配置失败', 'error')
         }
       },
       dismissedCodexCliPrompts: [],
@@ -1900,6 +1975,7 @@ export const useStore = create<AppState>()(
             rewardState: DEFAULT_REWARD_STATE,
             systemSettings: DEFAULT_SYSTEM_SETTINGS,
             emailSettings: null,
+            imageStorageSettings: DEFAULT_IMAGE_STORAGE_SETTINGS,
             emailVerification: null,
             authSession: null,
             adminApiSettings: null,
@@ -1919,6 +1995,7 @@ export const useStore = create<AppState>()(
           rewardState: DEFAULT_REWARD_STATE,
           systemSettings: DEFAULT_SYSTEM_SETTINGS,
           emailSettings: null,
+          imageStorageSettings: DEFAULT_IMAGE_STORAGE_SETTINGS,
           emailVerification: null,
           appMode: 'gallery',
           adminApiSettings: null,
@@ -2704,9 +2781,36 @@ function reportContentAuditRecord(input: ContentAuditInput) {
   })
 }
 
-function createTaskContentAuditInput(task: TaskRecord): ContentAuditInput | null {
+async function getContentAuditImagePreviews(imageIds: string[]) {
+  const previews: string[] = []
+  for (const imageId of imageIds.slice(0, CONTENT_AUDIT_PREVIEW_LIMIT)) {
+    try {
+      const thumbnail = await getImageThumbnail(imageId)
+      if (thumbnail?.thumbnailDataUrl) {
+        previews.push(thumbnail.thumbnailDataUrl)
+        cacheThumbnail(imageId, {
+          dataUrl: thumbnail.thumbnailDataUrl,
+          width: thumbnail.width,
+          height: thumbnail.height,
+          thumbnailVersion: thumbnail.thumbnailVersion,
+        })
+        continue
+      }
+      const dataUrl = await ensureImageCached(imageId)
+      if (dataUrl) previews.push(dataUrl)
+    } catch (error) {
+      console.warn('生成内容审计图片预览失败', error)
+    }
+  }
+  return previews
+}
+
+async function createTaskContentAuditInput(task: TaskRecord): Promise<ContentAuditInput | null> {
   if (task.status !== 'done') return null
   if (task.outputImages.length === 0 && !task.rawImageUrls?.length) return null
+  const auditImagePreviews = task.rawImageUrls?.length
+    ? []
+    : await getContentAuditImagePreviews(task.outputImages)
 
   return {
     id: `image:${task.id}`,
@@ -2741,6 +2845,7 @@ function createTaskContentAuditInput(task: TaskRecord): ContentAuditInput | null
       agentToolAction: task.agentToolAction ?? '',
       elapsed: task.elapsed,
       rawResponsePayloadAvailable: Boolean(task.rawResponsePayload),
+      auditImagePreviews,
     },
     elapsedMs: task.elapsed,
     createdAt: task.createdAt,
@@ -2748,8 +2853,8 @@ function createTaskContentAuditInput(task: TaskRecord): ContentAuditInput | null
   }
 }
 
-function reportTaskContentAudit(task: TaskRecord) {
-  const input = createTaskContentAuditInput(task)
+async function reportTaskContentAudit(task: TaskRecord) {
+  const input = await createTaskContentAuditInput(task)
   if (input) reportContentAuditRecord(input)
 }
 
@@ -2777,40 +2882,47 @@ function reportAgentRoundContentAudit(
     .map((taskId) => state.tasks.find((task) => task.id === taskId))
     .filter((task): task is TaskRecord => Boolean(task))
   const finishedAt = round.finishedAt ?? Date.now()
-  reportContentAuditRecord({
-    id: `chat:${conversationId}:${roundId}`,
-    kind: 'chat',
-    source: 'agent',
-    taskId: '',
-    conversationId,
-    roundId,
-    messageId: assistantMessage.id,
-    prompt: round.prompt || userMessage?.content || '',
-    assistantText: assistantMessage.content,
-    imageUrls: outputTasks.flatMap((task) => task.rawImageUrls ?? []),
-    imageIds: outputTasks.flatMap((task) => task.outputImages),
-    inputImageIds: round.inputImageIds,
-    outputTaskIds: taskIds,
-    apiProvider: String(activeProfile.provider ?? ''),
-    apiMode: activeProfile.apiMode,
-    apiModel: activeProfile.model,
-    apiProfileName: activeProfile.name,
-    metadata: {
-      conversationTitle: conversation.title,
-      roundIndex: round.index,
-      responseId: meta.responseId ?? '',
-      params,
-      outputImageCount: outputTasks.reduce((sum, task) => sum + task.outputImages.length, 0),
-      toolCallsUsed: meta.toolCallsUsed,
-      reachedToolLimit: meta.reachedToolLimit,
-      maxToolCalls: meta.maxToolCalls,
-      maskTargetImageId: round.maskTargetImageId ?? null,
-      maskImageId: round.maskImageId ?? null,
-    },
-    elapsedMs: Math.max(0, finishedAt - round.createdAt),
-    createdAt: round.createdAt,
-    finishedAt,
-  })
+  void getContentAuditImagePreviews(outputTasks.flatMap((task) => task.outputImages))
+    .then((auditImagePreviews) => {
+      reportContentAuditRecord({
+        id: `chat:${conversationId}:${roundId}`,
+        kind: 'chat',
+        source: 'agent',
+        taskId: '',
+        conversationId,
+        roundId,
+        messageId: assistantMessage.id,
+        prompt: round.prompt || userMessage?.content || '',
+        assistantText: assistantMessage.content,
+        imageUrls: outputTasks.flatMap((task) => task.rawImageUrls ?? []),
+        imageIds: outputTasks.flatMap((task) => task.outputImages),
+        inputImageIds: round.inputImageIds,
+        outputTaskIds: taskIds,
+        apiProvider: String(activeProfile.provider ?? ''),
+        apiMode: activeProfile.apiMode,
+        apiModel: activeProfile.model,
+        apiProfileName: activeProfile.name,
+        metadata: {
+          conversationTitle: conversation.title,
+          roundIndex: round.index,
+          responseId: meta.responseId ?? '',
+          params,
+          outputImageCount: outputTasks.reduce((sum, task) => sum + task.outputImages.length, 0),
+          toolCallsUsed: meta.toolCallsUsed,
+          reachedToolLimit: meta.reachedToolLimit,
+          maxToolCalls: meta.maxToolCalls,
+          maskTargetImageId: round.maskTargetImageId ?? null,
+          maskImageId: round.maskImageId ?? null,
+          auditImagePreviews,
+        },
+        elapsedMs: Math.max(0, finishedAt - round.createdAt),
+        createdAt: round.createdAt,
+        finishedAt,
+      })
+    })
+    .catch((error) => {
+      console.warn('上报 Agent 内容审计记录失败', error)
+    })
 }
 
 function clearFalRecoveryTimer(taskId: string) {
@@ -2905,13 +3017,13 @@ async function completeRecoveredFalTask(task: TaskRecord, result: Awaited<Return
   const latest = useStore.getState().tasks.find((item) => item.id === task.id)
   if (!latest || latest.status === 'done') return
 
-  const { outputIds, outputDataUrls, transparentOriginalImageIds } = await storeTaskOutputImages(task, result.images)
+  const { outputIds, outputDataUrls, remoteImageUrls, transparentOriginalImageIds } = await storeTaskOutputImages(task, result.images)
   const actualParamsList = await resolveImageSizeParamsList(outputDataUrls, result.actualParamsList)
 
   updateTaskInStore(task.id, {
     outputImages: outputIds,
     transparentOriginalImages: transparentOriginalImageIds,
-    rawImageUrls: result.rawImageUrls?.length ? result.rawImageUrls : undefined,
+    rawImageUrls: resolveStoredRawImageUrls(remoteImageUrls, result.rawImageUrls),
     actualParams: firstActualParams(actualParamsList),
     actualParamsByImage: mapActualParamsByImage(outputIds, actualParamsList),
     revisedPromptByImage: undefined,
@@ -3316,6 +3428,93 @@ function updateAgentConversation(conversationId: string, updater: (conversation:
   }))
 }
 
+export async function repairAgentMarkdownImageTasks(conversationId: string) {
+  const state = useStore.getState()
+  const conversation = state.agentConversations.find((item) => item.id === conversationId)
+  if (!conversation) return
+
+  const activeProfile = getActiveApiProfile(state.settings)
+  const fallbackMime = OUTPUT_FORMAT_MIME[state.params.output_format] ?? 'image/png'
+
+  for (const round of conversation.rounds) {
+    if (round.outputTaskIds.length > 0) continue
+    const assistantMessage = round.assistantMessageId
+      ? conversation.messages.find((message) => message.id === round.assistantMessageId)
+      : conversation.messages.find((message) => message.roundId === round.id && message.role === 'assistant')
+    if (!assistantMessage?.content) continue
+
+    const markdownImages = extractAgentMarkdownImages(assistantMessage.content)
+    if (markdownImages.length === 0) continue
+
+    const newTasks: TaskRecord[] = []
+    for (const image of markdownImages) {
+      const repairKey = `${conversationId}:${round.id}:${image.url}`
+      if (agentMarkdownImageRepairKeys.has(repairKey)) continue
+      agentMarkdownImageRepairKeys.add(repairKey)
+
+      try {
+        const dataUrl = await fetchImageUrlAsDataUrl(image.url, fallbackMime)
+        const storedImage = await storeGeneratedImageRecord(dataUrl, {
+          source: 'agent',
+        })
+        const imgId = storedImage.imageId
+        const actualParams: Partial<TaskParams> = { n: 1 }
+        newTasks.push({
+          id: genId(),
+          prompt: image.alt || round.prompt,
+          params: { ...state.params, n: 1 },
+          apiProvider: activeProfile.provider,
+          apiProfileId: activeProfile.id,
+          apiProfileName: activeProfile.name,
+          apiMode: activeProfile.apiMode,
+          apiModel: activeProfile.model,
+          inputImageIds: round.inputImageIds,
+          maskTargetImageId: round.maskTargetImageId ?? null,
+          maskImageId: round.maskImageId ?? null,
+          outputImages: [imgId],
+          rawImageUrls: [storedImage.remoteUrl ?? image.url],
+          actualParams,
+          actualParamsByImage: { [imgId]: actualParams },
+          status: 'done',
+          error: null,
+          createdAt: round.createdAt,
+          finishedAt: Date.now(),
+          elapsed: null,
+          sourceMode: 'agent',
+          agentConversationId: conversationId,
+          agentRoundId: round.id,
+          agentMessageId: assistantMessage.id,
+          agentToolAction: 'markdown_image',
+        })
+      } catch (error) {
+        useStore.getState().showToast(
+          `Markdown 图片已显示，但未能恢复为可引用图片任务：${error instanceof Error ? error.message : String(error)}`,
+          'error',
+        )
+      }
+    }
+
+    if (newTasks.length === 0) continue
+    useStore.getState().setTasks([...newTasks, ...useStore.getState().tasks])
+    updateAgentConversation(conversationId, (current) => ({
+      ...current,
+      updatedAt: Date.now(),
+      rounds: current.rounds.map((item) =>
+        item.id === round.id
+          ? { ...item, outputTaskIds: [...item.outputTaskIds, ...newTasks.map((task) => task.id)] }
+          : item,
+      ),
+      messages: current.messages.map((message) =>
+        message.id === assistantMessage.id
+          ? { ...message, outputTaskIds: [...new Set([...(message.outputTaskIds ?? []), ...newTasks.map((task) => task.id)])] }
+          : message,
+      ),
+    }))
+    await Promise.all(newTasks.map((task) => putTask(task)))
+    newTasks.forEach(reportTaskContentAudit)
+  }
+}
+
 function getAgentRoundControllerKey(conversationId: string, roundId: string) {
   return `${conversationId}:${roundId}`
 }
@@ -3624,6 +3823,7 @@ function addTaskReferencedImageIds(target: Set<string>, task: TaskRecord) {
 async function storeTaskOutputImages(task: TaskRecord, images: string[]) {
   const outputIds: string[] = []
   const outputDataUrls: string[] = []
+  const remoteImageUrls: string[] = []
   const transparentOriginalImageIds: string[] = []
   const storedImageIds: string[] = []
 
@@ -3631,9 +3831,12 @@ async function storeTaskOutputImages(task: TaskRecord, images: string[]) {
     for (const dataUrl of images) {
       let outputDataUrl = dataUrl
       if (task.transparentOutput) {
-        const originalImgId = await storeImage(dataUrl, 'generated')
+        const originalImage = await storeGeneratedImageRecord(dataUrl, {
+          taskId: task.id,
+          source: task.sourceMode === 'agent' ? 'agent' : 'gallery',
+        })
+        const originalImgId = originalImage.imageId
         storedImageIds.push(originalImgId)
-        cacheImage(originalImgId, dataUrl)
 
         try {
           outputDataUrl = await removeKeyedBackgroundFromDataUrl(dataUrl)
@@ -3647,22 +3850,64 @@ async function storeTaskOutputImages(task: TaskRecord, images: string[]) {
         }
       }
 
-      const imgId = await storeImage(outputDataUrl, 'generated')
+      const storedImage = await storeGeneratedImageRecord(outputDataUrl, {
+        taskId: task.id,
+        source: task.sourceMode === 'agent' ? 'agent' : 'gallery',
+      })
+      const imgId = storedImage.imageId
       storedImageIds.push(imgId)
-      cacheImage(imgId, outputDataUrl)
       outputIds.push(imgId)
       outputDataUrls.push(outputDataUrl)
+      if (storedImage.remoteUrl) remoteImageUrls.push(storedImage.remoteUrl)
     }
 
     return {
       outputIds,
       outputDataUrls,
+      remoteImageUrls,
       transparentOriginalImageIds: transparentOriginalImageIds.length ? transparentOriginalImageIds : undefined,
     }
   } catch (err) {
     await deleteUnreferencedImageIds(storedImageIds)
     throw err
   }
+}
+
+async function uploadGeneratedImageToBackend(
+  dataUrl: string,
+  options: { taskId?: string; source?: 'gallery' | 'agent' | 'upload' | 'generated' } = {},
+) {
+  const { authSession, imageStorageSettings } = useStore.getState()
+  if (!authSession || !imageStorageSettings.enabled) return null
+  try {
+    const contentType = dataUrl.match(/^data:([^;,]+);base64,/)?.[1] || 'image/png'
+    const result = await backendUploadImage({
+      dataUrl,
+      contentType,
+      source: options.source ?? 'generated',
+      taskId: options.taskId,
+    }, authSession)
+    return result.uploaded && result.url ? result.url : null
+  } catch (error) {
+    console.warn('图床上传失败，已保留本地 IndexedDB 图片：', error)
+    return null
+  }
+}
+
+async function storeGeneratedImageRecord(
+  dataUrl: string,
+  options: { taskId?: string; source?: 'gallery' | 'agent' | 'upload' | 'generated' } = {},
+) {
+  const remoteUrl = await uploadGeneratedImageToBackend(dataUrl, options)
+  const storedSrc = remoteUrl ?? dataUrl
+  const imageId = await storeImage(storedSrc, 'generated')
+  cacheImage(imageId, storedSrc)
+  return { imageId, storedSrc, remoteUrl }
+}
+
+function resolveStoredRawImageUrls(remoteImageUrls: string[], upstreamRawImageUrls?: string[]) {
+  if (remoteImageUrls.length > 0) return remoteImageUrls
+  return upstreamRawImageUrls?.length ? upstreamRawImageUrls : undefined
 }
 
 async function deleteUnreferencedImageIds(imageIds: Iterable<string>) {
@@ -3707,9 +3952,14 @@ async function readAgentImageDataUrls(ids: string[]) {
   const dataUrls: string[] = []
   for (const id of ids) {
     const dataUrl = await ensureImageCached(id)
-    if (dataUrl) dataUrls.push(dataUrl)
+    if (dataUrl) dataUrls.push(await resolveStoredImageForApi(dataUrl))
   }
   return dataUrls
+}
+
+async function resolveStoredImageForApi(src: string, fallbackMime = 'image/png') {
+  if (/^https?:\/\//i.test(src)) return fetchImageUrlAsDataUrl(src, fallbackMime)
+  return src
 }
 
 async function createAgentUserInputItem(conversation: AgentConversation, round: AgentRound, message: AgentMessage, tasks: TaskRecord[]) {
@@ -3738,15 +3988,17 @@ async function createAgentGeneratedImagesInputItem(round: AgentRound, tasks: Tas
       imageIndex += 1
       continue
     }
-    for (const imageId of task.outputImages) {
+    for (let taskImageIndex = 0; taskImageIndex < task.outputImages.length; taskImageIndex++) {
+      const imageId = task.outputImages[taskImageIndex]
       const dataUrl = await ensureImageCached(imageId)
       if (dataUrl) {
-        contentParts.push({ type: 'input_image', image_url: dataUrl })
+        contentParts.push({ type: 'input_image', image_url: await resolveStoredImageForApi(dataUrl) })
       }
       const refId = getAgentGeneratedImageReferenceId(round, imageIndex)
       const prompt = truncateAgentReferencePrompt(task.prompt || '')
       const promptAttribute = prompt ? ` prompt="${escapeXmlAttribute(prompt)}"` : ''
-      contentParts.push({ type: 'input_text', text: `<ref id="${refId}"${promptAttribute} />` })
+      const upstreamAttributes = getAgentReferenceUpstreamAttributes(task, taskImageIndex)
+      contentParts.push({ type: 'input_text', text: `<ref id="${refId}"${promptAttribute}${upstreamAttributes} />` })
       imageIndex += 1
     }
   }
@@ -3770,12 +4022,14 @@ async function createAgentBatchImagesInputItem(round: AgentRound, tasks: TaskRec
     for (const imgId of task.outputImages) {
       const dataUrl = await ensureImageCached(imgId)
       if (dataUrl) {
-        contentParts.push({ type: 'input_image', image_url: dataUrl })
+        contentParts.push({ type: 'input_image', image_url: await resolveStoredImageForApi(dataUrl) })
       }
       const refId = getAgentGeneratedImageReferenceId(round, imageIndex)
       const prompt = truncateAgentReferencePrompt(task.prompt || '')
       const promptAttribute = prompt ? ` prompt="${escapeXmlAttribute(prompt)}"` : ''
-      contentParts.push({ type: 'input_text', text: `<ref id="${refId}"${promptAttribute} />` })
+      const taskImageIndex = task.outputImages.indexOf(imgId)
+      const upstreamAttributes = getAgentReferenceUpstreamAttributes(task, Math.max(0, taskImageIndex))
+      contentParts.push({ type: 'input_text', text: `<ref id="${refId}"${promptAttribute}${upstreamAttributes} />` })
       imageIndex += 1
     }
   }
@@ -3794,6 +4048,55 @@ function escapeXmlAttribute(value: string) {
 function truncateAgentReferencePrompt(prompt: string) {
   const normalized = prompt.replace(/\s+/g, ' ').trim()
   return normalized.length > 1200 ? `${normalized.slice(0, 1200)}...` : normalized
+}
+
+function getResponseItemUpstreamState(item: ResponsesOutputItem | undefined): AgentReferenceUpstreamState | null {
+  if (!item) return null
+  const state: AgentReferenceUpstreamState = {}
+  if (typeof item.upstream_conversation_id === 'string' && item.upstream_conversation_id.trim()) {
+    state.upstream_conversation_id = item.upstream_conversation_id.trim()
+  }
+  if (typeof item.upstream_parent_message_id === 'string' && item.upstream_parent_message_id.trim()) {
+    state.upstream_parent_message_id = item.upstream_parent_message_id.trim()
+  }
+  if (typeof item.upstream_account_ref === 'string' && item.upstream_account_ref.trim()) {
+    state.upstream_account_ref = item.upstream_account_ref.trim()
+  }
+  return hasAgentReferenceUpstreamState(state) ? state : null
+}
+
+function getResponseOutputUpstreamState(output: ResponsesOutputItem[] | null | undefined): AgentReferenceUpstreamState | null {
+  if (!output?.length) return null
+  for (let index = output.length - 1; index >= 0; index--) {
+    const state = getResponseItemUpstreamState(output[index])
+    if (state) return state
+  }
+  return null
+}
+
+function hasAgentReferenceUpstreamState(state: AgentReferenceUpstreamState | null | undefined) {
+  return Boolean(state?.upstream_conversation_id || state?.upstream_parent_message_id || state?.upstream_account_ref)
+}
+
+function getTaskImageUpstreamState(task: TaskRecord | undefined, imageIndex = 0): AgentReferenceUpstreamState | null {
+  const output = parseResponseOutputFromPayload(task?.rawResponsePayload)
+  if (!output?.length) return null
+  const imageItems = output.filter((item) => item.type === 'image_generation_call')
+  if (task?.agentToolCallId) {
+    const matchingItem = imageItems.find((item) => item.id === task.agentToolCallId)
+    if (matchingItem) return getResponseItemUpstreamState(matchingItem)
+  }
+  return getResponseItemUpstreamState(imageItems[imageIndex] ?? imageItems[0])
+}
+
+function getAgentReferenceUpstreamAttributes(task: TaskRecord | undefined, imageIndex = 0) {
+  const state = getTaskImageUpstreamState(task, imageIndex)
+  if (!state) return ''
+  const attrs: string[] = []
+  if (state.upstream_conversation_id) attrs.push(`upstream_conversation_id="${escapeXmlAttribute(state.upstream_conversation_id)}"`)
+  if (state.upstream_parent_message_id) attrs.push(`upstream_parent_message_id="${escapeXmlAttribute(state.upstream_parent_message_id)}"`)
+  if (state.upstream_account_ref) attrs.push(`upstream_account_ref="${escapeXmlAttribute(state.upstream_account_ref)}"`)
+  return attrs.length ? ` ${attrs.join(' ')}` : ''
 }
 
 function createAgentAssistantFallbackItem(text: string) {
@@ -3999,6 +4302,19 @@ function getAgentRoundResponseOutput(round: AgentRound, tasks: TaskRecord[]): Re
   return null
 }
 
+function getAgentRoundUpstreamState(round: AgentRound, tasks: TaskRecord[]): AgentReferenceUpstreamState | null {
+  return getResponseOutputUpstreamState(getAgentRoundResponseOutput(round, tasks))
+}
+
+function getAgentConversationUpstreamState(conversation: AgentConversation, currentRound: AgentRound, tasks: TaskRecord[]): AgentReferenceUpstreamState | null {
+  const rounds = getAgentRoundPath(conversation, currentRound.id)
+  for (let index = rounds.length - 2; index >= 0; index--) {
+    const state = getAgentRoundUpstreamState(rounds[index], tasks)
+    if (state) return state
+  }
+  return null
+}
+
 async function buildAgentApiInput(conversation: AgentConversation, currentRound: AgentRound, tasks: TaskRecord[]): Promise<unknown[]> {
   const input: unknown[] = []
   const rounds = getAgentRoundPath(conversation, currentRound.id)
@@ -4046,8 +4362,9 @@ async function buildAgentApiInput(conversation: AgentConversation, currentRound:
 export async function submitAgentMessage() {
   const state = useStore.getState()
   const { settings, prompt, inputImages, maskDraft, params, showToast } = state
-  if (!canCurrentUserUseAgent(state)) {
-    showToast('当前账号未开通 Agent 权限', 'error')
+  const agentAccessError = getCurrentUserAgentAccessError(state)
+  if (agentAccessError) {
+    showToast(agentAccessError, 'error')
     state.setAppMode('gallery')
     return
   }
@@ -4205,8 +4522,9 @@ export async function submitAgentMessage() {
 export async function regenerateAgentAssistantMessage(conversationId: string, roundId: string) {
   const state = useStore.getState()
   const { settings, params, showToast } = state
-  if (!canCurrentUserUseAgent(state)) {
-    showToast('当前账号未开通 Agent 权限', 'error')
+  const agentAccessError = getCurrentUserAgentAccessError(state)
+  if (agentAccessError) {
+    showToast(agentAccessError, 'error')
     state.setAppMode('gallery')
     return
   }
@@ -4338,8 +4656,9 @@ async function executeAgentRound(
     const round = conversation.rounds.find((item) => item.id === roundId)
     const userMessage = round ? conversation.messages.find((message) => message.id === round.userMessageId) : null
     if (!round || !userMessage) return
-    const maskDataUrl = round.maskImageId ? await ensureImageCached(round.maskImageId) : undefined
+    let maskDataUrl = round.maskImageId ? await ensureImageCached(round.maskImageId) : undefined
     if (round.maskImageId && !maskDataUrl) throw new Error('遮罩图片已不存在')
+    if (maskDataUrl) maskDataUrl = await resolveStoredImageForApi(maskDataUrl, 'image/png')
 
     const apiInput = await buildAgentApiInput(conversation, round, latestState.tasks)
     if (controller.signal.aborted) throw createAgentAbortError()
@@ -4350,6 +4669,7 @@ async function executeAgentRound(
     const shouldStreamAssistantMessage = activeProfile.streamImages === true
     const streamingTaskIds: string[] = []
     const taskIdByToolCallId = new Map<string, string>()
+    const markdownImageTaskUrls = new Set<string>()
 
     const attachTaskToAgentRound = (taskId: string) => {
       if (streamingTaskIds.includes(taskId)) return
@@ -4425,8 +4745,11 @@ async function executeAgentRound(
       const latestTask = useStore.getState().tasks.find((task) => task.id === taskId)
       if (latestTask?.status === 'done' && latestTask.outputImages.length > 0) return taskId
 
-      const imgId = await storeImage(image.dataUrl, 'generated')
-      cacheImage(imgId, image.dataUrl)
+      const storedImage = await storeGeneratedImageRecord(image.dataUrl, {
+        taskId,
+        source: 'agent',
+      })
+      const imgId = storedImage.imageId
       const actualParams: Partial<TaskParams> = {
         ...(Object.keys(image.actualParams ?? {}).length ? image.actualParams : {}),
         n: 1,
@@ -4437,6 +4760,7 @@ async function executeAgentRound(
         actualParams,
         actualParamsByImage: { [imgId]: actualParams },
         revisedPromptByImage: image.revisedPrompt ? { [imgId]: image.revisedPrompt } : undefined,
+        rawImageUrls: storedImage.remoteUrl ? [storedImage.remoteUrl] : undefined,
         rawResponsePayload,
         status: 'done',
         error: null,
@@ -4448,6 +4772,68 @@ async function executeAgentRound(
       if (completedTask) reportTaskContentAudit(completedTask)
       useStore.getState().setTaskStreamPreview(taskId)
       return taskId
+    }
+
+    const createMarkdownImageTasks = async (content: string, rawResponsePayload?: string) => {
+      const markdownImages = extractAgentMarkdownImages(content)
+        .filter((image) => {
+          if (markdownImageTaskUrls.has(image.url)) return false
+          markdownImageTaskUrls.add(image.url)
+          return true
+        })
+      if (markdownImages.length === 0) return
+
+      const fallbackMime = OUTPUT_FORMAT_MIME[params.output_format] ?? 'image/png'
+      for (const image of markdownImages) {
+        try {
+          const dataUrl = await fetchImageUrlAsDataUrl(image.url, fallbackMime, controller.signal)
+          if (controller.signal.aborted) throw createAgentAbortError()
+
+          const storedImage = await storeGeneratedImageRecord(dataUrl, {
+            source: 'agent',
+          })
+          const imgId = storedImage.imageId
+          const actualParams: Partial<TaskParams> = { n: 1 }
+          const task: TaskRecord = {
+            id: genId(),
+            prompt: image.alt || round.prompt || userMessage.content,
+            params: { ...params, n: 1 },
+            apiProvider: activeProfile.provider,
+            apiProfileId: activeProfile.id,
+            apiProfileName: activeProfile.name,
+            apiMode: activeProfile.apiMode,
+            apiModel: activeProfile.model,
+            inputImageIds: round.inputImageIds ?? [],
+            maskTargetImageId: round.maskTargetImageId ?? null,
+            maskImageId: round.maskImageId ?? null,
+            outputImages: [imgId],
+            rawImageUrls: [storedImage.remoteUrl ?? image.url],
+            actualParams,
+            actualParamsByImage: { [imgId]: actualParams },
+            rawResponsePayload,
+            status: 'done',
+            error: null,
+            createdAt: startedAt,
+            finishedAt: Date.now(),
+            elapsed: Date.now() - startedAt,
+            sourceMode: 'agent',
+            agentConversationId: conversationId,
+            agentRoundId: roundId,
+            agentMessageId: assistantMessageId,
+            agentToolAction: 'markdown_image',
+          }
+          useStore.getState().setTasks([task, ...useStore.getState().tasks])
+          attachTaskToAgentRound(task.id)
+          await putTask(task)
+          reportTaskContentAudit(task)
+        } catch (error) {
+          if (controller.signal.aborted) throw createAgentAbortError()
+          useStore.getState().showToast(
+            `Markdown 图片已显示，但未能转为可引用图片任务：${error instanceof Error ? error.message : String(error)}`,
+            'error',
+          )
+        }
+      }
     }
 
     if (shouldStreamAssistantMessage) {
@@ -4475,6 +4861,7 @@ async function executeAgentRound(
       ? Math.max(1, Math.trunc(requestSettings.agentMaxToolRounds))
       : DEFAULT_AGENT_MAX_TOOL_ROUNDS
     let apiInputForTurn = apiInput
+    let apiUpstreamState = getAgentConversationUpstreamState(conversation, round, latestState.tasks)
     let accumulatedOutputItems: ResponsesOutputItem[] = []
     let accumulatedText = ''
     const textSegments: string[] = []
@@ -4484,9 +4871,10 @@ async function executeAgentRound(
     let pendingToolTextSeparator = false
 
     // Helper: resolve reference image ids to data URLs for batch image calls
-    const resolveReferenceImages = async (referenceIds: string[]): Promise<{ dataUrls: string[]; imageIds: string[] }> => {
+    const resolveReferenceImages = async (referenceIds: string[]): Promise<{ dataUrls: string[]; imageIds: string[]; upstreamState: AgentReferenceUpstreamState | null }> => {
       const dataUrls: string[] = []
       const imageIds: string[] = []
+      let upstreamState: AgentReferenceUpstreamState | null = null
       for (const refId of referenceIds) {
         // Resolve both generated image refs and current/user input refs from XML tags.
         const latestConv = useStore.getState().agentConversations.find((item) => item.id === conversationId)
@@ -4497,24 +4885,32 @@ async function executeAgentRound(
             if (currentRefId === refId) {
               const imageId = r.inputImageIds[imgIdx]
               const dataUrl = await ensureImageCached(imageId)
-              if (dataUrl) dataUrls.push(dataUrl)
+              if (dataUrl) dataUrls.push(await resolveStoredImageForApi(dataUrl))
               imageIds.push(imageId)
             }
           }
-          const outputImages = collectAgentRoundOutputImageSlots(r, useStore.getState().tasks)
-          for (let imgIdx = 0; imgIdx < outputImages.length; imgIdx++) {
-            const generatedRefId = getAgentGeneratedImageReferenceId(r, imgIdx)
-            if (generatedRefId === refId) {
-              const imageId = outputImages[imgIdx]
-              if (!imageId) continue
+          let generatedImageIndex = 0
+          for (const taskId of r.outputTaskIds) {
+            const task = useStore.getState().tasks.find((item) => item.id === taskId)
+            if (!task) {
+              generatedImageIndex += 1
+              continue
+            }
+            for (let taskImageIndex = 0; taskImageIndex < task.outputImages.length; taskImageIndex++) {
+              const generatedRefId = getAgentGeneratedImageReferenceId(r, generatedImageIndex)
+              const imageId = task.outputImages[taskImageIndex]
+              generatedImageIndex += 1
+              if (generatedRefId !== refId || !imageId) continue
+
               const dataUrl = await ensureImageCached(imageId)
-              if (dataUrl) dataUrls.push(dataUrl)
+              if (dataUrl) dataUrls.push(await resolveStoredImageForApi(dataUrl))
               imageIds.push(imageId)
+              upstreamState = upstreamState ?? getTaskImageUpstreamState(task, taskImageIndex)
             }
           }
         }
       }
-      return { dataUrls, imageIds }
+      return { dataUrls, imageIds, upstreamState }
     }
 
     // Helper: execute a generate_image_batch function call concurrently
@@ -4552,6 +4948,7 @@ async function executeAgentRound(
           prompt: item.prompt,
           referenceImageDataUrls: references.dataUrls,
           referenceIds,
+          referenceUpstreamState: references.upstreamState,
           signal: controller.signal,
           onImageToolStarted: shouldStreamAssistantMessage
             ? async () => {
@@ -4624,6 +5021,7 @@ async function executeAgentRound(
         profile: activeProfile,
         params,
         input: apiInputForTurn,
+        upstreamState: apiUpstreamState,
         maskDataUrl,
         signal: controller.signal,
         onTextDelta: shouldStreamAssistantMessage
@@ -4677,6 +5075,7 @@ async function executeAgentRound(
       lastResponseId = result.responseId ?? lastResponseId
       currentResponseOutputItems = currentResponseOutputItems.length ? currentResponseOutputItems : result.outputItems ?? []
       accumulatedOutputItems = mergeResponseOutputItems(accumulatedOutputItems, currentResponseOutputItems)
+      apiUpstreamState = getResponseOutputUpstreamState(currentResponseOutputItems) ?? apiUpstreamState
 
       const responseText = result.text.trim()
       if (responseText && accumulatedText === textBeforeResponse) {
@@ -4686,6 +5085,10 @@ async function executeAgentRound(
       }
       const newTextInThisResponse = accumulatedText.slice(textBeforeResponse.length).trim()
       if (newTextInThisResponse) textSegments.push(newTextInThisResponse)
+      const hasImageToolOutput = currentResponseOutputItems.some((item) =>
+        item.type === 'image_generation_call' ||
+        (item.type === 'function_call' && item.name === 'generate_image_batch')
+      )
 
       // Process built-in image_generation_call results (single images)
       for (const image of result.images) {
@@ -4708,8 +5111,10 @@ async function executeAgentRound(
         }
         const promptRefIds = uniqueIds(extractAgentReferenceIds(image.revisedPrompt ?? ''))
         const promptRefs = await resolveReferenceImages(promptRefIds)
-        const imgId = await storeImage(image.dataUrl, 'generated')
-        cacheImage(imgId, image.dataUrl)
+        const storedImage = await storeGeneratedImageRecord(image.dataUrl, {
+          source: 'agent',
+        })
+        const imgId = storedImage.imageId
         const actualParams: Partial<TaskParams> = {
           ...(Object.keys(image.actualParams ?? {}).length ? image.actualParams : {}),
           n: 1,
@@ -4727,6 +5132,7 @@ async function executeAgentRound(
           maskTargetImageId: round?.maskTargetImageId ?? null,
           maskImageId: round?.maskImageId ?? null,
           outputImages: [imgId],
+          rawImageUrls: storedImage.remoteUrl ? [storedImage.remoteUrl] : undefined,
           actualParams,
           actualParamsByImage: { [imgId]: actualParams },
           revisedPromptByImage: image.revisedPrompt ? { [imgId]: image.revisedPrompt } : undefined,
@@ -4747,6 +5153,10 @@ async function executeAgentRound(
         attachTaskToAgentRound(task.id)
         await putTask(task)
         reportTaskContentAudit(task)
+      }
+
+      if (!hasImageToolOutput && newTextInThisResponse) {
+        await createMarkdownImageTasks(newTextInThisResponse, result.rawResponsePayload)
       }
 
       if (result.rawResponsePayload && streamingTaskIds.length > 0) {
@@ -4982,12 +5392,13 @@ async function executeTask(taskId: string) {
     for (const imgId of task.inputImageIds) {
       const dataUrl = await ensureImageCached(imgId)
       if (!dataUrl) throw new Error('输入图片已不存在')
-      inputDataUrls.push(dataUrl)
+      inputDataUrls.push(await resolveStoredImageForApi(dataUrl, OUTPUT_FORMAT_MIME[task.params.output_format] ?? 'image/png'))
     }
     let maskDataUrl: string | undefined
     if (task.maskImageId) {
       maskDataUrl = await ensureImageCached(task.maskImageId)
       if (!maskDataUrl) throw new Error('遮罩图片已不存在')
+      maskDataUrl = await resolveStoredImageForApi(maskDataUrl, 'image/png')
     }
 
     const requestPrompt = task.transparentOutput && task.transparentPrompt
@@ -5028,7 +5439,7 @@ async function executeTask(taskId: string) {
     }
 
     // 存储输出图片
-    const { outputIds, outputDataUrls, transparentOriginalImageIds } = await storeTaskOutputImages(task, result.images)
+    const { outputIds, outputDataUrls, remoteImageUrls, transparentOriginalImageIds } = await storeTaskOutputImages(task, result.images)
     const isAsyncCustomTask = taskProvider !== 'fal' && taskProvider !== 'openai' && Boolean(customTaskInfo)
     const actualParamsList = taskProvider === 'fal'
       ? await resolveImageSizeParamsList(outputDataUrls, result.actualParamsList)
@@ -5072,7 +5483,7 @@ async function executeTask(taskId: string) {
       outputImages: outputIds,
       transparentOriginalImages: transparentOriginalImageIds,
       streamPartialImageIds: undefined,
-      rawImageUrls: result.rawImageUrls?.length ? result.rawImageUrls : undefined,
+      rawImageUrls: resolveStoredRawImageUrls(remoteImageUrls, result.rawImageUrls),
       actualParams,
       actualParamsByImage,
       revisedPromptByImage: revisedPromptByImage && Object.keys(revisedPromptByImage).length > 0 ? revisedPromptByImage : undefined,
@@ -5632,13 +6043,13 @@ async function completeRecoveredCustomTask(task: TaskRecord, result: Awaited<Ret
   const latest = useStore.getState().tasks.find((item) => item.id === task.id)
   if (!latest || latest.status === 'done') return
 
-  const { outputIds, outputDataUrls, transparentOriginalImageIds } = await storeTaskOutputImages(task, result.images)
+  const { outputIds, outputDataUrls, remoteImageUrls, transparentOriginalImageIds } = await storeTaskOutputImages(task, result.images)
   const actualParamsList = await readImageSizeParamsList(outputDataUrls)
 
   updateTaskInStore(task.id, {
     outputImages: outputIds,
     transparentOriginalImages: transparentOriginalImageIds,
-    rawImageUrls: result.rawImageUrls?.length ? result.rawImageUrls : undefined,
+    rawImageUrls: resolveStoredRawImageUrls(remoteImageUrls, result.rawImageUrls),
     actualParams: firstActualParams(actualParamsList),
     actualParamsByImage: mapActualParamsByImage(outputIds, actualParamsList),
     revisedPromptByImage: undefined,

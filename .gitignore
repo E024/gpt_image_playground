@@ -4,3 +4,4 @@ dev-proxy.config.json
 .wrangler/
 data/
 .codex-tasks/
+docker-data/

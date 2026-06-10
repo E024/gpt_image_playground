@@ -18,6 +18,12 @@ export interface AgentApiResult {
   rawResponsePayload?: string
 }
 
+export interface AgentReferenceUpstreamState {
+  upstream_conversation_id?: string
+  upstream_parent_message_id?: string
+  upstream_account_ref?: string
+}
+
 const AGENT_IMAGE_INSTRUCTIONS = [
   'You are an image-generation assistant in a multi-turn gallery app.',
   '',
@@ -584,6 +590,7 @@ export async function callAgentResponsesApi(opts: {
   profile: ApiProfile
   params: TaskParams
   input: unknown
+  upstreamState?: AgentReferenceUpstreamState | null
   maskDataUrl?: string
   signal?: AbortSignal
   onTextDelta?: (delta: string) => void
@@ -592,7 +599,7 @@ export async function callAgentResponsesApi(opts: {
   onImagePartialImage?: (event: { toolCallId: string; image: string; partialImageIndex?: number; outputIndex?: number }) => void | Promise<void>
   onImageToolCompleted?: (image: AgentApiResultImage) => void | Promise<void>
 }): Promise<AgentApiResult> {
-  const { settings, profile, params, input, maskDataUrl, signal, onTextDelta, onOutputItems, onImageToolStarted, onImagePartialImage, onImageToolCompleted } = opts
+  const { settings, profile, params, input, upstreamState, maskDataUrl, signal, onTextDelta, onOutputItems, onImageToolStarted, onImagePartialImage, onImageToolCompleted } = opts
   const mime = MIME_MAP[params.output_format] || 'image/png'
   const proxyConfig = readClientDevProxyConfig()
   const useApiProxy = shouldUseApiProxy(profile.apiProxy, proxyConfig)
@@ -608,6 +615,15 @@ export async function callAgentResponsesApi(opts: {
       instructions: createAgentInstructions(settings),
       input,
       tools: createAgentTools(params, profile, settings, maskDataUrl),
+    }
+    if (upstreamState?.upstream_conversation_id) {
+      body.upstream_conversation_id = upstreamState.upstream_conversation_id
+    }
+    if (upstreamState?.upstream_parent_message_id) {
+      body.upstream_parent_message_id = upstreamState.upstream_parent_message_id
+    }
+    if (upstreamState?.upstream_account_ref) {
+      body.upstream_account_ref = upstreamState.upstream_account_ref
     }
     if (profile.streamImages) {
       body.stream = true
@@ -723,12 +739,13 @@ export async function callBatchImageSingle(opts: {
   prompt: string
   referenceImageDataUrls: string[]
   referenceIds?: string[]
+  referenceUpstreamState?: AgentReferenceUpstreamState | null
   signal?: AbortSignal
   onImageToolStarted?: () => void | Promise<void>
   onPartialImage?: (event: { image: string; partialImageIndex?: number }) => void | Promise<void>
   onImageToolCompleted?: (image: AgentApiResultImage) => void | Promise<void>
 }): Promise<BatchImageCallResult> {
-  const { profile, params, batchItemId, prompt, referenceImageDataUrls, referenceIds, signal, onImageToolStarted, onPartialImage, onImageToolCompleted } = opts
+  const { profile, params, batchItemId, prompt, referenceImageDataUrls, referenceIds, referenceUpstreamState, signal, onImageToolStarted, onPartialImage, onImageToolCompleted } = opts
   const mime = MIME_MAP[params.output_format] || 'image/png'
   const proxyConfig = readClientDevProxyConfig()
   const useApiProxy = shouldUseApiProxy(profile.apiProxy, proxyConfig)
@@ -781,6 +798,15 @@ export async function callBatchImageSingle(opts: {
       input,
       tools: [tool],
       tool_choice: 'required',
+    }
+    if (referenceUpstreamState?.upstream_conversation_id) {
+      body.upstream_conversation_id = referenceUpstreamState.upstream_conversation_id
+    }
+    if (referenceUpstreamState?.upstream_parent_message_id) {
+      body.upstream_parent_message_id = referenceUpstreamState.upstream_parent_message_id
+    }
+    if (referenceUpstreamState?.upstream_account_ref) {
+      body.upstream_account_ref = referenceUpstreamState.upstream_account_ref
     }
     if (profile.streamImages) {
       body.stream = true

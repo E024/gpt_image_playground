@@ -18,6 +18,10 @@ function clamp(v: number, min: number, max: number) {
   return Math.max(min, Math.min(max, v))
 }
 
+function isDirectImageSrc(value: string) {
+  return value.startsWith('http://') || value.startsWith('https://') || value.startsWith('data:image/')
+}
+
 export default function Lightbox() {
   const lightboxImageId = useStore((s) => s.lightboxImageId)
   const lightboxImageList = useStore((s) => s.lightboxImageList)
@@ -45,6 +49,11 @@ export default function Lightbox() {
     setSrc('')
 
     const imageId = lightboxImageId
+    if (isDirectImageSrc(imageId)) {
+      setSrc(imageId)
+      return
+    }
+
     const cached = getCachedImage(imageId)
     if (cached) {
       setSrc(cached)
@@ -64,6 +73,11 @@ export default function Lightbox() {
     let cancelled = false
 
     if (!lightboxImageId) {
+      setMaskImageSrc('')
+      return
+    }
+
+    if (isDirectImageSrc(lightboxImageId)) {
       setMaskImageSrc('')
       return
     }
@@ -627,6 +641,7 @@ function LightboxInner({ src, imageId, maskPreviewSrc, onClose, showNav, current
             src={src}
             data-image-id={imageId}
             className="saveable-image max-w-[85vw] max-h-[85vh] object-contain rounded-lg shadow-2xl"
+            referrerPolicy="no-referrer"
             onDragStart={(e) => e.preventDefault()}
             alt=""
           />

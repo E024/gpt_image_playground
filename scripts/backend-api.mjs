@@ -1,10 +1,9 @@
 import http from 'node:http'
 import { mkdirSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
-import { createHash, randomBytes } from 'node:crypto'
+import { createHash, createHmac, randomBytes } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import nodemailer from 'nodemailer'
-import { parse as parseYaml } from 'yaml'
 
 const port = Number(process.env.BACKEND_API_PORT || 3018)
 const host = process.env.BACKEND_API_HOST || '127.0.0.1'
@@ -14,8 +13,6 @@ const SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1000
 const DEFAULT_GROUP_ID = 'default'
 const ACCENT_VALUES = new Set(['cyan', 'sky', 'violet', 'fuchsia', 'rose', 'amber', 'emerald', 'lime', 'indigo', 'slate'])
 const QUOTA_DEDUCTION_PRIORITIES = new Set(['group_first', 'personal_first'])
-const DEFAULT_MANAGEMENT_CONFIG_URL = 'https://cpajp.cloud1024.com/v0/management/config.yaml'
-
 const defaultPlans = [
   ['starter', 'Starter Spark', '轻量试用，适合探索提示词和少量素材。', 0, 80, 4, 6, 'sky'],
   ['studio', 'Studio Flow', '稳定创作额度，适合日常批量生成和迭代。', 29, 650, 3, 5, 'emerald'],
@@ -38,7 +35,10 @@ const CONTENT_AUDIT_SOURCES = new Set(['gallery', 'agent'])
 const DEFAULT_CHECKIN_SETTINGS_ID = 'default'
 const EMAIL_SETTINGS_KEY = 'email_settings'
 const SYSTEM_SETTINGS_KEY = 'system_settings'
+const STORAGE_SETTINGS_KEY = 'storage_settings'
 const DEFAULT_SITE_NAME = '造像台'
+const DEFAULT_AGENT_USER_AGENT = 'codex-tui/0.135.0 (Windows 10.0.19045; x86_64) WindowsTerminal (codex-tui; 0.135.0)'
+const CONTENT_AUDIT_METADATA_MAX_LENGTH = 250_000
 const DEFAULT_EMAIL_VERIFICATION_EXPIRES_MINUTES = 30
 const EMAIL_VERIFICATION_CODE_LENGTH = 6
 const DEFAULT_EMAIL_SUBJECT = '验证你的 {brandName} 账号'
@@ -55,6 +55,8 @@ const DEFAULT_EMAIL_HTML = `<p>你好，{displayName}：</p>
 <p><a href="{verificationLink}" style="display:inline-block;padding:12px 18px;background:#111827;color:#ffffff;text-decoration:none;border-radius:8px;font-weight:700;">验证邮箱并完成注册</a></p>
 <p>安全验证码：<strong>{verificationCode}</strong></p>
 <p style="color:#6b7280;font-size:13px;">如果这不是你的操作，可以忽略这封邮件。</p>`
+
+const DEFAULT_PRESSDOWN_SIGNATURE_URL = 'https://api.pressdown.co/v1/file/notAuthSignature/mannequin'
 
 mkdirSync(dirname(dbPath), { recursive: true })
 const db = new DatabaseSync(dbPath)
@@ -271,6 +273,7 @@ if (planCount === 0) {
 ensureApiSettings()
 ensureEmailSettings()
 ensureSystemSettings()
+ensureStorageSettings()
 ensureCheckinSettings()
 repairMissingAdmin()
 
@@ -388,9 +391,6 @@ function createDefaultApiSettings() {
     apiProxy: profile.apiProxy,
     streamImages: profile.streamImages,
     streamPartialImages: profile.streamPartialImages,
-    managementConfigUrl: process.env.MANAGEMENT_CONFIG_URL || DEFAULT_MANAGEMENT_CONFIG_URL,
-    managementConfigAuthToken: process.env.MANAGEMENT_CONFIG_TOKEN || '',
-    managementConfigUpdatedAt: undefined,
     customProviders: [],
     providerOrder: ['openai', 'fal'],
     clearInputAfterSubmit: false,
@@ -431,6 +431,30 @@ function createDefaultEmailSettings() {
 function createDefaultSystemSettings() {
   return {
     siteName: process.env.SITE_NAME || DEFAULT_SITE_NAME,
+    agentEnabled: process.env.AGENT_ENABLED === 'false' ? false : true,
+  }
+}
+
+function createDefaultStorageSettings() {
+  return {
+    enabled: false,
+    primary: 'pressdown',
+    fallback: 'r2',
+    pressdown: {
+      enabled: false,
+      signatureUrl: process.env.PRESSDOWN_SIGNATURE_URL || DEFAULT_PRESSDOWN_SIGNATURE_URL,
+      displayMode: 'cloud',
+    },
+    r2: {
+      enabled: false,
+      accountId: process.env.R2_ACCOUNT_ID || '',
+      accessKeyId: process.env.R2_ACCESS_KEY_ID || '',
+      secretAccessKey: process.env.R2_SECRET_ACCESS_KEY || '',
+      bucket: process.env.R2_BUCKET || '',
+      prefix: process.env.R2_PREFIX || 'images',
+      publicHost: process.env.R2_PUBLIC_HOST || '',
+      presignTtlSeconds: 3600,
+    },
   }
 }
 
@@ -483,6 +507,21 @@ function setSystemSettings(settings) {
   `).run(SYSTEM_SETTINGS_KEY, JSON.stringify(settings), Date.now())
 }
 
+function parseStorageSettings(value) {
+  const parsed = JSON.parse(value)
+  if (!isRecord(parsed)) throw new Error('图床配置已损坏：配置不是 JSON 对象')
+  return parsed
+}
+
+function setStorageSettings(settings) {
+  if (!isRecord(settings)) throw new Error('图床配置必须是 JSON 对象')
+  db.prepare(`
+    INSERT INTO app_settings (key, value, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+  `).run(STORAGE_SETTINGS_KEY, JSON.stringify(settings), Date.now())
+}
+
 function ensureApiSettings() {
   const row = db.prepare("SELECT value FROM app_settings WHERE key = 'api_settings'").get()
   if (row) {
@@ -502,8 +541,20 @@ function ensureEmailSettings() {
 
 function ensureSystemSettings() {
   const row = db.prepare('SELECT value FROM app_settings WHERE key = ?').get(SYSTEM_SETTINGS_KEY)
-  if (row) return
+  if (row) {
+    getSystemSettings()
+    return
+  }
   setSystemSettings(normalizeSystemSettings(createDefaultSystemSettings(), { allowDefault: true }))
+}
+
+function ensureStorageSettings() {
+  const row = db.prepare('SELECT value FROM app_settings WHERE key = ?').get(STORAGE_SETTINGS_KEY)
+  if (row) {
+    getStorageSettings()
+    return
+  }
+  setStorageSettings(normalizeStorageSettings(createDefaultStorageSettings(), { allowDefault: true }))
 }
 
 function ensureCheckinSettings() {
@@ -553,7 +604,14 @@ function normalizeSystemSettings(settings, options = {}) {
   const rawSiteName = String(settings.siteName ?? '').trim()
   const siteName = (rawSiteName || fallback).slice(0, 80)
   if (!siteName) fail(400, '网站名称不能为空')
-  return { siteName }
+  return {
+    siteName,
+    agentEnabled: settings.agentEnabled !== false,
+  }
+}
+
+function isAgentFeatureEnabled() {
+  return getSystemSettings().agentEnabled !== false
 }
 
 function getSystemSettings() {
@@ -563,12 +621,96 @@ function getSystemSettings() {
     setSystemSettings(settings)
     return settings
   }
-  return normalizeSystemSettings(parseSystemSettings(row.value), { allowDefault: true })
+  const parsed = parseSystemSettings(row.value)
+  const settings = normalizeSystemSettings(parsed, { allowDefault: true })
+  if (parsed.siteName !== settings.siteName || parsed.agentEnabled !== settings.agentEnabled) {
+    setSystemSettings(settings)
+  }
+  return settings
 }
 
 function updateSystemSettings(input) {
   const next = normalizeSystemSettings({ ...getSystemSettings(), ...input })
   setSystemSettings(next)
+  return next
+}
+
+function normalizeStorageProvider(value, fallback = 'pressdown') {
+  return value === 'r2' ? 'r2' : value === 'pressdown' ? 'pressdown' : fallback
+}
+
+function normalizeStorageFallback(value) {
+  if (value === 'none') return 'none'
+  return normalizeStorageProvider(value, 'r2')
+}
+
+function normalizeStorageSettings(settings, options = {}) {
+  const base = options.allowDefault ? createDefaultStorageSettings() : getStorageSettings()
+  const pressdown = isRecord(settings.pressdown) ? settings.pressdown : {}
+  const r2 = isRecord(settings.r2) ? settings.r2 : {}
+  return {
+    enabled: Boolean(settings.enabled),
+    primary: normalizeStorageProvider(settings.primary, base.primary),
+    fallback: normalizeStorageFallback(settings.fallback ?? base.fallback),
+    pressdown: {
+      enabled: Boolean(pressdown.enabled),
+      signatureUrl: String(pressdown.signatureUrl ?? base.pressdown.signatureUrl ?? '').trim(),
+      displayMode: pressdown.displayMode === 'local' ? 'local' : 'cloud',
+    },
+    r2: {
+      enabled: Boolean(r2.enabled),
+      accountId: String(r2.accountId ?? base.r2.accountId ?? '').trim(),
+      accessKeyId: String(r2.accessKeyId ?? base.r2.accessKeyId ?? '').trim(),
+      secretAccessKey: typeof r2.secretAccessKey === 'string' && r2.secretAccessKey
+        ? r2.secretAccessKey
+        : String(base.r2.secretAccessKey ?? ''),
+      bucket: String(r2.bucket ?? base.r2.bucket ?? '').trim(),
+      prefix: String(r2.prefix ?? base.r2.prefix ?? 'images').trim().replace(/^\/+|\/+$/g, '') || 'images',
+      publicHost: String(r2.publicHost ?? base.r2.publicHost ?? '').trim().replace(/\/+$/g, ''),
+      presignTtlSeconds: Math.min(604800, Math.max(60, normalizePositiveInteger(r2.presignTtlSeconds, base.r2.presignTtlSeconds || 3600))),
+    },
+  }
+}
+
+function getStorageSettings() {
+  const row = db.prepare('SELECT value FROM app_settings WHERE key = ?').get(STORAGE_SETTINGS_KEY)
+  if (!row) {
+    const settings = normalizeStorageSettings(createDefaultStorageSettings(), { allowDefault: true })
+    setStorageSettings(settings)
+    return settings
+  }
+  const settings = normalizeStorageSettings(parseStorageSettings(row.value), { allowDefault: true })
+  return settings
+}
+
+function redactStorageSettings(settings = getStorageSettings()) {
+  const { secretAccessKey, ...r2 } = settings.r2
+  return {
+    ...settings,
+    r2: {
+      ...r2,
+      hasSecretAccessKey: Boolean(secretAccessKey),
+    },
+  }
+}
+
+function updateStorageSettings(input) {
+  const current = getStorageSettings()
+  const r2 = isRecord(input.r2) ? input.r2 : {}
+  const next = normalizeStorageSettings({
+    ...current,
+    ...input,
+    r2: {
+      ...current.r2,
+      ...r2,
+      secretAccessKey: typeof r2.secretAccessKey === 'string' && r2.secretAccessKey ? r2.secretAccessKey : current.r2.secretAccessKey,
+    },
+  })
+  if (next.enabled) {
+    const providerSettings = next[next.primary]
+    if (!providerSettings?.enabled) fail(400, '启用图床前请先启用主图床配置')
+  }
+  setStorageSettings(next)
   return next
 }
 
@@ -592,168 +734,6 @@ function updateEmailSettings(input) {
     fail(400, '启用邮箱验证前请完整填写 SMTP Host、端口和发件邮箱')
   }
   setEmailSettings(next)
-}
-
-function getManagementConfigUrl(inputUrl, currentSettings) {
-  const raw = String(inputUrl || currentSettings.managementConfigUrl || DEFAULT_MANAGEMENT_CONFIG_URL).trim()
-  let url
-  try {
-    url = new URL(raw)
-  } catch {
-    fail(400, '管理配置 URL 无效')
-  }
-  if (url.protocol !== 'https:') fail(400, '管理配置 URL 必须使用 HTTPS')
-  return url.toString()
-}
-
-function getAuthorizationHeader(token) {
-  const value = String(token || '').trim()
-  if (!value) return ''
-  return /^(bearer|basic)\s+/i.test(value) ? value : `Bearer ${value}`
-}
-
-function parseManagementConfig(text) {
-  const raw = String(text || '').trim()
-  if (!raw) fail(502, '管理配置为空')
-  try {
-    return JSON.parse(raw)
-  } catch {
-    try {
-      return parseYaml(raw)
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error)
-      fail(502, `管理配置 YAML 解析失败：${detail}`)
-    }
-  }
-}
-
-function normalizeConfigKey(value) {
-  return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '')
-}
-
-function collectConfigScalars(value, path = [], output = []) {
-  if (Array.isArray(value)) {
-    value.forEach((item, index) => collectConfigScalars(item, [...path, String(index)], output))
-    return output
-  }
-  if (isRecord(value)) {
-    for (const [key, item] of Object.entries(value)) collectConfigScalars(item, [...path, key], output)
-    return output
-  }
-  if (value == null) return output
-  output.push({
-    key: normalizeConfigKey(path[path.length - 1] || ''),
-    path: path.map(normalizeConfigKey).join('.'),
-    value,
-  })
-  return output
-}
-
-function pickConfigString(scalars, keys, pathHints = []) {
-  const normalizedKeys = keys.map(normalizeConfigKey)
-  const normalizedHints = pathHints.map(normalizeConfigKey)
-  const match = scalars.find((item) =>
-    normalizedKeys.includes(item.key) &&
-    (normalizedHints.length === 0 || normalizedHints.some((hint) => item.path.includes(hint)))
-  ) ?? scalars.find((item) => normalizedKeys.includes(item.key))
-  if (!match) return ''
-  const value = String(match.value ?? '').trim()
-  return value
-}
-
-function pickConfigNumber(scalars, keys) {
-  const value = pickConfigString(scalars, keys)
-  const number = Number(value)
-  return Number.isFinite(number) && number > 0 ? number : null
-}
-
-function getImportedApiSettingsFromManagementConfig(parsed, currentSettings, source) {
-  if (!isRecord(parsed) && !Array.isArray(parsed)) fail(502, '管理配置格式无效')
-  const scalars = collectConfigScalars(parsed)
-  const currentProfile = getActiveProfile(currentSettings)
-  const baseUrl = pickConfigString(scalars, ['baseUrl', 'base_url', 'apiBaseUrl', 'api_base_url', 'apiUrl', 'api_url', 'endpoint', 'url'], ['api', 'openai', 'upstream', 'provider'])
-  const apiKey = pickConfigString(scalars, ['apiKey', 'api_key', 'key', 'token', 'bearerToken', 'bearer_token', 'authorization'], ['api', 'openai', 'upstream', 'provider'])
-  const model = pickConfigString(scalars, ['model', 'modelId', 'model_id', 'imageModel', 'image_model', 'imagesModel', 'generationModel', 'generation_model'], ['image', 'images', 'openai', 'api'])
-  const apiModeValue = pickConfigString(scalars, ['apiMode', 'api_mode', 'mode'], ['api', 'openai', 'responses', 'images']).toLowerCase()
-  const provider = pickConfigString(scalars, ['provider', 'type'], ['api', 'openai', 'provider']).toLowerCase()
-  const timeout = pickConfigNumber(scalars, ['timeout', 'timeoutSeconds', 'timeout_seconds'])
-  const streamImagesValue = pickConfigString(scalars, ['streamImages', 'stream_images']).toLowerCase()
-  const streamPartialImages = pickConfigNumber(scalars, ['streamPartialImages', 'stream_partial_images', 'partialImages', 'partial_images'])
-
-  if (!baseUrl && !apiKey && !model) {
-    fail(502, '管理配置未包含可识别的 API Base URL、API Key 或模型字段')
-  }
-
-  const nextProfile = {
-    ...currentProfile,
-    name: pickConfigString(scalars, ['name', 'profileName', 'profile_name'], ['api', 'openai', 'profile']) || currentProfile.name || '管理配置',
-    provider: provider === 'fal' ? 'fal' : 'openai',
-    baseUrl: baseUrl || currentProfile.baseUrl,
-    apiKey: apiKey || currentProfile.apiKey,
-    model: model || currentProfile.model,
-    timeout: timeout ?? currentProfile.timeout ?? DEFAULT_API_TIMEOUT,
-    apiMode: apiModeValue === 'responses' ? 'responses' : apiModeValue === 'images' ? 'images' : currentProfile.apiMode === 'responses' ? 'responses' : 'images',
-    apiProxy: false,
-    streamImages: streamImagesValue ? streamImagesValue === 'true' || streamImagesValue === '1' : Boolean(currentProfile.streamImages),
-    streamPartialImages: streamPartialImages ?? currentProfile.streamPartialImages ?? DEFAULT_STREAM_PARTIAL_IMAGES,
-  }
-
-  const profiles = getProfiles(currentSettings)
-  const nextProfiles = profiles.length
-    ? profiles.map((profile) => profile.id === currentProfile.id ? nextProfile : profile)
-    : [nextProfile]
-
-  return {
-    ...currentSettings,
-    baseUrl: nextProfile.baseUrl,
-    apiKey: nextProfile.apiKey,
-    model: nextProfile.model,
-    timeout: nextProfile.timeout,
-    apiMode: nextProfile.apiMode,
-    apiProxy: false,
-    streamImages: nextProfile.streamImages,
-    streamPartialImages: nextProfile.streamPartialImages,
-    providerOrder: [nextProfile.provider],
-    profiles: nextProfiles,
-    activeProfileId: nextProfile.id,
-    managementConfigUrl: source.url,
-    managementConfigAuthToken: source.authToken,
-    managementConfigUpdatedAt: source.updatedAt,
-  }
-}
-
-async function syncManagementApiConfig(input = {}) {
-  const currentSettings = getApiSettings()
-  const url = getManagementConfigUrl(input.url, currentSettings)
-  const currentProfile = getActiveProfile(currentSettings)
-  const authToken = String(input.authToken || currentSettings.managementConfigAuthToken || currentProfile.apiKey || '').trim()
-  const authorization = getAuthorizationHeader(authToken)
-  if (!authorization) fail(400, '请填写管理配置授权信息')
-
-  let response
-  try {
-    response = await fetch(url, {
-      method: 'GET',
-      headers: {
-        Authorization: authorization,
-        Accept: 'application/yaml,text/yaml,text/plain,application/json',
-      },
-    })
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error)
-    fail(502, `管理配置请求失败：${detail}`)
-  }
-  if (!response.ok) fail(response.status, `管理配置请求失败：HTTP ${response.status}`)
-
-  const text = await response.text()
-  const parsed = parseManagementConfig(text)
-  const next = getImportedApiSettingsFromManagementConfig(parsed, currentSettings, {
-    url,
-    authToken,
-    updatedAt: Date.now(),
-  })
-  setApiSettings(next)
-  return next
 }
 
 function getApiSettings() {
@@ -951,6 +931,9 @@ async function proxyUpstream(req, res, actor, upstreamPath, search) {
   const admin = canManage(actor)
   const endpointPath = upstreamPath.replace(/^\/+/, '').replace(/^v1\//, '')
   if (profile.provider === 'fal') return json(res, 400, { error: admin ? '后台统一代理暂不支持 fal.ai 配置，请在管理员后台切换为 OpenAI 或兼容接口。' : '当前后台接口配置不可用，请联系管理员检查。' })
+  if (endpointPath.startsWith('responses') && !isAgentFeatureEnabled()) {
+    return json(res, 403, { error: 'Agent 功能已由管理员关闭' })
+  }
   if (endpointPath.startsWith('responses') && actor.canUseAgent === false) {
     return json(res, 403, { error: '当前账号未开通 Agent 权限' })
   }
@@ -963,6 +946,7 @@ async function proxyUpstream(req, res, actor, upstreamPath, search) {
   if (contentType) headers.set('Content-Type', contentType)
   if (accept) headers.set('Accept', accept)
   headers.set('Authorization', `Bearer ${profile.apiKey.trim()}`)
+  headers.set('User-Agent', process.env.AGENT_USER_AGENT || DEFAULT_AGENT_USER_AGENT)
 
   const method = req.method || 'GET'
   const body = method === 'GET' || method === 'HEAD' ? undefined : await readRawBody(req)
@@ -1571,7 +1555,7 @@ function sanitizeAuditJsonValue(value, depth = 0) {
 function normalizeAuditMetadata(value) {
   const sanitized = sanitizeAuditJsonValue(isRecord(value) ? value : {})
   const jsonText = JSON.stringify(sanitized)
-  if (jsonText.length <= 20_000) return jsonText
+  if (jsonText.length <= CONTENT_AUDIT_METADATA_MAX_LENGTH) return jsonText
   return JSON.stringify({ truncated: true, originalLength: jsonText.length })
 }
 
@@ -1880,6 +1864,7 @@ function getState(actor, authSession = null) {
     adminApiSettings: admin ? adminApiSettings : null,
     systemSettings: getSystemSettings(),
     emailSettings: admin || setupRequired ? redactEmailSettings() : null,
+    imageStorageSettings: admin ? redactStorageSettings() : redactStorageSettings(),
     rewardState: getRewardState(actor),
   }
 }
@@ -2466,6 +2451,148 @@ function checkInUser(actor, ipAddress) {
   })
 }
 
+function parseDataUrlImage(dataUrl) {
+  const match = String(dataUrl || '').match(/^data:([^;,]+);base64,([A-Za-z0-9+/=\r\n]+)$/)
+  if (!match) fail(400, '图片数据格式不正确')
+  const contentType = match[1] || 'image/png'
+  if (!contentType.startsWith('image/')) fail(400, '只支持上传图片文件')
+  const buffer = Buffer.from(match[2].replace(/\s/g, ''), 'base64')
+  if (!buffer.length) fail(400, '图片数据为空')
+  return { buffer, contentType }
+}
+
+function getImageExtension(contentType) {
+  if (contentType === 'image/jpeg' || contentType === 'image/jpg') return 'jpg'
+  if (contentType === 'image/webp') return 'webp'
+  if (contentType === 'image/gif') return 'gif'
+  return 'png'
+}
+
+function createImageObjectKey(prefix, contentType) {
+  const now = new Date()
+  const yyyy = now.getFullYear()
+  const mm = String(now.getMonth() + 1).padStart(2, '0')
+  const dd = String(now.getDate()).padStart(2, '0')
+  const random = randomBytes(8).toString('hex')
+  const ext = getImageExtension(contentType)
+  return `${String(prefix || 'images').replace(/^\/+|\/+$/g, '')}/${yyyy}/${mm}/${dd}/${Date.now()}-${random}.${ext}`
+}
+
+async function uploadToPressdown(settings, payload) {
+  if (!settings.enabled) fail(400, 'Pressdown 图床未启用')
+  if (!settings.signatureUrl) fail(400, 'Pressdown 签名接口未配置')
+  const signatureResponse = await fetch(settings.signatureUrl, { method: 'GET' })
+  const signaturePayload = await signatureResponse.json().catch(() => null)
+  if (!signatureResponse.ok || !isRecord(signaturePayload) || signaturePayload.success !== '1' || !isRecord(signaturePayload.obj)) {
+    fail(502, 'Pressdown 签名接口返回异常')
+  }
+  const signature = signaturePayload.obj
+  const host = String(signature.host || '').replace(/\/+$/g, '')
+  const dir = String(signature.dir || '').replace(/^\/+|\/+$/g, '')
+  if (!host || !signature.accessid || !signature.policy || !signature.signature || !dir) {
+    fail(502, 'Pressdown 签名信息不完整')
+  }
+  const key = `${dir}/${new Date().getFullYear()}-${new Date().getMonth() + 1}-${new Date().getDate()}/${randomBytes(6).toString('hex')}.${getImageExtension(payload.contentType)}`
+  const form = new FormData()
+  form.set('key', key)
+  form.set('policy', String(signature.policy))
+  form.set('OSSAccessKeyId', String(signature.accessid))
+  form.set('Signature', String(signature.signature))
+  form.set('success_action_status', '200')
+  form.set('file', new Blob([payload.buffer], { type: payload.contentType }), payload.filename || key.split('/').pop() || 'image.png')
+  const uploadResponse = await fetch(host, { method: 'POST', body: form })
+  if (!uploadResponse.ok) fail(502, `Pressdown 上传失败：HTTP ${uploadResponse.status}`)
+  return { provider: 'pressdown', url: `${host}/${key}`, key }
+}
+
+function hmac(key, value, encoding) {
+  return createHmac('sha256', key).update(value).digest(encoding)
+}
+
+function sha256Hex(value) {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+function getR2SigningKey(secret, dateStamp, region, service) {
+  const kDate = hmac(`AWS4${secret}`, dateStamp)
+  const kRegion = hmac(kDate, region)
+  const kService = hmac(kRegion, service)
+  return hmac(kService, 'aws4_request')
+}
+
+async function uploadToR2(settings, payload) {
+  if (!settings.enabled) fail(400, 'R2 图床未启用')
+  if (!settings.accountId || !settings.accessKeyId || !settings.secretAccessKey || !settings.bucket) {
+    fail(400, 'R2 配置不完整')
+  }
+  const region = 'auto'
+  const service = 's3'
+  const hostName = `${settings.bucket}.${settings.accountId}.r2.cloudflarestorage.com`
+  const key = createImageObjectKey(settings.prefix, payload.contentType)
+  const encodedKey = key.split('/').map(encodeURIComponent).join('/')
+  const endpoint = `https://${hostName}/${encodedKey}`
+  const now = new Date()
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '')
+  const dateStamp = amzDate.slice(0, 8)
+  const payloadHash = sha256Hex(payload.buffer)
+  const canonicalHeaders = `content-type:${payload.contentType}\nhost:${hostName}\nx-amz-content-sha256:${payloadHash}\nx-amz-date:${amzDate}\n`
+  const signedHeaders = 'content-type;host;x-amz-content-sha256;x-amz-date'
+  const canonicalRequest = `PUT\n/${encodedKey}\n\n${canonicalHeaders}\n${signedHeaders}\n${payloadHash}`
+  const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`
+  const stringToSign = `AWS4-HMAC-SHA256\n${amzDate}\n${credentialScope}\n${sha256Hex(canonicalRequest)}`
+  const signature = hmac(getR2SigningKey(settings.secretAccessKey, dateStamp, region, service), stringToSign, 'hex')
+  const authorization = `AWS4-HMAC-SHA256 Credential=${settings.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
+  const response = await fetch(endpoint, {
+    method: 'PUT',
+    headers: {
+      Authorization: authorization,
+      'Content-Type': payload.contentType,
+      'x-amz-content-sha256': payloadHash,
+      'x-amz-date': amzDate,
+    },
+    body: payload.buffer,
+  })
+  if (!response.ok) fail(502, `R2 上传失败：HTTP ${response.status}`)
+  return {
+    provider: 'r2',
+    url: settings.publicHost ? `${settings.publicHost}/${encodedKey}` : endpoint,
+    key,
+  }
+}
+
+async function uploadImageWithConfiguredStorage(input) {
+  const settings = getStorageSettings()
+  if (!settings.enabled) return { uploaded: false }
+  const { buffer, contentType } = parseDataUrlImage(input.dataUrl)
+  const payload = {
+    buffer,
+    contentType: String(input.contentType || contentType),
+    filename: String(input.filename || `image.${getImageExtension(contentType)}`),
+  }
+  const order = [settings.primary]
+  if (settings.fallback !== 'none' && settings.fallback !== settings.primary) order.push(settings.fallback)
+  let lastError = null
+  for (let index = 0; index < order.length; index += 1) {
+    const provider = order[index]
+    try {
+      const result = provider === 'r2'
+        ? await uploadToR2(settings.r2, payload)
+        : await uploadToPressdown(settings.pressdown, payload)
+      return { uploaded: true, ...result, fallbackUsed: index > 0 }
+    } catch (error) {
+      lastError = error
+      if (index === order.length - 1) break
+      console.warn(`${provider} image upload failed, trying fallback:`, error instanceof Error ? error.message : String(error))
+    }
+  }
+  if (lastError instanceof ApiError) throw lastError
+  throw lastError instanceof Error ? lastError : new Error('图床上传失败')
+}
+
+function isStorageSettingsPath(path) {
+  return path === '/settings/storage' || path === '/settings/storage/' || path === '/settings/image-storage' || path === '/settings/image-storage/'
+}
+
 const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') return json(res, 204, {})
   const url = new URL(req.url || '/', `http://${req.headers.host || `${host}:${port}`}`)
@@ -2556,6 +2683,10 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true })
     }
 
+    if (req.method === 'POST' && path === '/image-storage/upload') {
+      return json(res, 200, await uploadImageWithConfiguredStorage(await readJson(req)))
+    }
+
     if (req.method === 'GET' && path === '/content-audit') {
       return json(res, 200, getContentAuditPage(actor, {
         query: url.searchParams.get('query') ?? '',
@@ -2599,6 +2730,7 @@ const server = http.createServer(async (req, res) => {
       const admin = canManage(actor)
       if (typeof activeProfile.apiKey !== 'string' || !activeProfile.apiKey.trim()) return json(res, 400, { error: admin ? '管理员尚未配置 API Key' : '当前后台接口配置不可用，请联系管理员检查。' })
       if (typeof activeProfile.baseUrl !== 'string' || !activeProfile.baseUrl.trim()) return json(res, 400, { error: admin ? '管理员尚未配置 API Base URL' : '当前后台接口配置不可用，请联系管理员检查。' })
+      if (source === 'agent' && !isAgentFeatureEnabled()) return json(res, 403, { error: 'Agent 功能已由管理员关闭' })
       if (source === 'agent' && (activeProfile.provider !== 'openai' || activeProfile.apiMode !== 'responses')) return json(res, 400, { error: admin ? '管理员尚未配置可用的 OpenAI Responses API' : '当前 Agent 接口配置不可用，请联系管理员检查。' })
       const units = normalizePositiveInteger(body.units, 1)
       withImmediateTransaction(() => {
@@ -2691,11 +2823,6 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, getState(getUser(actor.id), authSession))
     }
 
-    if (req.method === 'POST' && path === '/settings/api/management-config') {
-      await syncManagementApiConfig(await readJson(req))
-      return json(res, 200, getState(getUser(actor.id), authSession))
-    }
-
     if (req.method === 'PATCH' && path === '/settings/email') {
       const body = await readJson(req)
       updateEmailSettings(isRecord(body.settings) ? body.settings : body)
@@ -2705,6 +2832,16 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'PATCH' && path === '/settings/system') {
       const body = await readJson(req)
       updateSystemSettings(isRecord(body.settings) ? body.settings : body)
+      return json(res, 200, getState(getUser(actor.id), authSession))
+    }
+
+    if (req.method === 'GET' && isStorageSettingsPath(path)) {
+      return json(res, 200, redactStorageSettings())
+    }
+
+    if (req.method === 'PATCH' && isStorageSettingsPath(path)) {
+      const body = await readJson(req)
+      updateStorageSettings(isRecord(body.settings) ? body.settings : body)
       return json(res, 200, getState(getUser(actor.id), authSession))
     }
 

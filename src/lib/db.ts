@@ -278,6 +278,10 @@ export async function storeImage(dataUrl: string, source: NonNullable<StoredImag
 function loadImage(dataUrl: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const image = new Image()
+    if (/^https?:\/\//i.test(dataUrl)) {
+      image.crossOrigin = 'anonymous'
+      image.referrerPolicy = 'no-referrer'
+    }
     image.onload = () => resolve(image)
     image.onerror = () => reject(new Error('图片加载失败'))
     image.src = dataUrl

@@ -1,11 +1,23 @@
 import { useEffect, useMemo, useState, type CSSProperties } from 'react'
-import { useStore } from '../store'
-import { getActiveApiProfile, normalizeSettings } from '../lib/apiProfiles'
+import { ensureImageThumbnailCached, useStore } from '../store'
+import {
+  DEFAULT_IMAGES_MODEL,
+  DEFAULT_RESPONSES_MODEL,
+  createDefaultOpenAIProfile,
+  getActiveApiProfile,
+  getApiProviderLabel,
+  normalizeSettings,
+  switchApiProfileProvider,
+} from '../lib/apiProfiles'
 import { backendFetchContentAudit, backendFetchLedger, type ContentAuditPage, type LedgerPage, type RewardCodeInput } from '../lib/backendApi'
 import { getEmailSettingsDraft } from '../lib/emailSettings'
-import type { ApiMode, ApiProfile, AppSettings, BillingLedgerEntry, BillingLedgerType, BillingUsageSource, ContentAuditKind, ContentAuditSource, EmailSettings, ManagedUser, QuotaDeductionPriority, RewardCode, RewardState, SystemSettings, UserGroup, UserPlan } from '../types'
+import type { ApiMode, ApiProfile, ApiProvider, AppSettings, BillingLedgerEntry, BillingLedgerType, BillingUsageSource, ContentAuditEntry, ContentAuditKind, ContentAuditSource, EmailSettings, ImageStorageSettings, ManagedUser, QuotaDeductionPriority, RewardCode, RewardState, SystemSettings, UserGroup, UserPlan } from '../types'
+import { PlusIcon, TrashIcon } from './icons'
+import MarkdownRenderer from './MarkdownRenderer'
+import AgentReferenceText from './AgentReferenceText'
+import { formatAgentReferenceTagsForDisplay } from '../lib/agentImageReferences'
 
-type AdminSection = 'overview' | 'groups' | 'plans' | 'users' | 'rewards' | 'content' | 'ledger' | 'system' | 'settings' | 'email'
+type AdminSection = 'overview' | 'groups' | 'plans' | 'users' | 'rewards' | 'content' | 'ledger' | 'system' | 'storage' | 'settings' | 'email'
 type NavItem = { id: AdminSection; label: string; description: string; adminOnly?: boolean }
 const DEFAULT_GROUP_ID = 'default'
 const LEDGER_PAGE_SIZES = [10, 20, 50, 100]
@@ -55,6 +67,14 @@ const ACCENT_PRESETS = [
   { value: 'slate', label: '钛灰', color: '#64748b' },
 ] as const
 
+function newApiProfileId(prefix: string) {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+}
+
+function getDefaultModelForApiMode(apiMode: ApiMode) {
+  return apiMode === 'responses' ? DEFAULT_RESPONSES_MODEL : DEFAULT_IMAGES_MODEL
+}
+
 function formatMoney(value: number) {
   return new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(value)
 }
@@ -87,6 +107,62 @@ function formatDurationMs(value: number | null) {
   const hours = Math.floor(minutes / 60)
   const restMinutes = minutes % 60
   return `${hours} 小时 ${restMinutes} 分`
+}
+
+function getContentAuditImagePreviews(entry: ContentAuditEntry) {
+  const previews = entry.metadata.auditImagePreviews
+  if (!Array.isArray(previews)) return []
+  return previews.filter((item): item is string => typeof item === 'string' && item.startsWith('data:image/')).slice(0, 8)
+}
+
+function ContentAuditLocalPreviewGrid({ entryId, imageIds }: { entryId: string; imageIds: string[] }) {
+  const [previews, setPreviews] = useState<string[] | null>(null)
+  const setLightboxImageId = useStore((s) => s.setLightboxImageId)
+
+  useEffect(() => {
+    let cancelled = false
+    void Promise.all(imageIds.slice(0, 8).map(async (imageId) => {
+      const thumbnail = await ensureImageThumbnailCached(imageId)
+      return thumbnail?.dataUrl ?? ''
+    })).then((items) => {
+      if (!cancelled) setPreviews(items.filter(Boolean))
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [imageIds])
+
+  if (previews === null) {
+    return (
+      <div className="rounded-lg border border-dashed border-gray-200 bg-gray-50 p-4 text-sm text-gray-500 dark:border-white/[0.08] dark:bg-gray-950">
+        正在读取本地图片预览；本地图片 ID：{imageIds.length > 0 ? imageIds.join('、') : '未记录'}
+      </div>
+    )
+  }
+
+  if (previews.length === 0) {
+    return (
+      <div className="rounded-lg border border-dashed border-gray-200 bg-gray-50 p-4 text-sm text-gray-500 dark:border-white/[0.08] dark:bg-gray-950">
+        这条图片记录没有原始 URL；本地图片 ID：{imageIds.length > 0 ? imageIds.join('、') : '未记录'}
+      </div>
+    )
+  }
+
+  return (
+    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      {previews.map((url, index) => (
+        <button
+          key={`${entryId}:local-preview:${index}`}
+          type="button"
+          onClick={() => setLightboxImageId(imageIds[index] ?? url, imageIds.length ? imageIds : previews)}
+          className="group block overflow-hidden rounded-lg border border-gray-100 bg-gray-50 text-left dark:border-white/[0.06] dark:bg-gray-950"
+        >
+          <img src={url} alt={`本地预览 ${index + 1}`} loading="lazy" referrerPolicy="no-referrer" className="aspect-square w-full object-cover transition group-hover:scale-[1.02]" />
+          <div className="truncate px-2 py-1.5 text-[11px] text-gray-400">本地预览 · 图片 ID：{imageIds[index] ?? '未记录'}</div>
+        </button>
+      ))}
+    </div>
+  )
 }
 
 function toDateTimeLocal(value: number) {
@@ -272,8 +348,11 @@ export default function AdminDashboard() {
   const adminApiSettings = useStore((s) => s.adminApiSettings)
   const systemSettings = useStore((s) => s.systemSettings)
   const emailSettings = useStore((s) => s.emailSettings)
+  const imageStorageSettings = useStore((s) => s.imageStorageSettings)
   const session = useStore((s) => s.authSession)
   const setAppMode = useStore((s) => s.setAppMode)
+  const setConfirmDialog = useStore((s) => s.setConfirmDialog)
+  const setLightboxImageId = useStore((s) => s.setLightboxImageId)
   const updateManagedUser = useStore((s) => s.updateManagedUser)
   const updateMyQuotaDeductionPriority = useStore((s) => s.updateMyQuotaDeductionPriority)
   const grantUserQuota = useStore((s) => s.grantUserQuota)
@@ -285,9 +364,9 @@ export default function AdminDashboard() {
   const updatePlan = useStore((s) => s.updatePlan)
   const deletePlan = useStore((s) => s.deletePlan)
   const updateApiSettings = useStore((s) => s.updateApiSettings)
-  const syncManagementApiConfig = useStore((s) => s.syncManagementApiConfig)
   const updateSystemSettings = useStore((s) => s.updateSystemSettings)
   const updateEmailSettings = useStore((s) => s.updateEmailSettings)
+  const updateImageStorageSettings = useStore((s) => s.updateImageStorageSettings)
   const createRewardCode = useStore((s) => s.createRewardCode)
   const updateRewardCode = useStore((s) => s.updateRewardCode)
   const deleteRewardCode = useStore((s) => s.deleteRewardCode)
@@ -318,6 +397,7 @@ export default function AdminDashboard() {
   const [apiDraft, setApiDraft] = useState<AppSettings>(() => normalizeSettings(adminApiSettings ?? settings))
   const [systemDraft, setSystemDraft] = useState<SystemSettings>(systemSettings)
   const [emailDraft, setEmailDraft] = useState<EmailSettings>(() => getEmailSettingsDraft(emailSettings))
+  const [storageDraft, setStorageDraft] = useState<ImageStorageSettings>(imageStorageSettings)
   const [ledgerQuery, setLedgerQuery] = useState('')
   const [ledgerSource, setLedgerSource] = useState<BillingUsageSource | 'all'>('all')
   const [ledgerType, setLedgerType] = useState<BillingLedgerType | 'all'>('all')
@@ -342,7 +422,6 @@ export default function AdminDashboard() {
   const [contentResult, setContentResult] = useState<ContentAuditPage | null>(null)
   const [contentBusy, setContentBusy] = useState(false)
   const [contentError, setContentError] = useState('')
-  const [managementConfigBusy, setManagementConfigBusy] = useState(false)
 
   const visibleLedger = isAdmin ? ledger : ledger.filter((entry) => entry.userId === currentUser?.id)
   const selectedGroup = groups.find((group) => group.id === selectedGroupId) ?? currentGroup ?? groups[0] ?? null
@@ -361,6 +440,11 @@ export default function AdminDashboard() {
   const selectedRewardDraft = selectedRewardCode ? rewardCodeDrafts[selectedRewardCode.id] ?? toRewardCodeDraft(selectedRewardCode) : null
   const canEditPlans = isAdmin
   const activeApiProfile = getActiveApiProfile(apiDraft)
+  const apiProviderOptions = [
+    { id: 'openai' as ApiProvider, label: 'OpenAI' },
+    { id: 'fal' as ApiProvider, label: 'fal.ai' },
+    ...apiDraft.customProviders.map((provider) => ({ id: provider.id as ApiProvider, label: provider.name })),
+  ]
   const getGroupName = (groupId: string) => groups.find((group) => group.id === groupId)?.name ?? '未知分组'
   const ledgerEntries = ledgerResult?.entries ?? visibleLedger.slice(0, ledgerPageSize)
   const ledgerTotal = ledgerResult?.total ?? ledgerEntries.length
@@ -388,6 +472,10 @@ export default function AdminDashboard() {
   }, [emailSettings])
 
   useEffect(() => {
+    setStorageDraft(imageStorageSettings)
+  }, [imageStorageSettings])
+
+  useEffect(() => {
     setCheckinDraft(rewardState.checkin)
   }, [rewardState.checkin])
 
@@ -397,7 +485,7 @@ export default function AdminDashboard() {
   }, [rewardState.rewardCodes, selectedRewardCodeId])
 
   useEffect(() => {
-    if (!isAdmin && (section === 'groups' || section === 'users' || section === 'system' || section === 'settings' || section === 'email' || section === 'content')) setSection('overview')
+    if (!isAdmin && (section === 'groups' || section === 'users' || section === 'system' || section === 'storage' || section === 'settings' || section === 'email' || section === 'content')) setSection('overview')
   }, [isAdmin, section])
 
   useEffect(() => {
@@ -518,7 +606,8 @@ export default function AdminDashboard() {
     { id: 'users', label: '用户', description: '角色、套餐、额度', adminOnly: true },
     { id: 'rewards', label: '权益', description: isAdmin ? '兑换码与签到' : '兑换、签到、领取记录' },
     { id: 'content', label: '内容', description: '图片与聊天审计', adminOnly: true },
-    { id: 'system', label: '系统设置', description: '站点名称与系统邮箱', adminOnly: true },
+    { id: 'system', label: '系统设置', description: '站点名称、Agent 与系统邮箱', adminOnly: true },
+    { id: 'storage', label: '图床存储', description: 'Pressdown 与 R2', adminOnly: true },
     { id: 'settings', label: 'API 配置', description: '统一接口与 Agent', adminOnly: true },
     { id: 'ledger', label: '流水', description: isAdmin ? '全部消费与调整' : '我的消费记录' },
   ] satisfies NavItem[]).filter((item) => isAdmin || !item.adminOnly)
@@ -599,6 +688,80 @@ export default function AdminDashboard() {
     }))
   }
 
+  const createApiProfile = () => {
+    setApiDraft((draft) => {
+      const profile = createDefaultOpenAIProfile({
+        id: newApiProfileId('openai'),
+        name: `新配置 ${draft.profiles.length + 1}`,
+      })
+      return normalizeSettings({
+        ...draft,
+        profiles: [...draft.profiles, profile],
+        activeProfileId: profile.id,
+      })
+    })
+  }
+
+  const duplicateApiProfile = () => {
+    setApiDraft((draft) => {
+      const current = draft.profiles.find((profile) => profile.id === draft.activeProfileId) ?? draft.profiles[0]
+      if (!current) return draft
+      const profile: ApiProfile = {
+        ...current,
+        id: newApiProfileId(current.provider === 'openai' ? 'openai' : 'profile'),
+        name: `${current.name || '配置'}（复制）`,
+      }
+      return normalizeSettings({
+        ...draft,
+        profiles: [...draft.profiles, profile],
+        activeProfileId: profile.id,
+      })
+    })
+  }
+
+  const switchApiProfile = (id: string) => {
+    setApiDraft((draft) => {
+      if (!draft.profiles.some((profile) => profile.id === id)) return draft
+      return normalizeSettings({ ...draft, activeProfileId: id })
+    })
+  }
+
+  const deleteApiProfile = (profile: ApiProfile) => {
+    if (apiDraft.profiles.length <= 1) return
+    setConfirmDialog({
+      title: '删除 API 配置',
+      message: `确定删除配置「${profile.name || getApiProviderLabel(apiDraft, profile.provider)}」吗？删除后在保存配置前仍可刷新页面放弃本次草稿修改。`,
+      confirmText: '删除配置',
+      cancelText: '取消',
+      tone: 'danger',
+      action: () => {
+        setApiDraft((draft) => {
+          if (draft.profiles.length <= 1) return draft
+          const nextProfiles = draft.profiles.filter((item) => item.id !== profile.id)
+          if (!nextProfiles.length) return draft
+          return normalizeSettings({
+            ...draft,
+            profiles: nextProfiles,
+            activeProfileId: draft.activeProfileId === profile.id ? nextProfiles[0].id : draft.activeProfileId,
+          })
+        })
+      },
+    })
+  }
+
+  const handleApiProviderChange = (provider: ApiProvider) => {
+    const customProvider = apiDraft.customProviders.find((item) => item.id === provider)
+    updateApiProfileDraft(switchApiProfileProvider(activeApiProfile, provider, customProvider))
+  }
+
+  const handleApiModeChange = (apiMode: ApiMode) => {
+    const nextModel =
+      activeApiProfile.model === DEFAULT_IMAGES_MODEL || activeApiProfile.model === DEFAULT_RESPONSES_MODEL
+        ? getDefaultModelForApiMode(apiMode)
+        : activeApiProfile.model
+    updateApiProfileDraft({ apiMode, model: nextModel })
+  }
+
   const updateApiDraft = (patch: Partial<AppSettings>) => {
     setApiDraft((draft) => normalizeSettings({ ...draft, ...patch }))
   }
@@ -608,19 +771,10 @@ export default function AdminDashboard() {
   }
 
   const commitSystemSettings = () => {
-    updateSystemSettings({ siteName: systemDraft.siteName.trim() })
-  }
-
-  const handleSyncManagementConfig = async () => {
-    setManagementConfigBusy(true)
-    try {
-      await syncManagementApiConfig({
-        url: apiDraft.managementConfigUrl,
-        authToken: apiDraft.managementConfigAuthToken,
-      })
-    } finally {
-      setManagementConfigBusy(false)
-    }
+    updateSystemSettings({
+      ...systemDraft,
+      siteName: systemDraft.siteName.trim(),
+    })
   }
 
   const updateEmailDraft = (patch: Partial<EmailSettings>) => {
@@ -629,6 +783,14 @@ export default function AdminDashboard() {
 
   const commitEmailSettings = () => {
     updateEmailSettings(emailDraft)
+  }
+
+  const updateStorageDraft = (patch: Partial<ImageStorageSettings>) => {
+    setStorageDraft((draft) => ({ ...draft, ...patch }))
+  }
+
+  const commitStorageSettings = () => {
+    updateImageStorageSettings(storageDraft)
   }
 
   const updateSelectedDraft = (patch: Partial<UserPlan>) => {
@@ -685,6 +847,18 @@ export default function AdminDashboard() {
     const nextDraft = { ...selectedRewardDraft, active: !selectedRewardDraft.active }
     setRewardCodeDrafts((drafts) => ({ ...drafts, [selectedRewardCode.id]: nextDraft }))
     updateRewardCode(selectedRewardCode.id, nextDraft)
+  }
+
+  const handleDeleteRewardCode = (code: RewardCode) => {
+    setConfirmDialog({
+      title: '删除兑换码',
+      message: `确定删除兑换码「${code.name || code.code}」吗？删除后会从后台列表隐藏，已经产生的兑换记录和限制流水会保留。`,
+      confirmText: '删除兑换码',
+      cancelText: '取消',
+      action: () => {
+        void deleteRewardCode(code.id)
+      },
+    })
   }
 
   const commitCheckinDraft = () => {
@@ -836,7 +1010,7 @@ export default function AdminDashboard() {
               <span>/</span>
               <span className="font-bold text-gray-900 dark:text-gray-100">{navItems.find((item) => item.id === section)?.label}</span>
             </div>
-            <h1 className="mt-1 text-2xl font-black">{section === 'groups' ? '分组管理' : section === 'plans' ? '套餐列表与详情' : section === 'users' ? '用户管理' : section === 'rewards' ? '权益补给站' : section === 'content' ? '内容观测台' : section === 'system' ? '系统设置' : section === 'settings' ? 'API 与 Agent 配置' : section === 'email' ? '系统邮箱配置' : section === 'ledger' ? '消费流水' : isAdmin ? '运营总览' : '我的账户'}</h1>
+            <h1 className="mt-1 text-2xl font-black">{section === 'groups' ? '分组管理' : section === 'plans' ? '套餐列表与详情' : section === 'users' ? '用户管理' : section === 'rewards' ? '权益补给站' : section === 'content' ? '内容观测台' : section === 'system' ? '系统设置' : section === 'storage' ? '图床存储' : section === 'settings' ? 'API 与 Agent 配置' : section === 'email' ? '系统邮箱配置' : section === 'ledger' ? '消费流水' : isAdmin ? '运营总览' : '我的账户'}</h1>
           </header>
 
           <div className="p-4">
@@ -1273,26 +1447,38 @@ export default function AdminDashboard() {
                         ) : rewardState.rewardCodes.map((code) => {
                           const isSelected = selectedRewardCode?.id === code.id
                           return (
-                            <button
+                            <div
                               key={code.id}
-                              type="button"
-                              onClick={() => setSelectedRewardCodeId(code.id)}
-                              className={`mb-2 w-full rounded-lg border p-3 text-left transition ${isSelected ? 'border-cyan-400 bg-cyan-50 dark:border-cyan-500/60 dark:bg-cyan-500/10' : 'border-gray-200 bg-white hover:bg-gray-50 dark:border-white/[0.08] dark:bg-transparent dark:hover:bg-white/[0.04]'}`}
+                              className={`mb-2 flex items-stretch gap-2 rounded-lg border p-2 transition ${isSelected ? 'border-cyan-400 bg-cyan-50 dark:border-cyan-500/60 dark:bg-cyan-500/10' : 'border-gray-200 bg-white hover:bg-gray-50 dark:border-white/[0.08] dark:bg-transparent dark:hover:bg-white/[0.04]'}`}
                             >
-                              <div className="flex items-center justify-between gap-2">
-                                <div className="min-w-0">
-                                  <div className="truncate text-sm font-black">{code.name}</div>
-                                  <div className="mt-0.5 font-mono text-xs text-gray-400">{code.code}</div>
+                              <button
+                                type="button"
+                                onClick={() => setSelectedRewardCodeId(code.id)}
+                                className="min-w-0 flex-1 rounded-md p-1 text-left"
+                              >
+                                <div className="flex items-center justify-between gap-2">
+                                  <div className="min-w-0">
+                                    <div className="truncate text-sm font-black">{code.name}</div>
+                                    <div className="mt-0.5 font-mono text-xs text-gray-400">{code.code}</div>
+                                  </div>
+                                  <span className={`shrink-0 rounded-md px-2 py-1 text-xs font-bold ${code.active ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300' : 'bg-gray-100 text-gray-500 dark:bg-white/[0.06] dark:text-gray-400'}`}>
+                                    {code.active ? '启用' : '关闭'}
+                                  </span>
                                 </div>
-                                <span className={`shrink-0 rounded-md px-2 py-1 text-xs font-bold ${code.active ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300' : 'bg-gray-100 text-gray-500 dark:bg-white/[0.06] dark:text-gray-400'}`}>
-                                  {code.active ? '启用' : '关闭'}
-                                </span>
-                              </div>
-                              <div className="mt-2 flex items-center justify-between text-xs text-gray-500">
-                                <span>+{code.quotaAmount} 点</span>
-                                <span>{code.redeemedCount} / {formatLimit(code.totalLimit)}</span>
-                              </div>
-                            </button>
+                                <div className="mt-2 flex items-center justify-between text-xs text-gray-500">
+                                  <span>+{code.quotaAmount} 点</span>
+                                  <span>{code.redeemedCount} / {formatLimit(code.totalLimit)}</span>
+                                </div>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteRewardCode(code)}
+                                className="shrink-0 rounded-md px-2.5 text-xs font-bold text-rose-500 transition hover:bg-rose-50 dark:hover:bg-rose-500/10"
+                                aria-label={`删除兑换码 ${code.code}`}
+                              >
+                                删除
+                              </button>
+                            </div>
                           )
                         })}
                       </div>
@@ -1307,10 +1493,10 @@ export default function AdminDashboard() {
                           </div>
                           {selectedRewardCode && (
                             <div className="flex gap-2">
-                              <button onClick={toggleSelectedRewardCode} className="rounded-md border border-gray-200 px-2.5 py-1.5 text-xs font-bold text-gray-600 transition hover:bg-gray-50 dark:border-white/[0.08] dark:text-gray-300 dark:hover:bg-white/[0.06]">
+                              <button type="button" onClick={toggleSelectedRewardCode} className="rounded-md border border-gray-200 px-2.5 py-1.5 text-xs font-bold text-gray-600 transition hover:bg-gray-50 dark:border-white/[0.08] dark:text-gray-300 dark:hover:bg-white/[0.06]">
                                 {selectedRewardDraft?.active ? '关闭' : '启用'}
                               </button>
-                              <button onClick={() => deleteRewardCode(selectedRewardCode.id)} className="rounded-md px-2.5 py-1.5 text-xs font-bold text-rose-500 transition hover:bg-rose-50 dark:hover:bg-rose-500/10">
+                              <button type="button" onClick={() => handleDeleteRewardCode(selectedRewardCode)} className="rounded-md px-2.5 py-1.5 text-xs font-bold text-rose-500 transition hover:bg-rose-50 dark:hover:bg-rose-500/10">
                                 删除
                               </button>
                             </div>
@@ -1441,7 +1627,7 @@ export default function AdminDashboard() {
                   <div className="flex flex-col gap-3 border-b border-gray-200 px-4 py-3 dark:border-white/[0.08] sm:flex-row sm:items-center sm:justify-between">
                     <div>
                       <h2 className="text-sm font-black">站点基础信息</h2>
-                      <p className="mt-1 text-xs text-gray-500">这里控制所有用户可见的网站名称，系统邮箱配置在本页下方统一管理。</p>
+                      <p className="mt-1 text-xs text-gray-500">这里控制所有用户可见的网站名称、前端功能入口和系统邮箱。</p>
                     </div>
                     <button
                       onClick={commitSystemSettings}
@@ -1457,12 +1643,31 @@ export default function AdminDashboard() {
                       <input
                         value={systemDraft.siteName}
                         maxLength={80}
-                        onChange={(event) => setSystemDraft({ siteName: event.target.value })}
+                        onChange={(event) => setSystemDraft((draft) => ({ ...draft, siteName: event.target.value }))}
                         placeholder="例如：Pixel Studio"
                         className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm font-black outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
                       />
                       <span className="mt-1 block text-xs text-gray-400">1-80 个字符。建议使用清晰、有识别度的产品名。</span>
                     </label>
+                    <div className="lg:col-span-2 rounded-lg border border-cyan-100 bg-cyan-50/60 p-3 dark:border-cyan-500/20 dark:bg-cyan-500/10">
+                      <div className="flex items-start justify-between gap-4">
+                        <div>
+                          <div className="text-sm font-black text-gray-950 dark:text-gray-50">前端 Agent 功能</div>
+                          <p className="mt-1 text-xs leading-5 text-gray-500 dark:text-gray-400">关闭后用户侧不显示 Agent 入口，已进入 Agent 的页面会退回画廊，后台也会拒绝 Agent 调用。用户表里的单人授权仍然保留。</p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setSystemDraft((draft) => ({ ...draft, agentEnabled: draft.agentEnabled === false }))}
+                          className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${systemDraft.agentEnabled !== false ? 'bg-cyan-500' : 'bg-gray-300 dark:bg-gray-600'}`}
+                          aria-pressed={systemDraft.agentEnabled !== false}
+                        >
+                          <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${systemDraft.agentEnabled !== false ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                        </button>
+                      </div>
+                      <div className="mt-3 inline-flex rounded-md bg-white px-2.5 py-1 text-xs font-black text-cyan-700 shadow-sm dark:bg-gray-950 dark:text-cyan-300">
+                        {systemDraft.agentEnabled !== false ? '当前对用户可见' : '当前已隐藏并禁用'}
+                      </div>
+                    </div>
                   </div>
                 </div>
 
@@ -1474,7 +1679,90 @@ export default function AdminDashboard() {
                   </div>
                   <div className="mt-3 rounded-lg border border-gray-200 p-3 dark:border-white/[0.08]">
                     <div className="text-xs font-semibold text-gray-500 dark:text-gray-400">顶部导航</div>
-                    <div className="mt-1 truncate text-sm font-black">{systemDraft.siteName.trim() || '未设置网站名称'}</div>
+                    <div className="mt-1 flex min-w-0 items-center gap-2">
+                      <span className="truncate text-sm font-black">{systemDraft.siteName.trim() || '未设置网站名称'}</span>
+                      {systemDraft.agentEnabled !== false && <span className="rounded bg-cyan-50 px-1.5 py-0.5 text-[10px] font-black text-cyan-700 dark:bg-cyan-500/10 dark:text-cyan-300">Agent</span>}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {section === 'storage' && isAdmin && (
+              <div className="grid gap-4 xl:grid-cols-[1fr_360px]">
+                <div className="rounded-lg border border-gray-200 bg-white shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
+                  <div className="flex flex-col gap-3 border-b border-gray-200 px-4 py-3 dark:border-white/[0.08] sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <h2 className="text-sm font-black">图片持久化策略</h2>
+                      <p className="mt-1 text-xs text-gray-500">生成结果会保留本地缓存，同时按配置上传图床并写入任务与内容记录。</p>
+                    </div>
+                    <button onClick={commitStorageSettings} className="rounded-md bg-gray-900 px-3 py-2 text-xs font-bold text-white transition hover:bg-gray-700 dark:bg-white dark:text-gray-950">
+                      保存图床配置
+                    </button>
+                  </div>
+                  <div className="grid gap-4 p-4 lg:grid-cols-2">
+                    <label className="flex items-center justify-between gap-3 rounded-md border border-gray-200 px-3 py-2 dark:border-white/[0.08] lg:col-span-2">
+                      <span>
+                        <span className="block text-xs font-semibold text-gray-500 dark:text-gray-400">启用图床上传</span>
+                        <span className="mt-1 block text-xs text-gray-400">关闭时沿用浏览器 IndexedDB，不触发后台上传。</span>
+                      </span>
+                      <button type="button" onClick={() => updateStorageDraft({ enabled: !storageDraft.enabled })} className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${storageDraft.enabled ? 'bg-cyan-500' : 'bg-gray-300 dark:bg-gray-600'}`} aria-pressed={storageDraft.enabled}>
+                        <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${storageDraft.enabled ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                      </button>
+                    </label>
+                    <label className="block">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">主图床</span>
+                      <select value={storageDraft.primary} onChange={(event) => updateStorageDraft({ primary: event.target.value === 'r2' ? 'r2' : 'pressdown' })} className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950">
+                        <option value="pressdown">Pressdown 成片云库</option>
+                        <option value="r2">Cloudflare R2</option>
+                      </select>
+                    </label>
+                    <label className="block">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">失败回退</span>
+                      <select value={storageDraft.fallback} onChange={(event) => updateStorageDraft({ fallback: event.target.value === 'none' ? 'none' : event.target.value === 'pressdown' ? 'pressdown' : 'r2' })} className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950">
+                        <option value="r2">Cloudflare R2</option>
+                        <option value="pressdown">Pressdown 成片云库</option>
+                        <option value="none">不回退</option>
+                      </select>
+                    </label>
+                    <div className="rounded-lg border border-cyan-100 bg-cyan-50/60 p-3 dark:border-cyan-500/20 dark:bg-cyan-500/10 lg:col-span-2">
+                      <div className="mb-3 flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-black">Pressdown 成片云库</div>
+                          <div className="mt-1 text-xs text-gray-500">通过签名接口获取 OSS 表单参数后直传图片。</div>
+                        </div>
+                        <button type="button" onClick={() => setStorageDraft((draft) => ({ ...draft, pressdown: { ...draft.pressdown, enabled: !draft.pressdown.enabled } }))} className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${storageDraft.pressdown.enabled ? 'bg-cyan-500' : 'bg-gray-300 dark:bg-gray-600'}`} aria-pressed={storageDraft.pressdown.enabled}>
+                          <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${storageDraft.pressdown.enabled ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                        </button>
+                      </div>
+                      <input value={storageDraft.pressdown.signatureUrl} onChange={(event) => setStorageDraft((draft) => ({ ...draft, pressdown: { ...draft.pressdown, signatureUrl: event.target.value } }))} placeholder="https://api.pressdown.co/v1/file/notAuthSignature/mannequin" className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950" />
+                    </div>
+                    <div className="rounded-lg border border-gray-200 bg-gray-50/70 p-3 dark:border-white/[0.08] dark:bg-white/[0.03] lg:col-span-2">
+                      <div className="mb-3 flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-black">Cloudflare R2 备用图床</div>
+                          <div className="mt-1 text-xs text-gray-500">按 S3 兼容协议上传，建议配置公开访问域名用于前端展示。</div>
+                        </div>
+                        <button type="button" onClick={() => setStorageDraft((draft) => ({ ...draft, r2: { ...draft.r2, enabled: !draft.r2.enabled } }))} className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${storageDraft.r2.enabled ? 'bg-cyan-500' : 'bg-gray-300 dark:bg-gray-600'}`} aria-pressed={storageDraft.r2.enabled}>
+                          <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${storageDraft.r2.enabled ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                        </button>
+                      </div>
+                      <div className="grid gap-3 lg:grid-cols-2">
+                        <input value={storageDraft.r2.accountId} onChange={(event) => setStorageDraft((draft) => ({ ...draft, r2: { ...draft.r2, accountId: event.target.value } }))} placeholder="Account ID" className="rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950" />
+                        <input value={storageDraft.r2.bucket} onChange={(event) => setStorageDraft((draft) => ({ ...draft, r2: { ...draft.r2, bucket: event.target.value } }))} placeholder="Bucket" className="rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950" />
+                        <input value={storageDraft.r2.accessKeyId} onChange={(event) => setStorageDraft((draft) => ({ ...draft, r2: { ...draft.r2, accessKeyId: event.target.value } }))} placeholder="Access Key ID" className="rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950" />
+                        <input type="password" value={storageDraft.r2.secretAccessKey ?? ''} onChange={(event) => setStorageDraft((draft) => ({ ...draft, r2: { ...draft.r2, secretAccessKey: event.target.value } }))} placeholder={storageDraft.r2.hasSecretAccessKey ? '已保存 Secret，留空不修改' : 'Secret Access Key'} className="rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950" />
+                        <input value={storageDraft.r2.prefix} onChange={(event) => setStorageDraft((draft) => ({ ...draft, r2: { ...draft.r2, prefix: event.target.value } }))} placeholder="images" className="rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950" />
+                        <input value={storageDraft.r2.publicHost} onChange={(event) => setStorageDraft((draft) => ({ ...draft, r2: { ...draft.r2, publicHost: event.target.value } }))} placeholder="https://img.example.com" className="rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950" />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div className="rounded-lg border border-gray-200 bg-white p-4 shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
+                  <div className="text-xs font-black uppercase tracking-[0.18em] text-cyan-600 dark:text-cyan-400">Storage Flow</div>
+                  <div className="mt-4 rounded-lg border border-gray-200 p-3 text-sm dark:border-white/[0.08]">
+                    <div className="font-black">{storageDraft.enabled ? '图床已启用' : '本地缓存模式'}</div>
+                    <div className="mt-1 text-xs leading-5 text-gray-500">启用后优先记录图床 URL；上传失败时仍保留本地 IndexedDB 和上游原始 URL。</div>
                   </div>
                 </div>
               </div>
@@ -1493,7 +1781,76 @@ export default function AdminDashboard() {
                     </button>
                   </div>
                   <div className="grid gap-4 p-4 lg:grid-cols-2">
-                    <label className="block lg:col-span-2">
+                    <div className="rounded-lg border border-gray-200 bg-gray-50/70 p-3 dark:border-white/[0.08] dark:bg-white/[0.03] lg:col-span-2">
+                      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                          <div className="text-xs font-black uppercase tracking-[0.18em] text-gray-500 dark:text-gray-400">Profiles</div>
+                          <div className="mt-1 text-sm font-black text-gray-950 dark:text-gray-50">API 配置列表</div>
+                          <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">为生图、Responses 与 Agent 分别维护连接配置，保存后统一由后台代理调用。</p>
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            onClick={duplicateApiProfile}
+                            className="rounded-md border border-gray-200 bg-white px-3 py-2 text-xs font-bold text-gray-700 transition hover:border-cyan-300 hover:text-cyan-700 dark:border-white/[0.08] dark:bg-gray-950 dark:text-gray-200"
+                          >
+                            复制当前
+                          </button>
+                          <button
+                            type="button"
+                            onClick={createApiProfile}
+                            className="inline-flex items-center gap-1.5 rounded-md bg-gray-900 px-3 py-2 text-xs font-bold text-white transition hover:bg-gray-700 dark:bg-white dark:text-gray-950"
+                          >
+                            <PlusIcon className="h-3.5 w-3.5" />
+                            新增配置
+                          </button>
+                        </div>
+                      </div>
+                      <div className="mt-3 grid gap-2 md:grid-cols-2">
+                        {apiDraft.profiles.map((profile) => {
+                          const active = profile.id === apiDraft.activeProfileId
+                          return (
+                            <div
+                              key={profile.id}
+                              className={`group flex min-w-0 items-stretch overflow-hidden rounded-md border transition ${
+                                active
+                                  ? 'border-cyan-300 bg-cyan-50 shadow-sm dark:border-cyan-500/40 dark:bg-cyan-500/10'
+                                  : 'border-gray-200 bg-white hover:border-gray-300 dark:border-white/[0.08] dark:bg-gray-950 dark:hover:border-white/[0.16]'
+                              }`}
+                            >
+                              <button
+                                type="button"
+                                onClick={() => switchApiProfile(profile.id)}
+                                className="min-w-0 flex-1 px-3 py-2 text-left"
+                              >
+                                <div className="flex min-w-0 items-center justify-between gap-2">
+                                  <span className="truncate text-sm font-black text-gray-950 dark:text-gray-50">{profile.name || '未命名配置'}</span>
+                                  {active && <span className="shrink-0 rounded bg-cyan-600 px-1.5 py-0.5 text-[10px] font-black text-white">当前</span>}
+                                </div>
+                                <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] font-semibold text-gray-500 dark:text-gray-400">
+                                  <span>{getApiProviderLabel(apiDraft, profile.provider)}</span>
+                                  <span className="h-1 w-1 rounded-full bg-gray-300 dark:bg-gray-600" />
+                                  <span>{profile.apiMode === 'responses' ? 'Responses API' : 'Images API'}</span>
+                                  <span className="h-1 w-1 rounded-full bg-gray-300 dark:bg-gray-600" />
+                                  <span className="max-w-[11rem] truncate font-mono">{profile.model || '未设置模型'}</span>
+                                </div>
+                              </button>
+                              {apiDraft.profiles.length > 1 && (
+                                <button
+                                  type="button"
+                                  onClick={() => deleteApiProfile(profile)}
+                                  className="flex w-10 shrink-0 items-center justify-center border-l border-gray-200 text-gray-400 transition hover:bg-red-50 hover:text-red-600 dark:border-white/[0.08] dark:hover:bg-red-500/10 dark:hover:text-red-300"
+                                  aria-label={`删除 ${profile.name || 'API 配置'}`}
+                                >
+                                  <TrashIcon className="h-4 w-4" />
+                                </button>
+                              )}
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+                    <label className="block">
                       <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">配置名称</span>
                       <input
                         value={activeApiProfile.name}
@@ -1501,40 +1858,18 @@ export default function AdminDashboard() {
                         className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm font-black outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
                       />
                     </label>
-                    <div className="rounded-lg border border-cyan-100 bg-cyan-50/70 p-3 dark:border-cyan-500/20 dark:bg-cyan-500/10 lg:col-span-2">
-                      <div className="flex flex-col gap-3 lg:flex-row lg:items-end">
-                        <label className="block min-w-0 flex-1">
-                          <span className="mb-1 block text-xs font-semibold text-cyan-800 dark:text-cyan-100">管理配置 URL</span>
-                          <input
-                            value={apiDraft.managementConfigUrl ?? ''}
-                            onChange={(event) => updateApiDraft({ managementConfigUrl: event.target.value })}
-                            placeholder="https://cpajp.cloud1024.com/v0/management/config.yaml"
-                            className="w-full rounded-md border border-cyan-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-500 dark:border-cyan-500/30 dark:bg-gray-950"
-                          />
-                        </label>
-                        <label className="block min-w-0 flex-1">
-                          <span className="mb-1 block text-xs font-semibold text-cyan-800 dark:text-cyan-100">管理配置授权 Token</span>
-                          <input
-                            type="password"
-                            value={apiDraft.managementConfigAuthToken ?? ''}
-                            onChange={(event) => updateApiDraft({ managementConfigAuthToken: event.target.value })}
-                            placeholder="Bearer token 或原始 token"
-                            className="w-full rounded-md border border-cyan-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-500 dark:border-cyan-500/30 dark:bg-gray-950"
-                          />
-                        </label>
-                        <button
-                          type="button"
-                          onClick={handleSyncManagementConfig}
-                          disabled={managementConfigBusy}
-                          className="rounded-md bg-cyan-700 px-3 py-2 text-sm font-bold text-white transition hover:bg-cyan-600 disabled:cursor-not-allowed disabled:opacity-50"
-                        >
-                          {managementConfigBusy ? '同步中...' : '拉取配置'}
-                        </button>
-                      </div>
-                      <div className="mt-2 text-xs leading-5 text-cyan-800/80 dark:text-cyan-100/80">
-                        后端会用 GET 请求读取 config.yaml，并带上 Authorization 请求头。{apiDraft.managementConfigUpdatedAt ? `上次同步：${formatFullDate(apiDraft.managementConfigUpdatedAt)}` : '尚未同步远程管理配置。'}
-                      </div>
-                    </div>
+                    <label className="block">
+                      <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">服务商类型</span>
+                      <select
+                        value={activeApiProfile.provider}
+                        onChange={(event) => handleApiProviderChange(event.target.value as ApiProvider)}
+                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                      >
+                        {apiProviderOptions.map((provider) => (
+                          <option key={provider.id} value={provider.id}>{provider.label}</option>
+                        ))}
+                      </select>
+                    </label>
                     <label className="block lg:col-span-2">
                       <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">API Base URL（含端口）</span>
                       <input
@@ -1555,14 +1890,22 @@ export default function AdminDashboard() {
                     </label>
                     <label className="block">
                       <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">API 模式</span>
-                      <select
-                        value={activeApiProfile.apiMode}
-                        onChange={(event) => updateApiProfileDraft({ apiMode: event.target.value as ApiMode })}
-                        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
-                      >
-                        <option value="images">Images API</option>
-                        <option value="responses">Responses API</option>
-                      </select>
+                      {activeApiProfile.provider === 'openai' ? (
+                        <select
+                          value={activeApiProfile.apiMode}
+                          onChange={(event) => handleApiModeChange(event.target.value as ApiMode)}
+                          className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-cyan-400 dark:border-white/[0.08] dark:bg-gray-950"
+                        >
+                          <option value="images">Images API</option>
+                          <option value="responses">Responses API</option>
+                        </select>
+                      ) : (
+                        <input
+                          value="Images API（服务商固定）"
+                          disabled
+                          className="w-full rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-500 outline-none dark:border-white/[0.08] dark:bg-white/[0.04]"
+                        />
+                      )}
                     </label>
                     <label className="block">
                       <span className="mb-1 block text-xs font-semibold text-gray-500 dark:text-gray-400">模型</span>
@@ -1574,20 +1917,22 @@ export default function AdminDashboard() {
                     </label>
                     <NumberField label="超时（秒）" value={activeApiProfile.timeout} min={1} onChange={(value) => updateApiProfileDraft({ timeout: value })} />
                     <NumberField label="中间步骤图像数" value={activeApiProfile.streamPartialImages ?? 1} min={0} onChange={(value) => updateApiProfileDraft({ streamPartialImages: value })} />
-                    <label className="flex items-center justify-between gap-3 rounded-md border border-gray-200 px-3 py-2 dark:border-white/[0.08] lg:col-span-2">
-                      <span>
-                        <span className="block text-xs font-semibold text-gray-500 dark:text-gray-400">流式传输</span>
-                        <span className="mt-1 block text-xs text-gray-400">开启后通过 Responses 流式事件接收中间图。</span>
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => updateApiProfileDraft({ streamImages: !activeApiProfile.streamImages })}
-                        className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${activeApiProfile.streamImages ? 'bg-cyan-500' : 'bg-gray-300 dark:bg-gray-600'}`}
-                        aria-pressed={Boolean(activeApiProfile.streamImages)}
-                      >
-                        <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${activeApiProfile.streamImages ? 'translate-x-4' : 'translate-x-0.5'}`} />
-                      </button>
-                    </label>
+                    {activeApiProfile.provider === 'openai' && (
+                      <label className="flex items-center justify-between gap-3 rounded-md border border-gray-200 px-3 py-2 dark:border-white/[0.08] lg:col-span-2">
+                        <span>
+                          <span className="block text-xs font-semibold text-gray-500 dark:text-gray-400">流式传输</span>
+                          <span className="mt-1 block text-xs text-gray-400">开启后通过 Responses 流式事件接收中间图。</span>
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => updateApiProfileDraft({ streamImages: !activeApiProfile.streamImages })}
+                          className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${activeApiProfile.streamImages ? 'bg-cyan-500' : 'bg-gray-300 dark:bg-gray-600'}`}
+                          aria-pressed={Boolean(activeApiProfile.streamImages)}
+                        >
+                          <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${activeApiProfile.streamImages ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                        </button>
+                      </label>
+                    )}
                     <div className="rounded-md bg-gray-50 p-3 text-xs text-gray-500 dark:bg-white/[0.04] lg:col-span-2">
                       前端运行地址固定为 <span className="font-mono text-gray-800 dark:text-gray-200">/backend-api/upstream</span>，真实 Base URL 与 Key 只由后台代理读取。
                     </div>
@@ -2010,6 +2355,7 @@ export default function AdminDashboard() {
                     contentEntries.map((entry) => {
                       const user = users.find((item) => item.id === entry.userId)
                       const group = groups.find((item) => item.id === entry.groupId)
+                      const auditImagePreviews = getContentAuditImagePreviews(entry)
                       return (
                         <article key={entry.id} className="rounded-lg border border-gray-200 bg-white p-4 shadow-sm transition hover:border-fuchsia-200 dark:border-white/[0.08] dark:bg-white/[0.04] dark:hover:border-fuchsia-500/50">
                           <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
@@ -2019,7 +2365,12 @@ export default function AdminDashboard() {
                                 <span className="rounded-md bg-fuchsia-50 px-2 py-1 text-xs font-bold text-fuchsia-700 dark:bg-fuchsia-400/10 dark:text-fuchsia-200">{contentSourceLabels[entry.source]}</span>
                                 <span className="font-mono text-xs text-gray-400">#{entry.clientRecordId.slice(0, 28)}</span>
                               </div>
-                              <h3 className="mt-2 line-clamp-2 text-base font-black">{entry.prompt || (entry.kind === 'image' ? '未记录提示词' : '未记录用户输入')}</h3>
+                              <AgentReferenceText
+                                as="h3"
+                                text={entry.prompt}
+                                fallback={entry.kind === 'image' ? '未记录提示词' : '未记录用户输入'}
+                                className="mt-2 line-clamp-2 text-base font-black"
+                              />
                               <div className="mt-1 text-xs text-gray-500">
                                 {(user?.displayName ?? entry.userDisplayName) || '未知用户'} · {(user?.email ?? entry.userEmail) || entry.userId} · {formatFullDate(entry.createdAt)}
                               </div>
@@ -2037,27 +2388,66 @@ export default function AdminDashboard() {
                               {entry.imageUrls.length > 0 ? (
                                 <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                                   {entry.imageUrls.map((url, index) => (
-                                    <a key={`${entry.id}:${url}`} href={url} target="_blank" rel="noreferrer" className="group block overflow-hidden rounded-lg border border-gray-100 bg-gray-50 dark:border-white/[0.06] dark:bg-gray-950">
+                                    <button
+                                      key={`${entry.id}:${url}`}
+                                      type="button"
+                                      onClick={() => setLightboxImageId(url, entry.imageUrls)}
+                                      className="group block overflow-hidden rounded-lg border border-gray-100 bg-gray-50 text-left dark:border-white/[0.06] dark:bg-gray-950"
+                                    >
                                       <img src={url} alt={`生成图片 ${index + 1}`} loading="lazy" referrerPolicy="no-referrer" className="aspect-square w-full object-cover transition group-hover:scale-[1.02]" />
                                       <div className="truncate px-2 py-1.5 font-mono text-[11px] text-gray-400">{url}</div>
-                                    </a>
+                                    </button>
+                                  ))}
+                                </div>
+                              ) : auditImagePreviews.length > 0 ? (
+                                <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                                  {auditImagePreviews.map((url, index) => (
+                                    <button
+                                      key={`${entry.id}:preview:${index}`}
+                                      type="button"
+                                      onClick={() => setLightboxImageId(url, auditImagePreviews)}
+                                      className="group block overflow-hidden rounded-lg border border-gray-100 bg-gray-50 text-left dark:border-white/[0.06] dark:bg-gray-950"
+                                    >
+                                      <img src={url} alt={`审计预览 ${index + 1}`} loading="lazy" referrerPolicy="no-referrer" className="aspect-square w-full object-cover transition group-hover:scale-[1.02]" />
+                                      <div className="truncate px-2 py-1.5 text-[11px] text-gray-400">审计预览 · 本地图片 ID：{entry.imageIds[index] ?? '未记录'}</div>
+                                    </button>
                                   ))}
                                 </div>
                               ) : (
-                                <div className="rounded-lg border border-dashed border-gray-200 bg-gray-50 p-4 text-sm text-gray-500 dark:border-white/[0.08] dark:bg-gray-950">
-                                  这条图片记录没有原始 URL；本地图片 ID：{entry.imageIds.length > 0 ? entry.imageIds.join('、') : '未记录'}
-                                </div>
+                                <ContentAuditLocalPreviewGrid entryId={entry.id} imageIds={entry.imageIds} />
                               )}
                             </div>
                           ) : (
                             <div className="mt-4 grid gap-3 lg:grid-cols-2">
                               <div className="rounded-lg bg-gray-50 p-3 dark:bg-gray-950">
                                 <div className="text-xs font-black text-gray-500 dark:text-gray-400">用户输入</div>
-                                <div className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-words text-sm leading-6">{entry.prompt || '未记录'}</div>
+                                <AgentReferenceText
+                                  text={entry.prompt}
+                                  fallback="未记录"
+                                  className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-words text-sm leading-6"
+                                />
                               </div>
                               <div className="rounded-lg bg-gray-50 p-3 dark:bg-gray-950">
                                 <div className="text-xs font-black text-gray-500 dark:text-gray-400">助手回复</div>
-                                <div className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-words text-sm leading-6">{entry.assistantText || '未记录'}</div>
+                                {entry.assistantText ? (
+                                  <MarkdownRenderer content={formatAgentReferenceTagsForDisplay(entry.assistantText)} className="content-audit-assistant-markdown mt-2 max-h-40 overflow-auto text-sm leading-6" />
+                                ) : (
+                                  <div className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words text-sm leading-6">未记录</div>
+                                )}
+                                {auditImagePreviews.length > 0 && (
+                                  <div className="mt-3 grid grid-cols-3 gap-2">
+                                    {auditImagePreviews.slice(0, 6).map((url, index) => (
+                                      <button
+                                        key={`${entry.id}:chat-preview:${index}`}
+                                        type="button"
+                                        onClick={() => setLightboxImageId(url, auditImagePreviews)}
+                                        className="overflow-hidden rounded-md border border-gray-200 dark:border-white/[0.08]"
+                                      >
+                                        <img src={url} alt={`输出预览 ${index + 1}`} loading="lazy" referrerPolicy="no-referrer" className="aspect-square w-full object-cover" />
+                                      </button>
+                                    ))}
+                                  </div>
+                                )}
                               </div>
                             </div>
                           )}

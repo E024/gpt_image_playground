@@ -102,7 +102,7 @@ vi.mock('./lib/transparentImage', () => ({
 vi.mock('./lib/agentApi', () => ({
   callAgentConversationTitleApi: vi.fn(async () => '标题'),
   callAgentResponsesApi: vi.fn(() => new Promise(() => {})),
-  callBatchImageSingle: vi.fn(async (opts: { batchItemId: string; prompt: string }) => ({
+  callBatchImageSingle: vi.fn(async (opts: { batchItemId: string; prompt: string; referenceUpstreamState?: unknown }) => ({
     batchItemId: opts.batchItemId,
     image: { dataUrl: 'data:image/png;base64,batch-output', revisedPrompt: opts.prompt },
     error: null,
@@ -178,6 +178,7 @@ beforeEach(() => {
     authSession: testAuthSession,
     authReady: true,
     setupRequired: false,
+    systemSettings: { siteName: '造像台', agentEnabled: true },
     chargeCurrentUserQuota: vi.fn(async () => true),
   })
 })
@@ -226,6 +227,61 @@ describe('backend group state normalization', () => {
       const [user] = useStore.getState().users
       expect(user.groupId).toBe(studioGroup.id)
       expect(user.planId).toBe(studioPlan.id)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+})
+
+describe('system settings', () => {
+  it('persists the global Agent feature switch', async () => {
+    let requestBody: unknown = null
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestBody = init?.body ? JSON.parse(String(init.body)) : null
+      return new Response(JSON.stringify({
+        groups: [testGroup],
+        plans: [testPlan],
+        users: [testUser],
+        billingLedger: [],
+        authSession: testAuthSession,
+        setupRequired: false,
+        apiSettings: null,
+        adminApiSettings: null,
+        systemSettings: { siteName: '造像台', agentEnabled: false },
+        emailSettings: null,
+        rewardState: null,
+      }), { status: 200 })
+    }))
+
+    try {
+      await useStore.getState().updateSystemSettings({ siteName: '造像台', agentEnabled: false })
+
+      expect(requestBody).toMatchObject({ settings: { siteName: '造像台', agentEnabled: false } })
+      expect(useStore.getState().systemSettings.agentEnabled).toBe(false)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('keeps Agent enabled when backend sends legacy system settings', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      groups: [testGroup],
+      plans: [testPlan],
+      users: [testUser],
+      billingLedger: [],
+      authSession: testAuthSession,
+      setupRequired: false,
+      apiSettings: null,
+      adminApiSettings: null,
+      systemSettings: { siteName: '造像台' },
+      emailSettings: null,
+      rewardState: null,
+    }), { status: 200 })))
+
+    try {
+      await useStore.getState().syncBackendState()
+
+      expect(useStore.getState().systemSettings).toMatchObject({ siteName: '造像台', agentEnabled: true })
     } finally {
       vi.unstubAllGlobals()
     }
@@ -1475,13 +1531,57 @@ describe('agent context for removed outputs', () => {
     expect(serializedInput).toContain('input_image')
   })
 
+  it('continues the previous upstream Agent planning conversation on the next user turn', async () => {
+    useStore.setState((state) => ({
+      tasks: [],
+      agentConversations: state.agentConversations.map((conversation) => ({
+        ...conversation,
+        rounds: conversation.rounds.map((round) => round.id === 'round-a'
+          ? {
+              ...round,
+              outputTaskIds: [],
+              responseOutput: [{
+                type: 'message',
+                content: [{ type: 'output_text', text: '请补充表情和风格。' }],
+                upstream_conversation_id: 'conversation-agent-1',
+                upstream_parent_message_id: 'parent-agent-1',
+                upstream_account_ref: 'token:agent-1',
+              }],
+            }
+          : round,
+        ),
+        messages: conversation.messages.map((message) => message.id === 'assistant-a'
+          ? { ...message, content: '请补充表情和风格。', outputTaskIds: [] }
+          : message,
+        ),
+      })),
+    }))
+
+    await submitAgentMessage()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    const callArgs = vi.mocked(callAgentResponsesApi).mock.calls[0][0]
+    expect(callArgs.upstreamState).toEqual({
+      upstream_conversation_id: 'conversation-agent-1',
+      upstream_parent_message_id: 'parent-agent-1',
+      upstream_account_ref: 'token:agent-1',
+    })
+  })
+
   it('restores stripped image_generation results from task payloads when building context', async () => {
     await putImage({ id: 'image-live', dataUrl: 'data:image/png;base64,live-base64' })
     const rawResponsePayload = JSON.stringify({
       output: [
         { type: 'message', content: [{ type: 'output_text', text: '已生成两张图。' }] },
         { type: 'image_generation_call', id: 'deleted-call', result: 'deleted-base64' },
-        { type: 'image_generation_call', id: 'live-call', result: 'live-base64' },
+        {
+          type: 'image_generation_call',
+          id: 'live-call',
+          result: 'live-base64',
+          upstream_conversation_id: 'conversation-live',
+          upstream_parent_message_id: 'parent-live',
+          upstream_account_ref: 'token:live',
+        },
       ],
     }, null, 2)
     useStore.setState((state) => ({
@@ -1519,6 +1619,10 @@ describe('agent context for removed outputs', () => {
     expect(serializedInput).not.toContain('deleted-base64')
     expect(serializedInput).not.toContain('live-call')
     expect(serializedInput).not.toContain('image_generation_call')
+    expect(serializedInput).toContain('upstream_conversation_id')
+    expect(serializedInput).toContain('conversation-live')
+    expect(serializedInput).toContain('parent-live')
+    expect(serializedInput).toContain('token:live')
   })
 
   it('hydrates stripped task payload image results from stored images when building context', async () => {
@@ -1823,8 +1927,34 @@ describe('agent batch reference resolution', () => {
       params: { ...DEFAULT_PARAMS },
       appMode: 'agent',
       tasks: [
-        task({ id: 'task-branch-a', outputImages: [imageA.id], sourceMode: 'agent', agentRoundId: 'round-2-a' }),
-        task({ id: 'task-branch-b', outputImages: [imageB.id], sourceMode: 'agent', agentRoundId: 'round-2-b' }),
+        task({
+          id: 'task-branch-a',
+          outputImages: [imageA.id],
+          sourceMode: 'agent',
+          agentRoundId: 'round-2-a',
+          rawResponsePayload: JSON.stringify({
+            output: [{
+              type: 'image_generation_call',
+              upstream_conversation_id: 'conversation-branch-a',
+              upstream_parent_message_id: 'parent-branch-a',
+              upstream_account_ref: 'token:branch-a',
+            }],
+          }),
+        }),
+        task({
+          id: 'task-branch-b',
+          outputImages: [imageB.id],
+          sourceMode: 'agent',
+          agentRoundId: 'round-2-b',
+          rawResponsePayload: JSON.stringify({
+            output: [{
+              type: 'image_generation_call',
+              upstream_conversation_id: 'conversation-branch-b',
+              upstream_parent_message_id: 'parent-branch-b',
+              upstream_account_ref: 'token:branch-b',
+            }],
+          }),
+        }),
       ],
       agentConversations: [agentConversation({
         id: 'conversation-a',
@@ -1923,6 +2053,11 @@ describe('agent batch reference resolution', () => {
     expect(batchArgs.referenceImageDataUrls).toEqual([imageB.dataUrl])
     expect(batchArgs.referenceImageDataUrls).not.toContain(imageA.dataUrl)
     expect(batchArgs.referenceIds).toEqual(['round-2-image-1'])
+    expect(batchArgs.referenceUpstreamState).toEqual({
+      upstream_conversation_id: 'conversation-branch-b',
+      upstream_parent_message_id: 'parent-branch-b',
+      upstream_account_ref: 'token:branch-b',
+    })
   })
 
   it('resolves batch references to current round input images', async () => {

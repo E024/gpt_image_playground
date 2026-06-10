@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState, useRef, useCallback, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
 import type { AgentConversation, AgentMessage, AgentRound, ResponsesOutputItem, TaskRecord } from '../types'
-import { deleteAgentRoundFromConversation, editOutputs, getActiveAgentRounds, getAgentBranchLeafId, getAgentSiblingRounds, getCachedImage, ensureImageCached, regenerateAgentAssistantMessage, remapAgentRoundMentionsForPathChange, removeMultipleTasks, removeTask, reuseConfig, useStore } from '../store'
+import { deleteAgentRoundFromConversation, editOutputs, getActiveAgentRounds, getAgentBranchLeafId, getAgentSiblingRounds, getCachedImage, ensureImageCached, regenerateAgentAssistantMessage, remapAgentRoundMentionsForPathChange, repairAgentMarkdownImageTasks, removeMultipleTasks, removeTask, reuseConfig, useStore } from '../store'
 import { getPromptMentionParts } from '../lib/promptImageMentions'
+import { stripAgentMarkdownImages } from '../lib/agentMarkdownImages'
 import { copyTextToClipboard, getClipboardFailureMessage } from '../lib/clipboard'
 import { collectWebSearchCalls, getAgentRoundOutputItems, getWebSearchStatusForCalls, type AgentWebSearchStatus } from '../lib/agentWebSearch'
 import { createMaskPreviewDataUrl } from '../lib/canvasImage'
@@ -284,6 +285,13 @@ function getAgentAssistantCopyContent(fallbackContent: string, blocks: AgentAssi
   return parts.length > 0 ? parts.join('\n\n') : fallbackContent
 }
 
+function getAgentAssistantTextDisplayContent(content: string, blocks: AgentAssistantBlock[]) {
+  const hasMarkdownImageTask = blocks.some((block) =>
+    block.type === 'image-task' && block.task.agentToolAction === 'markdown_image'
+  )
+  return hasMarkdownImageTask ? stripAgentMarkdownImages(content) : content
+}
+
 function getConversationSearchText(conversation: AgentConversation) {
   return [
     conversation.title,
@@ -543,6 +551,11 @@ export default function AgentWorkspace() {
     }
     return messages
   }, [activeRounds, conversation])
+
+  useEffect(() => {
+    if (appMode !== 'agent' || !conversation?.id) return
+    void repairAgentMarkdownImageTasks(conversation.id)
+  }, [appMode, conversation?.id])
 
   useEffect(() => {
     const conversationId = conversation?.id ?? null
@@ -1089,7 +1102,11 @@ export default function AgentWorkspace() {
                           <>
                             {assistantBlocks.length > 0 ? assistantBlocks.map((block, index) => {
                               if (block.type === 'web-search') return <AgentWebSearchStatusLines key={block.key} statuses={[block.status]} />
-                              if (block.type === 'text') return <div key={block.key} className={index > 0 ? 'mt-3' : undefined}><MarkdownRenderer content={block.content ?? message.content} streaming={isStreamingAssistant} /></div>
+                              if (block.type === 'text') {
+                                const displayContent = getAgentAssistantTextDisplayContent(block.content ?? message.content, assistantBlocks)
+                                if (!displayContent.trim()) return null
+                                return <div key={block.key} className={index > 0 ? 'mt-3' : undefined}><MarkdownRenderer content={displayContent} streaming={isStreamingAssistant} /></div>
+                              }
                               if (block.type === 'batch-params') {
                                 return (
                                   <div key={block.key} className={index > 0 ? 'mt-3' : undefined}>

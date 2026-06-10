@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DEFAULT_PARAMS } from '../types'
 import { createDefaultOpenAIProfile, DEFAULT_SETTINGS } from './apiProfiles'
-import { callAgentConversationTitleApi, callAgentResponsesApi } from './agentApi'
+import { callAgentConversationTitleApi, callAgentResponsesApi, callBatchImageSingle } from './agentApi'
 
 describe('callAgentResponsesApi', () => {
   afterEach(() => {
@@ -77,6 +77,40 @@ describe('callAgentResponsesApi', () => {
     const [, init] = fetchMock.mock.calls[0]
     const body = JSON.parse(String((init as RequestInit).body))
     expect(body.tools[0].input_image_mask).toEqual({ image_url: 'data:image/png;base64,bWFzaw==' })
+  })
+
+  it('passes upstream state to Agent Responses calls', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      output: [{
+        type: 'message',
+        content: [{ type: 'output_text', text: 'OK' }],
+      }],
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    const profile = createDefaultOpenAIProfile({
+      apiKey: 'test-key',
+      apiMode: 'responses',
+    })
+
+    await callAgentResponsesApi({
+      settings: DEFAULT_SETTINGS,
+      profile,
+      params: DEFAULT_PARAMS,
+      input: [{ role: 'user', content: [{ type: 'input_text', text: 'continue' }] }],
+      upstreamState: {
+        upstream_conversation_id: 'conversation-1',
+        upstream_parent_message_id: 'parent-1',
+        upstream_account_ref: 'token:abc',
+      },
+    })
+
+    const [, init] = fetchMock.mock.calls[0]
+    const body = JSON.parse(String((init as RequestInit).body))
+    expect(body.upstream_conversation_id).toBe('conversation-1')
+    expect(body.upstream_parent_message_id).toBe('parent-1')
+    expect(body.upstream_account_ref).toBe('token:abc')
   })
 
   it('extracts image_generation results from base64 object fields', async () => {
@@ -224,5 +258,42 @@ describe('callAgentResponsesApi', () => {
     expect(body.tools).toEqual(expect.arrayContaining([{ type: 'web_search' }]))
     expect(result.text).toBe('See [OpenAI docs](https://platform.openai.com/docs).')
     expect(result.outputItems?.[0]).toMatchObject({ type: 'web_search_call', status: 'completed' })
+  })
+
+  it('passes upstream conversation state for batch image references', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      output: [{
+        type: 'image_generation_call',
+        id: 'ig_1',
+        result: 'ZmluYWw=',
+      }],
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    const profile = createDefaultOpenAIProfile({
+      apiKey: 'test-key',
+      apiMode: 'responses',
+    })
+
+    await callBatchImageSingle({
+      profile,
+      params: DEFAULT_PARAMS,
+      batchItemId: 'batch-1',
+      prompt: '参考 <ref id="round-1-image-1" /> 生成',
+      referenceImageDataUrls: ['data:image/png;base64,YQ=='],
+      referenceIds: ['round-1-image-1'],
+      referenceUpstreamState: {
+        upstream_conversation_id: 'conversation-1',
+        upstream_parent_message_id: 'parent-1',
+        upstream_account_ref: 'token:abc',
+      },
+    })
+
+    const [, init] = fetchMock.mock.calls[0]
+    const body = JSON.parse(String((init as RequestInit).body))
+    expect(body.upstream_conversation_id).toBe('conversation-1')
+    expect(body.upstream_parent_message_id).toBe('parent-1')
+    expect(body.upstream_account_ref).toBe('token:abc')
   })
 })

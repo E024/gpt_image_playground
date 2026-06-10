@@ -1,11 +1,12 @@
 import { useEffect, useState, useRef, type ReactNode } from 'react'
 import type { TaskRecord } from '../types'
-import { useStore, ensureImageThumbnailCached, subscribeImageThumbnail, retryTask } from '../store'
+import { useStore, ensureImageCached, ensureImageThumbnailCached, subscribeImageThumbnail, retryTask } from '../store'
 import { formatImageRatio } from '../lib/size'
 import { getParamDisplay, ActualValueBadge } from '../lib/paramDisplay'
 import { DEFAULT_IMAGES_MODEL, DEFAULT_FAL_MODEL } from '../lib/apiProfiles'
 import { isAgentTaskPromptPending } from '../lib/taskPromptDisplay'
 import { CodeIcon, TransparentBgIcon } from './icons'
+import AgentReferenceText from './AgentReferenceText'
 import ViewportTooltip from './ViewportTooltip'
 
 interface Props {
@@ -67,6 +68,7 @@ export default function TaskCard({
   disableSwipe,
 }: Props) {
   const [thumbSrc, setThumbSrc] = useState<string>('')
+  const [coverSrc, setCoverSrc] = useState<string>('')
   const [coverRatio, setCoverRatio] = useState<string>('')
   const [coverSize, setCoverSize] = useState<string>('')
   const [now, setNow] = useState(Date.now())
@@ -250,6 +252,7 @@ export default function TaskCard({
     setCoverRatio('')
     setCoverSize('')
     setThumbSrc('')
+    setCoverSrc('')
 
     let cancelled = false
     const imageId = task.outputImages?.[0]
@@ -266,6 +269,11 @@ export default function TaskCard({
 
     if (imageId) {
       unsubscribe = subscribeImageThumbnail(imageId, applyThumbnail)
+      ensureImageCached(imageId).then((src) => {
+        if (!cancelled && src) setCoverSrc(src)
+      }).catch(() => {
+        if (!cancelled) setCoverSrc(task.rawImageUrls?.[0] ?? '')
+      })
       ensureImageThumbnailCached(imageId).then((thumbnail) => {
         if (cancelled || !thumbnail) return
         applyThumbnail(thumbnail)
@@ -278,7 +286,7 @@ export default function TaskCard({
       cancelled = true
       unsubscribe?.()
     }
-  }, [task.outputImages])
+  }, [task.outputImages, task.rawImageUrls])
 
   const duration = (() => {
     let seconds: number
@@ -321,6 +329,7 @@ export default function TaskCard({
   const defaultModelForProvider = task.apiProvider === 'fal' ? DEFAULT_FAL_MODEL : DEFAULT_IMAGES_MODEL
   const showModel = task.apiModel && task.apiModel !== defaultModelForProvider
   const isInterrupted = task.status === 'error' && task.error === '已停止生成。'
+  const displayImageSrc = thumbSrc || coverSrc || task.rawImageUrls?.[0] || ''
 
   return (
     <div className="relative rounded-xl">
@@ -477,14 +486,15 @@ export default function TaskCard({
               </span>
             </div>
           )}
-          {task.status === 'done' && thumbSrc && (
+          {task.status === 'done' && displayImageSrc && (
             <>
               <img
-                src={thumbSrc}
+                src={displayImageSrc}
                 data-image-id={task.outputImages[0]}
                 data-output-image-ids={task.outputImages.join(',')}
                 className="saveable-image w-full h-full object-cover"
                 loading="lazy"
+                referrerPolicy="no-referrer"
                 alt=""
               />
               {task.outputImages.length > 1 && (
@@ -494,7 +504,7 @@ export default function TaskCard({
               )}
             </>
           )}
-          {task.status === 'done' && !thumbSrc && (
+          {task.status === 'done' && !displayImageSrc && (
             <svg
               className="w-8 h-8 text-gray-300"
               fill="none"
@@ -540,9 +550,12 @@ export default function TaskCard({
                 <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">输入内容将在响应完成时接收</p>
               </div>
             ) : (
-              <p className="text-sm text-gray-700 dark:text-gray-300 leading-relaxed line-clamp-3">
-                {task.prompt || '(无提示词)'}
-              </p>
+              <AgentReferenceText
+                as="p"
+                text={task.prompt}
+                fallback="(无提示词)"
+                className="text-sm text-gray-700 dark:text-gray-300 leading-relaxed line-clamp-3"
+              />
             )}
           </div>
           <div className="mt-auto flex flex-col gap-1.5">

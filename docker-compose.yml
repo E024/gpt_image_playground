@@ -1,0 +1,36 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: deploy/backend.Dockerfile
+    container_name: zaoxiangtai-backend
+    restart: unless-stopped
+    environment:
+      BACKEND_API_HOST: 0.0.0.0
+      BACKEND_API_PORT: 3018
+      BACKEND_SQLITE_PATH: /data/backend.sqlite
+      APP_BASE_URL: http://localhost:4017
+      SITE_NAME: 造像台
+    volumes:
+      - ./docker-data/backend:/data
+    ports:
+      - "3018:3018"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    container_name: zaoxiangtai-frontend
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: 80
+      DEFAULT_API_URL: ""
+      ENABLE_API_PROXY: "false"
+      LOCK_API_PROXY: "false"
+    volumes:
+      - ./deploy/nginx.local.conf:/etc/nginx/templates/default.conf.template:ro
+    ports:
+      - "4017:80"
+    depends_on:
+      - backend

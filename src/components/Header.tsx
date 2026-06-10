@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { canManagedUserUseAgent, useStore } from '../store'
+import { canManagedUserUseAgent, isAgentFeatureEnabled, useStore } from '../store'
 import { useVersionCheck } from '../hooks/useVersionCheck'
 import { useTooltip } from '../hooks/useTooltip'
 import { dismissAllTooltips } from '../lib/tooltipDismiss'
@@ -52,8 +52,9 @@ export default function Header() {
   const currentGroupQuotaBalance = currentGroup?.quotaBalance ?? 0
   const currentTotalQuotaBalance = (currentUser?.quotaBalance ?? 0) + currentGroupQuotaBalance
   const canOpenBackend = Boolean(currentUser)
-  const canOpenAgent = canManagedUserUseAgent(currentUser)
-  const siteName = useStore((s) => s.systemSettings.siteName)
+  const systemSettings = useStore((s) => s.systemSettings)
+  const canOpenAgent = isAgentFeatureEnabled(systemSettings) && canManagedUserUseAgent(currentUser)
+  const siteName = systemSettings.siteName
 
   useEffect(() => {
     if (appMode === 'agent') {

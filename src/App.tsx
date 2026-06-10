@@ -1,5 +1,5 @@
 import { useEffect } from 'react'
-import { canManagedUserUseAgent, initStore } from './store'
+import { canManagedUserUseAgent, initStore, isAgentFeatureEnabled } from './store'
 import { useStore } from './store'
 import { buildSettingsFromUrlParams, clearUrlSettingParams, hasUrlSettingParams } from './lib/urlSettings'
 import { mergeImportedSettings } from './lib/apiProfiles'
@@ -35,7 +35,9 @@ export default function App() {
   const setAppMode = useStore((s) => s.setAppMode)
   const filterFavorite = useStore((s) => s.filterFavorite)
   const activeFavoriteCollectionId = useStore((s) => s.activeFavoriteCollectionId)
-  const siteName = useStore((s) => s.systemSettings.siteName)
+  const systemSettings = useStore((s) => s.systemSettings)
+  const siteName = systemSettings.siteName
+  const agentEnabled = isAgentFeatureEnabled(systemSettings)
   const currentUser = users.find((user) => user.id === authSession?.userId) ?? null
   useDockerApiUrlMigrationNotice()
   useGlobalClickSuppression()
@@ -84,10 +86,10 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    if (appMode === 'agent' && !canManagedUserUseAgent(currentUser)) {
+    if (appMode === 'agent' && (!agentEnabled || !canManagedUserUseAgent(currentUser))) {
       setAppMode('gallery')
     }
-  }, [appMode, currentUser, setAppMode])
+  }, [agentEnabled, appMode, currentUser, setAppMode])
 
   useEffect(() => {
     document.title = siteName || '造像台'
