@@ -130,7 +130,10 @@ export default function App() {
     if (!authReady || !authSession) return
     const nextUrl = getRoutedUrl(appMode)
     const currentUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`
-    if (currentUrl === nextUrl) return
+    if (currentUrl === nextUrl) {
+      routeModeRestorePendingRef.current = false
+      return
+    }
 
     const routeMode = getAppModeFromPath(window.location.pathname)
     if (routeModeRestorePendingRef.current) {
