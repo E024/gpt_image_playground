@@ -156,6 +156,55 @@ describe('callAgentResponsesApi', () => {
     expect(body.upstream_account_ref).toBe('token:abc')
   })
 
+  it('shapes Agent Responses calls like Codex CLI when compatibility mode is enabled', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      output: [{
+        type: 'message',
+        content: [{ type: 'output_text', text: 'OK' }],
+      }],
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    const profile = createDefaultOpenAIProfile({
+      apiKey: 'test-key',
+      apiMode: 'responses',
+      codexCli: true,
+      streamImages: false,
+    })
+
+    await callAgentResponsesApi({
+      settings: DEFAULT_SETTINGS,
+      profile,
+      params: DEFAULT_PARAMS,
+      input: [{ role: 'user', content: [{ type: 'input_text', text: 'prompt' }] }],
+    })
+
+    const [, init] = fetchMock.mock.calls[0]
+    const headers = (init as RequestInit).headers as Record<string, string>
+    const body = JSON.parse(String((init as RequestInit).body))
+    expect(headers.Accept).toBe('text/event-stream')
+    expect(body).toMatchObject({
+      store: false,
+      stream: true,
+      tool_choice: 'auto',
+      parallel_tool_calls: true,
+      reasoning: { effort: 'medium' },
+      include: ['reasoning.encrypted_content'],
+      text: { verbosity: 'low' },
+    })
+    expect(body.prompt_cache_key).toEqual(expect.any(String))
+    expect(body.client_metadata).toMatchObject({
+      'x-codex-installation-id': expect.any(String),
+      'x-codex-window-id': expect.any(String),
+    })
+    expect(body.tools[0]).toEqual({ type: 'image_generation', size: 'auto' })
+    expect(body.tools[0].action).toBeUndefined()
+    expect(body.tools[0].quality).toBeUndefined()
+    expect(body.tools.find((tool: any) => tool.name === 'generate_image_batch')?.strict).toBe(false)
+    expect(body.tools.find((tool: any) => tool.name === 'continue_generation')?.strict).toBe(false)
+  })
+
   it('extracts image_generation results from base64 object fields', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
       output: [{
@@ -338,5 +387,48 @@ describe('callAgentResponsesApi', () => {
     expect(body.upstream_conversation_id).toBe('conversation-1')
     expect(body.upstream_parent_message_id).toBe('parent-1')
     expect(body.upstream_account_ref).toBe('token:abc')
+  })
+
+  it('shapes batch image Responses calls for Codex CLI compatibility', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      output: [{
+        type: 'image_generation_call',
+        id: 'ig_1',
+        result: 'ZmluYWw=',
+      }],
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    const profile = createDefaultOpenAIProfile({
+      apiKey: 'test-key',
+      apiMode: 'responses',
+      codexCli: true,
+      streamImages: false,
+    })
+
+    const result = await callBatchImageSingle({
+      profile,
+      params: DEFAULT_PARAMS,
+      batchItemId: 'batch-1',
+      prompt: '生成一张图',
+      referenceImageDataUrls: [],
+    })
+
+    const [, init] = fetchMock.mock.calls[0]
+    const headers = (init as RequestInit).headers as Record<string, string>
+    const body = JSON.parse(String((init as RequestInit).body))
+    expect(headers.Accept).toBe('text/event-stream')
+    expect(body).toMatchObject({
+      store: false,
+      stream: true,
+      tool_choice: 'required',
+      parallel_tool_calls: true,
+      reasoning: { effort: 'medium' },
+      include: ['reasoning.encrypted_content'],
+      text: { verbosity: 'low' },
+    })
+    expect(body.tools).toEqual([{ type: 'image_generation', size: 'auto' }])
+    expect(result.image?.dataUrl).toBe('data:image/png;base64,ZmluYWw=')
   })
 })

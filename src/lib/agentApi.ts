@@ -80,14 +80,60 @@ const AGENT_TITLE_INSTRUCTIONS = [
 
 const AGENT_TITLE_MAX_LENGTH = 28
 
-function createHeaders(profile: ApiProfile): Record<string, string> {
-  return {
+const CODEX_RESPONSES_INCLUDE = ['reasoning.encrypted_content'] as const
+const CODEX_RESPONSES_REASONING_EFFORT = 'medium'
+const CODEX_RESPONSES_TEXT_VERBOSITY = 'low'
+
+function createCodexCompatibilityId(prefix: string) {
+  return globalThis.crypto?.randomUUID?.() ?? `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+const CODEX_PROMPT_CACHE_KEY = createCodexCompatibilityId('zxt-agent')
+const CODEX_CLIENT_INSTALLATION_ID = createCodexCompatibilityId('zxt-install')
+
+function applyCodexResponsesCompatibility(body: Record<string, unknown>, options: { stream?: boolean } = {}) {
+  body.store = false
+  body.tool_choice ??= 'auto'
+  body.parallel_tool_calls ??= true
+  body.reasoning ??= { effort: CODEX_RESPONSES_REASONING_EFFORT }
+  body.include ??= [...CODEX_RESPONSES_INCLUDE]
+  body.text ??= { verbosity: CODEX_RESPONSES_TEXT_VERBOSITY }
+  body.prompt_cache_key ??= CODEX_PROMPT_CACHE_KEY
+  body.client_metadata ??= {
+    'x-codex-installation-id': CODEX_CLIENT_INSTALLATION_ID,
+    'x-codex-window-id': `${CODEX_PROMPT_CACHE_KEY}:0`,
+  }
+  if (options.stream) body.stream = true
+}
+
+function createHeaders(profile: ApiProfile, acceptsEventStream = false): Record<string, string> {
+  const headers: Record<string, string> = {
     Authorization: `Bearer ${profile.apiKey}`,
     'Content-Type': 'application/json',
   }
+  if (acceptsEventStream) headers.Accept = 'text/event-stream'
+  return headers
 }
 
 function createImageTool(params: TaskParams, profile: ApiProfile, maskDataUrl?: string): Record<string, unknown> {
+  if (profile.codexCli) {
+    const tool: Record<string, unknown> = {
+      type: 'image_generation',
+      size: params.size,
+    }
+    if (params.output_format !== 'png') tool.output_format = params.output_format
+    if (params.moderation !== 'auto') tool.moderation = params.moderation
+    if (params.output_format !== 'png' && params.output_compression != null) {
+      tool.output_compression = params.output_compression
+    }
+    if (maskDataUrl) {
+      tool.input_image_mask = {
+        image_url: maskDataUrl,
+      }
+    }
+    return tool
+  }
+
   const tool: Record<string, unknown> = {
     type: 'image_generation',
     action: 'auto',
@@ -117,6 +163,7 @@ function createImageTool(params: TaskParams, profile: ApiProfile, maskDataUrl?: 
 
 function createAgentTools(params: TaskParams, profile: ApiProfile, settings: AppSettings, maskDataUrl?: string): Array<Record<string, unknown>> {
   const tools: Array<Record<string, unknown>> = [createImageTool(params, profile, maskDataUrl)]
+  const strictFunctionTools = !profile.codexCli
 
   // generate_image_batch: custom function tool for concurrent multi-image generation
   tools.push({
@@ -156,7 +203,7 @@ function createAgentTools(params: TaskParams, profile: ApiProfile, settings: App
       required: ['images'],
       additionalProperties: false,
     },
-    strict: true,
+    strict: strictFunctionTools,
   })
 
   // continue_generation: model calls this to request another round (e.g. after generating a prerequisite image)
@@ -179,7 +226,7 @@ function createAgentTools(params: TaskParams, profile: ApiProfile, settings: App
       required: ['reason'],
       additionalProperties: false,
     },
-    strict: true,
+    strict: strictFunctionTools,
   })
 
   if (settings.agentWebSearch) {
@@ -649,6 +696,7 @@ export async function callAgentResponsesApi(opts: {
   signal?.addEventListener('abort', abortFromCaller, { once: true })
 
   try {
+    const expectsEventStream = profile.codexCli || Boolean(profile.streamImages)
     const body: Record<string, unknown> = {
       model: profile.model || settings.model,
       instructions: createAgentInstructions(settings),
@@ -664,13 +712,15 @@ export async function callAgentResponsesApi(opts: {
     if (upstreamState?.upstream_account_ref) {
       body.upstream_account_ref = upstreamState.upstream_account_ref
     }
-    if (profile.streamImages) {
+    if (profile.codexCli) {
+      applyCodexResponsesCompatibility(body, { stream: true })
+    } else if (profile.streamImages) {
       body.stream = true
     }
 
     const response = await fetch(buildApiUrl(profile.baseUrl, 'responses', proxyConfig, useApiProxy), {
       method: 'POST',
-      headers: createHeaders(profile),
+      headers: createHeaders(profile, profile.codexCli),
       cache: 'no-store',
       body: JSON.stringify(body),
       signal: controller.signal,
@@ -681,7 +731,7 @@ export async function callAgentResponsesApi(opts: {
       throw new Error(maybeAppendStreamingHint(errorMessage, response.status, profile.streamImages))
     }
 
-    if (profile.streamImages && isEventStreamResponse(response)) {
+    if (expectsEventStream && isEventStreamResponse(response)) {
       return parseAgentStreamResponse(response, mime, controller.signal, signal, onTextDelta, onOutputItems, onImageToolStarted, onImagePartialImage, onImageToolCompleted, onImageToolFailed)
     }
 
@@ -724,16 +774,19 @@ export async function callAgentConversationTitleApi(opts: {
       content.push({ type: 'input_image', image_url: dataUrl })
     }
 
+    const body: Record<string, unknown> = {
+      model: profile.model || settings.model,
+      instructions: AGENT_TITLE_INSTRUCTIONS,
+      input: [{ role: 'user', content }],
+      max_output_tokens: 32,
+    }
+    if (profile.codexCli) applyCodexResponsesCompatibility(body)
+
     const response = await fetch(buildApiUrl(profile.baseUrl, 'responses', proxyConfig, useApiProxy), {
       method: 'POST',
       headers: createHeaders(profile),
       cache: 'no-store',
-      body: JSON.stringify({
-        model: profile.model || settings.model,
-        instructions: AGENT_TITLE_INSTRUCTIONS,
-        input: [{ role: 'user', content }],
-        max_output_tokens: 32,
-      }),
+      body: JSON.stringify(body),
       signal: controller.signal,
     })
 
@@ -795,6 +848,7 @@ export async function callBatchImageSingle(opts: {
   signal?.addEventListener('abort', abortFromCaller, { once: true })
 
   try {
+    const expectsEventStream = profile.codexCli || Boolean(profile.streamImages)
     // Build input: reference id mapping + prompt-rewrite guard + reference images.
     const referenceMapping = referenceImageDataUrls.length > 0
       ? `Attached reference images correspond to these ids, in order: ${(referenceIds ?? []).map((id) => `<ref id="${id}" />`).join(', ') || 'reference images'}.`
@@ -817,20 +871,8 @@ export async function callBatchImageSingle(opts: {
     }
 
     // Build image_generation tool with current params
-    const tool: Record<string, unknown> = {
-      type: 'image_generation',
-      action: referenceImageDataUrls.length > 0 ? 'auto' : 'generate',
-      size: params.size,
-      output_format: params.output_format,
-      moderation: params.moderation,
-      quality: params.quality,
-    }
-    if (params.output_format !== 'png' && params.output_compression != null) {
-      tool.output_compression = params.output_compression
-    }
-    if (profile.streamImages) {
-      tool.partial_images = profile.streamPartialImages ?? DEFAULT_STREAM_PARTIAL_IMAGES
-    }
+    const tool = createImageTool(params, profile)
+    if (!profile.codexCli) tool.action = referenceImageDataUrls.length > 0 ? 'auto' : 'generate'
 
     const body: Record<string, unknown> = {
       model: profile.model,
@@ -847,13 +889,15 @@ export async function callBatchImageSingle(opts: {
     if (referenceUpstreamState?.upstream_account_ref) {
       body.upstream_account_ref = referenceUpstreamState.upstream_account_ref
     }
-    if (profile.streamImages) {
+    if (profile.codexCli) {
+      applyCodexResponsesCompatibility(body, { stream: true })
+    } else if (profile.streamImages) {
       body.stream = true
     }
 
     const response = await fetch(buildApiUrl(profile.baseUrl, 'responses', proxyConfig, useApiProxy), {
       method: 'POST',
-      headers: createHeaders(profile),
+      headers: createHeaders(profile, profile.codexCli),
       cache: 'no-store',
       body: JSON.stringify(body),
       signal: controller.signal,
@@ -865,7 +909,7 @@ export async function callBatchImageSingle(opts: {
     }
 
     // Handle streaming
-    if (profile.streamImages && isEventStreamResponse(response)) {
+    if (expectsEventStream && isEventStreamResponse(response)) {
       await onImageToolStarted?.()
       let completedImage: AgentApiResultImage | null = null
       let rawPayload: string | undefined
