@@ -6,6 +6,7 @@ import {
   createDefaultOpenAIProfile,
   getActiveApiProfile,
   getApiProviderLabel,
+  isOpenAICompatibleProvider,
   normalizeSettings,
   switchApiProfileProvider,
 } from '../lib/apiProfiles'
@@ -453,6 +454,7 @@ export default function AdminDashboard() {
   const selectedRewardDraft = selectedRewardCode ? rewardCodeDrafts[selectedRewardCode.id] ?? toRewardCodeDraft(selectedRewardCode) : null
   const canEditPlans = isAdmin
   const activeApiProfile = getActiveApiProfile(apiDraft)
+  const activeApiProfileIsOpenAICompatible = isOpenAICompatibleProvider(apiDraft, activeApiProfile.provider)
   const apiProviderOptions = [
     { id: 'openai' as ApiProvider, label: 'OpenAI' },
     { id: 'fal' as ApiProvider, label: 'fal.ai' },
@@ -1995,6 +1997,38 @@ export default function AdminDashboard() {
                           aria-pressed={Boolean(activeApiProfile.streamImages)}
                         >
                           <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${activeApiProfile.streamImages ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                        </button>
+                      </label>
+                    )}
+                    {activeApiProfileIsOpenAICompatible && (
+                      <label className="flex items-center justify-between gap-3 rounded-md border border-gray-200 px-3 py-2 dark:border-white/[0.08] lg:col-span-2">
+                        <span>
+                          <span className="block text-xs font-semibold text-gray-500 dark:text-gray-400">返回 Base64 图片数据</span>
+                          <span className="mt-1 block text-xs text-gray-400">开启后请求体会追加 response_format: b64_json，适合不希望上游返回图片 URL 的兼容接口。</span>
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => updateApiProfileDraft({ responseFormatB64Json: !activeApiProfile.responseFormatB64Json })}
+                          className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${activeApiProfile.responseFormatB64Json ? 'bg-cyan-500' : 'bg-gray-300 dark:bg-gray-600'}`}
+                          aria-pressed={Boolean(activeApiProfile.responseFormatB64Json)}
+                        >
+                          <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${activeApiProfile.responseFormatB64Json ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                        </button>
+                      </label>
+                    )}
+                    {activeApiProfile.provider === 'openai' && (
+                      <label className="flex items-center justify-between gap-3 rounded-md border border-gray-200 px-3 py-2 dark:border-white/[0.08] lg:col-span-2">
+                        <span>
+                          <span className="block text-xs font-semibold text-gray-500 dark:text-gray-400">Codex CLI 兼容模式</span>
+                          <span className="mt-1 block text-xs text-gray-400">开启后禁用该类接口不支持的质量参数，多图 Images API 会拆成并发单图请求，并添加简短提示词保护。</span>
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => updateApiProfileDraft({ codexCli: !activeApiProfile.codexCli })}
+                          className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${activeApiProfile.codexCli ? 'bg-cyan-500' : 'bg-gray-300 dark:bg-gray-600'}`}
+                          aria-pressed={activeApiProfile.codexCli}
+                        >
+                          <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${activeApiProfile.codexCli ? 'translate-x-4' : 'translate-x-0.5'}`} />
                         </button>
                       </label>
                     )}
