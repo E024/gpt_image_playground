@@ -137,6 +137,8 @@ CREATE TABLE IF NOT EXISTS billing_ledger (
   api_mode TEXT NOT NULL DEFAULT '',
   api_model TEXT NOT NULL DEFAULT '',
   api_base_url TEXT NOT NULL DEFAULT '',
+  refund_of_ledger_id TEXT NOT NULL DEFAULT '',
+  refund_token_hash TEXT NOT NULL DEFAULT '',
   note TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
 );
@@ -274,6 +276,8 @@ ensureColumn('billing_ledger', 'api_provider', "api_provider TEXT NOT NULL DEFAU
 ensureColumn('billing_ledger', 'api_mode', "api_mode TEXT NOT NULL DEFAULT ''")
 ensureColumn('billing_ledger', 'api_model', "api_model TEXT NOT NULL DEFAULT ''")
 ensureColumn('billing_ledger', 'api_base_url', "api_base_url TEXT NOT NULL DEFAULT ''")
+ensureColumn('billing_ledger', 'refund_of_ledger_id', "refund_of_ledger_id TEXT NOT NULL DEFAULT ''")
+ensureColumn('billing_ledger', 'refund_token_hash', "refund_token_hash TEXT NOT NULL DEFAULT ''")
 ensureColumn('content_audit_records', 'elapsed_ms', 'elapsed_ms INTEGER')
 ensureColumn('reward_codes', 'deleted_at', 'deleted_at INTEGER')
 
@@ -1200,6 +1204,7 @@ function rowToLedger(row) {
     apiBaseUrl: row.api_base_url,
     note: row.note,
     createdAt: row.created_at,
+    refundOfLedgerId: row.refund_of_ledger_id || undefined,
   }
 }
 
@@ -1495,6 +1500,7 @@ function insertLedgerEntry(input) {
   const groupAmount = normalizeNonNegativeInteger(input.groupAmount ?? 0, 0)
   const personalAmount = normalizeNonNegativeInteger(input.personalAmount ?? Math.max(0, input.amount - groupAmount), 0)
   const deductionPriority = normalizeQuotaDeductionPriority(input.deductionPriority ?? input.user?.quotaDeductionPriority)
+  const id = genId()
   db.prepare(`
     INSERT INTO billing_ledger (
       id,
@@ -1521,12 +1527,14 @@ function insertLedgerEntry(input) {
       api_mode,
       api_model,
       api_base_url,
+      refund_of_ledger_id,
+      refund_token_hash,
       note,
       created_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
-    genId(),
+    id,
     input.userId,
     input.type,
     input.source,
@@ -1550,9 +1558,93 @@ function insertLedgerEntry(input) {
     snapshot.apiMode,
     snapshot.apiModel,
     snapshot.apiBaseUrl,
+    String(input.refundOfLedgerId || ''),
+    String(input.refundTokenHash || ''),
     String(input.note || '').slice(0, 240),
     input.createdAt ?? Date.now(),
   )
+  return id
+}
+
+function refundQuotaDebit(input) {
+  const ledgerId = typeof input.ledgerId === 'string' ? input.ledgerId.trim() : ''
+  if (!ledgerId) fail(400, '缺少要退回的扣费流水')
+
+  return withImmediateTransaction(() => {
+    const debit = db.prepare('SELECT * FROM billing_ledger WHERE id = ?').get(ledgerId)
+    if (!debit) fail(404, '找不到要退回的扣费流水')
+    if (debit.type !== 'debit') fail(400, '只有扣费流水可以退回')
+    if (debit.source !== 'gallery' && debit.source !== 'agent') fail(400, '这条流水不是可自动退回的功能扣费')
+    if (!canManage(input.actor) && debit.user_id !== input.actor.id) fail(403, '不能退回其他用户的扣费流水')
+    if (!canManage(input.actor)) {
+      const refundToken = typeof input.refundToken === 'string' ? input.refundToken.trim() : ''
+      if (!debit.refund_token_hash || !refundToken || hashToken(refundToken) !== debit.refund_token_hash) {
+        fail(403, '退款凭证无效，无法退回这条扣费流水')
+      }
+    }
+
+    const refunded = db.prepare("SELECT id FROM billing_ledger WHERE refund_of_ledger_id = ? AND type = 'credit' LIMIT 1").get(debit.id)
+    if (refunded) return { ledgerId: refunded.id, alreadyRefunded: true }
+
+    const user = getUser(debit.user_id)
+    if (!user) fail(404, '扣费用户已不存在，无法自动退回')
+
+    const debitAmount = normalizeNonNegativeInteger(debit.amount, 0)
+    let personalAmount = normalizeNonNegativeInteger(debit.personal_amount, 0)
+    let groupAmount = normalizeNonNegativeInteger(debit.group_amount, 0)
+    if (debitAmount > 0 && personalAmount + groupAmount === 0) {
+      personalAmount = debitAmount
+    }
+
+    const group = debit.group_id ? getStrictGroup(debit.group_id) : getStrictGroup(user.groupId)
+    if (groupAmount > 0 && !group) fail(409, '扣费分组已不存在，无法自动退回分组额度')
+
+    const personalBalanceBefore = normalizeNonNegativeInteger(user.quotaBalance, 0)
+    const groupBalanceBefore = normalizeNonNegativeInteger(group?.quotaBalance ?? 0, 0)
+    const personalBalanceAfter = personalBalanceBefore + personalAmount
+    const groupBalanceAfter = groupBalanceBefore + groupAmount
+    const now = Date.now()
+
+    if (group && groupAmount > 0) {
+      db.prepare('UPDATE groups SET quota_balance = ?, updated_at = ? WHERE id = ?').run(groupBalanceAfter, now, group.id)
+    }
+    db.prepare('UPDATE users SET quota_balance = ?, total_quota_used = MAX(0, total_quota_used - ?), updated_at = ? WHERE id = ?')
+      .run(personalBalanceAfter, debitAmount, now, user.id)
+
+    const refundId = insertLedgerEntry({
+      userId: user.id,
+      user,
+      type: 'credit',
+      source: debit.source,
+      amount: debitAmount,
+      units: debit.units,
+      unitCost: debit.unit_cost,
+      balanceBefore: personalBalanceBefore + groupBalanceBefore,
+      balanceAfter: personalBalanceAfter + groupBalanceAfter,
+      personalAmount,
+      groupAmount,
+      personalBalanceBefore,
+      personalBalanceAfter,
+      groupBalanceBefore,
+      groupBalanceAfter,
+      deductionPriority: debit.deduction_priority,
+      plan: { id: debit.plan_id, name: debit.plan_name },
+      group: group
+        ? { ...group, quotaBalance: groupBalanceAfter }
+        : { id: debit.group_id, name: debit.group_name, quotaBalance: groupBalanceAfter },
+      profile: {
+        provider: debit.api_provider,
+        apiMode: debit.api_mode,
+        model: debit.api_model,
+        baseUrl: debit.api_base_url,
+      },
+      note: String(input.note || `失败退回：${debit.note || ledgerId}`),
+      refundOfLedgerId: debit.id,
+      createdAt: now,
+    })
+
+    return { ledgerId: refundId, alreadyRefunded: false }
+  })
 }
 
 function normalizeLedgerPageSize(value) {
@@ -1617,6 +1709,7 @@ function getLedgerPage(actor, filters = {}) {
     if (admin) {
       clauses.push(`(
         billing_ledger.id LIKE ?
+        OR billing_ledger.refund_of_ledger_id LIKE ?
         OR billing_ledger.note LIKE ?
         OR billing_ledger.plan_name LIKE ?
         OR billing_ledger.group_name LIKE ?
@@ -1627,15 +1720,16 @@ function getLedgerPage(actor, filters = {}) {
         OR users.display_name LIKE ?
         OR users.email LIKE ?
       )`)
-      values.push(like, like, like, like, like, like, like, like, like, like)
+      values.push(like, like, like, like, like, like, like, like, like, like, like)
     } else {
       clauses.push(`(
         billing_ledger.id LIKE ?
+        OR billing_ledger.refund_of_ledger_id LIKE ?
         OR billing_ledger.note LIKE ?
         OR billing_ledger.plan_name LIKE ?
         OR billing_ledger.group_name LIKE ?
       )`)
-      values.push(like, like, like, like)
+      values.push(like, like, like, like, like)
     }
   }
 
@@ -3067,7 +3161,7 @@ const server = http.createServer(async (req, res) => {
       if (source === 'agent' && !isAgentFeatureEnabled()) return json(res, 403, { error: 'Agent 功能已由管理员关闭' })
       if (source === 'agent' && (activeProfile.provider !== 'openai' || activeProfile.apiMode !== 'responses')) return json(res, 400, { error: admin ? '管理员尚未配置可用的 OpenAI Responses API' : '当前 Agent 接口配置不可用，请联系管理员检查。' })
       const units = normalizePositiveInteger(body.units, 1)
-      withImmediateTransaction(() => {
+      const quotaCharge = withImmediateTransaction(() => {
         const user = getUser(actor.id)
         if (!user) fail(401, '请重新登录')
         if (source === 'agent' && user.canUseAgent === false) fail(403, '当前账号未开通 Agent 权限')
@@ -3078,11 +3172,12 @@ const server = http.createServer(async (req, res) => {
         const cost = units * unitCost
         const split = splitQuotaDebit(user, group, cost)
         const now = Date.now()
+        const refundToken = randomBytes(32).toString('hex')
         if (group && split.groupAmount > 0) {
           db.prepare('UPDATE groups SET quota_balance = ?, updated_at = ? WHERE id = ?').run(split.groupBalanceAfter, now, group.id)
         }
         db.prepare('UPDATE users SET quota_balance = ?, total_quota_used = total_quota_used + ?, updated_at = ? WHERE id = ?').run(split.personalBalanceAfter, cost, now, user.id)
-        insertLedgerEntry({
+        const ledgerId = insertLedgerEntry({
           userId: user.id,
           user,
           type: 'debit',
@@ -3094,10 +3189,18 @@ const server = http.createServer(async (req, res) => {
           plan,
           group,
           profile: activeProfile,
+          refundTokenHash: hashToken(refundToken),
           note: String(body.note || ''),
           createdAt: now,
         })
+        return { ledgerId, refundToken, source, units, unitCost, amount: cost }
       })
+      return json(res, 200, { ...getState(getUser(actor.id), authSession), quotaCharge })
+    }
+
+    if (req.method === 'POST' && path === '/usage/refund') {
+      const body = await readJson(req)
+      refundQuotaDebit({ ledgerId: body.ledgerId, refundToken: body.refundToken, note: body.note, actor })
       return json(res, 200, getState(getUser(actor.id), authSession))
     }
 

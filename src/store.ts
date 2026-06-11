@@ -22,6 +22,7 @@ import type {
   EmailVerificationState,
   ImageStorageSettings,
   ManagedUser,
+  QuotaChargeResult,
   QuotaDeductionPriority,
   RewardCode,
   RewardState,
@@ -81,6 +82,7 @@ import {
   backendLogout,
   backendRegister,
   backendRedeemRewardCode,
+  backendRefundQuota,
   backendSetUserQuota,
   backendUpdateCheckinSettings,
   backendUpdateApiSettings,
@@ -619,6 +621,9 @@ function normalizeAgentRound(value: unknown, fallbackIndex: number): AgentRound 
     maskTargetImageId: typeof round.maskTargetImageId === 'string' ? round.maskTargetImageId : null,
     maskImageId: typeof round.maskImageId === 'string' ? round.maskImageId : null,
     outputTaskIds: normalizeStringArray(round.outputTaskIds),
+    ...(typeof round.quotaLedgerId === 'string' ? { quotaLedgerId: round.quotaLedgerId } : {}),
+    ...(typeof round.quotaRefundToken === 'string' ? { quotaRefundToken: round.quotaRefundToken } : {}),
+    ...(typeof round.quotaRefundedAt === 'number' ? { quotaRefundedAt: round.quotaRefundedAt } : {}),
     ...(typeof round.responseId === 'string' ? { responseId: round.responseId } : {}),
     ...(Array.isArray(round.responseOutput) ? { responseOutput: round.responseOutput } : {}),
     status,
@@ -1044,7 +1049,7 @@ interface AppState {
   updateCheckinSettings: (settings: Partial<RewardState['checkin']>) => Promise<void>
   redeemRewardCode: (code: string) => Promise<boolean>
   checkIn: () => Promise<boolean>
-  chargeCurrentUserQuota: (source: 'gallery' | 'agent', units: number, note: string) => Promise<boolean>
+  chargeCurrentUserQuota: (source: 'gallery' | 'agent', units: number, note: string) => Promise<QuotaChargeResult | null>
 
   // 输入
   prompt: string
@@ -1358,6 +1363,7 @@ function normalizeBillingLedger(value: unknown, users: ManagedUser[]): BillingLe
         apiBaseUrl: typeof item.apiBaseUrl === 'string' ? item.apiBaseUrl : '',
         note: typeof item.note === 'string' ? item.note.slice(0, 240) : '',
         createdAt: normalizeTimestamp(item.createdAt),
+        ...(typeof item.refundOfLedgerId === 'string' && item.refundOfLedgerId ? { refundOfLedgerId: item.refundOfLedgerId } : {}),
       }
     })
     .filter((entry): entry is BillingLedgerEntry => entry != null)
@@ -2149,14 +2155,15 @@ export const useStore = create<AppState>()(
         const state = get()
         if (!state.authSession) {
           state.showToast('请先登录再开始创作', 'error')
-          return false
+          return null
         }
         try {
-          applyBackendStatePatch(await backendChargeQuota({ source, units, note }, state.authSession))
-          return true
+          const result = await backendChargeQuota({ source, units, note }, state.authSession)
+          applyBackendStatePatch(result)
+          return result.quotaCharge
         } catch (error) {
           state.showToast(error instanceof Error ? error.message : '扣除额度失败', 'error')
-          return false
+          return null
         }
       },
 
@@ -2580,6 +2587,41 @@ function putTask(task: TaskRecord): Promise<IDBValidKey> {
   return dbPutTask(getPersistableTask(task))
 }
 
+async function refundQuotaLedger(ledgerId: string | undefined, refundToken: string | undefined, note: string): Promise<boolean> {
+  if (!ledgerId) return false
+  const session = useStore.getState().authSession
+  if (!session) return false
+  try {
+    applyBackendStatePatch(await backendRefundQuota({ ledgerId, refundToken, note }, session))
+    return true
+  } catch (error) {
+    useStore.getState().showToast(error instanceof Error ? error.message : '退回额度失败', 'error')
+    return false
+  }
+}
+
+async function refundTaskQuota(taskId: string, note: string) {
+  const task = useStore.getState().tasks.find((item) => item.id === taskId)
+  if (!task?.quotaLedgerId || task.quotaRefundedAt) return
+  if (await refundQuotaLedger(task.quotaLedgerId, task.quotaRefundToken, note)) {
+    updateTaskInStore(taskId, { quotaRefundToken: undefined, quotaRefundedAt: Date.now() })
+  }
+}
+
+async function refundAgentRoundQuota(conversationId: string, roundId: string, note: string) {
+  const conversation = useStore.getState().agentConversations.find((item) => item.id === conversationId)
+  const round = conversation?.rounds.find((item) => item.id === roundId)
+  if (!round?.quotaLedgerId || round.quotaRefundedAt) return
+  if (await refundQuotaLedger(round.quotaLedgerId, round.quotaRefundToken, note)) {
+    updateAgentConversation(conversationId, (current) => ({
+      ...current,
+      rounds: current.rounds.map((item) =>
+        item.id === roundId ? { ...item, quotaRefundToken: undefined, quotaRefundedAt: Date.now() } : item,
+      ),
+    }))
+  }
+}
+
 export function getCodexCliPromptKey(settings: AppSettings): string {
   const profile = getActiveApiProfile(settings)
   return `${profile.baseUrl}\n${profile.apiKey}`
@@ -2637,6 +2679,7 @@ function failOpenAITaskIfStillRunning(taskId: string, error: string, now = Date.
     finishedAt: now,
     elapsed: Math.max(0, now - task.createdAt),
   })
+  void refundTaskQuota(taskId, `任务失败退回：${error}`)
   return true
 }
 
@@ -3059,6 +3102,7 @@ async function completeRecoveredFalTask(task: TaskRecord, result: Awaited<Return
     revisedPromptByImage: undefined,
     status: 'done',
     error: null,
+    quotaRefundToken: undefined,
     falRecoverable: false,
     finishedAt: Date.now(),
     elapsed: Date.now() - task.createdAt,
@@ -3100,6 +3144,7 @@ async function recoverFalTask(taskId: string) {
       finishedAt: Date.now(),
       elapsed: Date.now() - task.createdAt,
     })
+    void refundTaskQuota(taskId, `任务失败退回：${getFalErrorMessage(err) ?? (err instanceof Error ? err.message : String(err))}`)
   }
 }
 
@@ -3156,6 +3201,9 @@ export async function initStore() {
     .filter((task, index) => normalizedFavorites.changed || interruptedTaskIds.has(task.id) || task.rawResponsePayload !== markedTasks[index]?.rawResponsePayload)
     .map((task) => putTask(task)))
   useStore.getState().setTasks(tasks)
+  for (const task of interruptedTasks) {
+    void refundTaskQuota(task.id, `任务中断退回：${task.error ?? OPENAI_INTERRUPTED_ERROR}`)
+  }
   showSupportPromptForExistingLocalData(tasks)
   for (const task of tasks) {
     if (
@@ -3392,7 +3440,8 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
     ? getTransparentRequestParams(normalizedParams)
     : { ...normalizedParams, transparent_output: false }
   const galleryUnits = Math.max(1, taskParams.n)
-  if (!(await useStore.getState().chargeCurrentUserQuota('gallery', galleryUnits, `画廊生成 x${galleryUnits}`))) {
+  const quotaCharge = await useStore.getState().chargeCurrentUserQuota('gallery', galleryUnits, `画廊生成 x${galleryUnits}`)
+  if (!quotaCharge) {
     return
   }
   const transparentMeta = taskParams.transparent_output
@@ -3418,6 +3467,8 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
     maskImageId,
     transparentOutput: transparentMeta?.transparentOutput,
     transparentPrompt: transparentMeta?.effectivePrompt,
+    quotaLedgerId: quotaCharge.ledgerId,
+    quotaRefundToken: quotaCharge.refundToken,
     outputImages: [],
     status: 'running',
     error: null,
@@ -3653,6 +3704,7 @@ function markAgentRoundStopped(conversationId: string, roundId: string) {
           ],
     }
   })
+  if (stoppedRound) void refundAgentRoundQuota(conversationId, roundId, `Agent 失败退回：${AGENT_STOPPED_MESSAGE}`)
   return stoppedRound || stoppedTasks
 }
 
@@ -4509,7 +4561,8 @@ export async function submitAgentMessage() {
     n: DEFAULT_PARAMS.n,
     transparent_output: false,
   }
-  if (!(await state.chargeCurrentUserQuota('agent', 1, 'Agent 对话轮次'))) {
+  const quotaCharge = await state.chargeCurrentUserQuota('agent', 1, 'Agent 对话轮次')
+  if (!quotaCharge) {
     return
   }
   const round: AgentRound = {
@@ -4523,6 +4576,9 @@ export async function submitAgentMessage() {
     maskTargetImageId,
     maskImageId,
     outputTaskIds: [],
+    quotaLedgerId: quotaCharge.ledgerId,
+    quotaRefundToken: quotaCharge.refundToken,
+    quotaRefundedAt: undefined,
     status: 'running',
     error: null,
     createdAt: now,
@@ -4624,7 +4680,8 @@ export async function regenerateAgentAssistantMessage(conversationId: string, ro
     n: DEFAULT_PARAMS.n,
     transparent_output: false,
   }
-  if (!(await state.chargeCurrentUserQuota('agent', 1, 'Agent 重新生成'))) {
+  const quotaCharge = await state.chargeCurrentUserQuota('agent', 1, 'Agent 重新生成')
+  if (!quotaCharge) {
     return
   }
   const now = Date.now()
@@ -4640,6 +4697,9 @@ export async function regenerateAgentAssistantMessage(conversationId: string, ro
           ? {
               ...round,
               outputTaskIds: [],
+              quotaLedgerId: quotaCharge.ledgerId,
+              quotaRefundToken: quotaCharge.refundToken,
+              quotaRefundedAt: undefined,
               responseId: undefined,
               responseOutput: undefined,
               status: 'running',
@@ -4671,6 +4731,9 @@ export async function regenerateAgentAssistantMessage(conversationId: string, ro
     maskTargetImageId: sourceRound.maskTargetImageId ?? sourceUserMessage.maskTargetImageId ?? null,
     maskImageId: sourceRound.maskImageId ?? sourceUserMessage.maskImageId ?? null,
     outputTaskIds: [],
+    quotaLedgerId: quotaCharge.ledgerId,
+    quotaRefundToken: quotaCharge.refundToken,
+    quotaRefundedAt: undefined,
     status: 'running',
     error: null,
     createdAt: now,
@@ -5376,6 +5439,7 @@ async function executeAgentRound(
               responseOutput: accumulatedOutputItems,
               status: 'done',
               error: null,
+              quotaRefundToken: undefined,
               finishedAt: Date.now(),
             }
           : round,
@@ -5449,6 +5513,7 @@ async function executeAgentRound(
             ],
       }
     })
+    void refundAgentRoundQuota(conversationId, roundId, `Agent 失败退回：${message}`)
     useStore.getState().showToast(`Agent 请求失败：${message}`, 'error')
   } finally {
     if (agentRoundControllers.get(controllerKey) === controller) {
@@ -5471,6 +5536,7 @@ async function executeTask(taskId: string) {
       finishedAt: Date.now(),
       elapsed: Date.now() - task.createdAt,
     })
+    void refundTaskQuota(taskId, '任务失败退回：找不到此任务所使用的 API 配置。')
     return
   }
   const activeProfile = taskProfile ?? getActiveApiProfile(settings)
@@ -5590,6 +5656,7 @@ async function executeTask(taskId: string) {
       actualParamsByImage,
       revisedPromptByImage: revisedPromptByImage && Object.keys(revisedPromptByImage).length > 0 ? revisedPromptByImage : undefined,
       status: 'done',
+      quotaRefundToken: undefined,
       finishedAt: Date.now(),
       elapsed: Date.now() - task.createdAt,
       falRecoverable: false,
@@ -5669,6 +5736,7 @@ async function executeTask(taskId: string) {
         finishedAt: Date.now(),
         elapsed: Date.now() - task.createdAt,
       })
+      void refundTaskQuota(taskId, `任务失败退回：${errorMessage}`)
       useStore.getState().setDetailTaskId(taskId)
     }
   } finally {
@@ -5875,6 +5943,9 @@ export async function retryTask(task: TaskRecord) {
   const transparentMeta = taskParams.transparent_output
     ? createTransparentOutputMeta(task.prompt.trim())
     : null
+  const galleryUnits = Math.max(1, taskParams.n)
+  const quotaCharge = await useStore.getState().chargeCurrentUserQuota('gallery', galleryUnits, `画廊重试 x${galleryUnits}`)
+  if (!quotaCharge) return
   const taskId = genId()
   const newTask: TaskRecord = {
     id: taskId,
@@ -5890,6 +5961,8 @@ export async function retryTask(task: TaskRecord) {
     maskImageId: task.maskImageId ?? null,
     transparentOutput: transparentMeta?.transparentOutput,
     transparentPrompt: transparentMeta?.effectivePrompt,
+    quotaLedgerId: quotaCharge.ledgerId,
+    quotaRefundToken: quotaCharge.refundToken,
     outputImages: [],
     status: 'running',
     error: null,
@@ -6179,6 +6252,7 @@ async function completeRecoveredCustomTask(task: TaskRecord, result: Awaited<Ret
     revisedPromptByImage: undefined,
     status: 'done',
     error: null,
+    quotaRefundToken: undefined,
     customRecoverable: false,
     finishedAt: Date.now(),
     elapsed: Date.now() - task.createdAt,
@@ -6215,6 +6289,7 @@ async function recoverCustomTask(taskId: string) {
       finishedAt: Date.now(),
       elapsed: Date.now() - task.createdAt,
     })
+    void refundTaskQuota(taskId, `任务失败退回：${err instanceof Error ? err.message : String(err)}`)
   }
 }
 

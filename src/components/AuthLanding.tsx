@@ -35,17 +35,20 @@ export default function AuthLanding() {
   const starterPlan = plans[0]
   const mailConfigured = isEmailVerificationConfigured(emailSettings)
   const needsMailSetup = setupRequired && !mailConfigured
+  const starterQuota = starterPlan?.monthlyQuota ?? 0
   const modeCopy = useMemo(() => mode === 'login'
     ? {
         title: `欢迎回到 ${siteName}`,
         action: '进入创作空间',
-        note: '用同一个账号进入创作台与个人空间。权限会在登录后自动匹配。',
+        note: '点数余额、作品画廊与创作记录已云端同步，登录后从上次的灵感继续。',
       }
     : {
-        title: setupRequired ? '创建初始账号' : '创建创作账号',
+        title: setupRequired ? '创建初始账号' : '开启你的创作账号',
         action: '发送验证邮件',
-        note: '提交后会发送验证邮件，点击专属链接激活后才算完成注册。',
-      }, [mode, setupRequired, siteName])
+        note: starterQuota > 0
+          ? `注册即享 ${starterQuota} 点创作额度，邮件激活后立即开始出图。`
+          : '提交后会发送验证邮件，点击专属链接激活即可开始创作。',
+      }, [mode, setupRequired, siteName, starterQuota])
 
   useEffect(() => {
     setEmailDraft(getEmailSettingsDraft(emailSettings))
@@ -86,18 +89,31 @@ export default function AuthLanding() {
   return (
     <main className="min-h-screen bg-[#f5f7fb] p-3 text-slate-950 sm:p-5">
       <div className="mx-auto grid min-h-[calc(100vh-24px)] max-w-7xl overflow-hidden rounded-lg border border-slate-200 bg-white shadow-xl shadow-slate-200/70 lg:min-h-[calc(100vh-40px)] lg:grid-cols-[1.08fr_0.92fr]">
-        <section className="relative overflow-hidden border-r border-cyan-100 bg-[#ecfbff] p-6 text-slate-950 sm:p-8 lg:p-10">
+        <section className="relative overflow-hidden border-b border-cyan-100 bg-[#ecfbff] p-5 text-slate-950 sm:p-8 lg:border-b-0 lg:border-r lg:p-10">
           <div className="absolute inset-0 opacity-70 [background-image:linear-gradient(rgba(8,145,178,.12)_1px,transparent_1px),linear-gradient(90deg,rgba(8,145,178,.12)_1px,transparent_1px)] [background-size:28px_28px]" />
           <div className="relative flex min-h-full flex-col">
             <header className="flex items-start justify-between gap-4">
               <div>
                 <div className="max-w-full truncate text-xs font-black uppercase tracking-[0.22em] text-cyan-700">{siteName}</div>
-                <h1 className="mt-2 max-w-xl text-3xl font-black leading-tight sm:text-4xl">把灵感变成一条可追踪的创作流水线</h1>
+                <h1 className="mt-2 max-w-xl text-2xl font-black leading-tight sm:text-3xl lg:text-4xl">一句话，生成可直接商用的视觉大片</h1>
+                <p className="mt-2 max-w-xl text-sm leading-6 text-slate-600">电商主图、品牌海报、人像写真一站生成，Agent 多轮修图直到满意为止。</p>
               </div>
-              <span className="rounded-md border border-cyan-200 bg-white/80 px-3 py-1.5 text-xs font-black text-cyan-700 shadow-sm">Studio</span>
+              <span className="hidden rounded-md border border-cyan-200 bg-white/80 px-3 py-1.5 text-xs font-black text-cyan-700 shadow-sm sm:inline-block">Studio</span>
             </header>
 
-            <div className="mt-8 grid gap-4 xl:grid-cols-[1fr_260px]">
+            <div className="mt-4 flex flex-wrap gap-2 lg:hidden">
+              {[
+                starterQuota > 0 ? `注册即送 ${starterQuota} 点` : '注册即可开始创作',
+                'Agent 连续修图',
+                '作品云端同步',
+              ].map((chip) => (
+                <span key={chip} className="rounded-full border border-cyan-200 bg-white/80 px-3 py-1 text-xs font-bold text-cyan-800">
+                  {chip}
+                </span>
+              ))}
+            </div>
+
+            <div className="mt-8 hidden gap-4 lg:grid xl:grid-cols-[1fr_260px]">
               <div className="rounded-lg border border-cyan-100 bg-white/85 p-4 shadow-xl shadow-cyan-200/30 backdrop-blur">
                 <div className="flex items-center justify-between gap-3">
                   <div>
@@ -158,11 +174,11 @@ export default function AuthLanding() {
               </div>
             </div>
 
-            <div className="relative mt-auto grid gap-3 pt-8 sm:grid-cols-3">
+            <div className="relative mt-auto hidden gap-3 pt-8 lg:grid lg:grid-cols-3">
               {[
-                ['套餐清晰', '分组权益与扣费规则登录后可查'],
-                ['邮箱激活', '点击专属链接后才创建账号'],
-                ['额度透明', '每次生成都有对应消费记录'],
+                ['注册即送点数', starterQuota > 0 ? `新账号开通即获 ${starterQuota} 点创作额度` : '开通账号即可领取创作额度'],
+                ['商用级出图', '电商主图、品牌海报、社媒配图一站生成'],
+                ['额度透明', '按张计费，每次生成都有对应消费记录'],
               ].map(([title, text]) => (
                 <div key={title} className="rounded-lg border border-cyan-100 bg-white/80 p-3 shadow-sm backdrop-blur">
                   <div className="text-sm font-black">{title}</div>

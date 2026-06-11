@@ -1,4 +1,4 @@
-import type { AppSettings, AuthSession, BillingLedgerEntry, BillingLedgerType, BillingUsageSource, ContentAuditEntry, ContentAuditKind, ContentAuditSource, EmailSettings, EmailVerificationState, ImageStorageSettings, ManagedUser, QuotaDeductionPriority, RewardCode, RewardState, SystemSettings, UserGroup, UserPlan } from '../types'
+import type { AppSettings, AuthSession, BillingLedgerEntry, BillingLedgerType, BillingUsageSource, ContentAuditEntry, ContentAuditKind, ContentAuditSource, EmailSettings, EmailVerificationState, ImageStorageSettings, ManagedUser, QuotaChargeResult, QuotaDeductionPriority, RewardCode, RewardState, SystemSettings, UserGroup, UserPlan } from '../types'
 
 export interface BackendState {
   groups: UserGroup[]
@@ -236,5 +236,9 @@ export function backendCheckIn(session?: AuthSession | null) {
 }
 
 export function backendChargeQuota(input: { source: 'gallery' | 'agent'; units: number; note: string }, session?: AuthSession | null) {
-  return request<BackendState>('/usage/charge', { method: 'POST', body: JSON.stringify(input), session })
+  return request<BackendState & { quotaCharge: QuotaChargeResult }>('/usage/charge', { method: 'POST', body: JSON.stringify(input), session })
+}
+
+export function backendRefundQuota(input: { ledgerId: string; refundToken?: string; note: string }, session?: AuthSession | null) {
+  return request<BackendState>('/usage/refund', { method: 'POST', body: JSON.stringify(input), session })
 }

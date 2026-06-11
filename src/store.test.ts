@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { strToU8, zipSync } from 'fflate'
 import { DEFAULT_PARAMS } from './types'
 import { createDefaultFalProfile, createDefaultOpenAIProfile, DEFAULT_RESPONSES_MODEL, DEFAULT_SETTINGS, normalizeSettings } from './lib/apiProfiles'
-import type { AgentConversation, AuthSession, ExportData, ManagedUser, StoredImage, StoredImageThumbnail, TaskRecord, UserGroup, UserPlan } from './types'
+import type { AgentConversation, AuthSession, ExportData, ManagedUser, QuotaChargeResult, StoredImage, StoredImageThumbnail, TaskRecord, UserGroup, UserPlan } from './types'
 import { getSelectedImageMentionLabel } from './lib/promptImageMentions'
 vi.mock('./lib/db', () => {
   const tasks = new Map<string, TaskRecord>()
@@ -179,7 +179,14 @@ beforeEach(() => {
     authReady: true,
     setupRequired: false,
     systemSettings: { siteName: '造像台', agentEnabled: true },
-    chargeCurrentUserQuota: vi.fn(async () => true),
+    chargeCurrentUserQuota: vi.fn(async (source: 'gallery' | 'agent', units: number): Promise<QuotaChargeResult> => ({
+      ledgerId: `test-ledger-${source}`,
+      refundToken: `test-refund-token-${source}`,
+      source,
+      units,
+      unitCost: 1,
+      amount: units,
+    })),
   })
 })
 

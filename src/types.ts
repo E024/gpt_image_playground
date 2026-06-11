@@ -287,6 +287,16 @@ export interface BillingLedgerEntry {
   apiBaseUrl: string
   note: string
   createdAt: number
+  refundOfLedgerId?: string
+}
+
+export interface QuotaChargeResult {
+  ledgerId: string
+  refundToken: string
+  source: BillingUsageSource
+  units: number
+  unitCost: number
+  amount: number
 }
 
 export interface ContentAuditEntry {
@@ -429,6 +439,12 @@ export interface TaskRecord {
   rawImageUrls?: string[]
   /** 发生解析错误时的原始响应 JSON */
   rawResponsePayload?: string
+  /** 本任务预扣额度对应的流水 ID，用于失败时幂等退款 */
+  quotaLedgerId?: string
+  /** 本任务自动退款凭证，仅失败退款接口使用，不展示给用户 */
+  quotaRefundToken?: string
+  /** 已完成退款的时间戳，避免前端重复触发退款 */
+  quotaRefundedAt?: number
   status: TaskStatus
   error: string | null
   createdAt: number
@@ -490,6 +506,12 @@ export interface AgentRound {
   maskTargetImageId?: string | null
   maskImageId?: string | null
   outputTaskIds: string[]
+  /** 本轮 Agent 预扣额度对应的流水 ID，用于失败时幂等退款 */
+  quotaLedgerId?: string
+  /** 本轮 Agent 自动退款凭证，仅失败退款接口使用，不展示给用户 */
+  quotaRefundToken?: string
+  /** 已完成退款的时间戳，避免前端重复触发退款 */
+  quotaRefundedAt?: number
   responseId?: string
   responseOutput?: ResponsesOutputItem[]
   status: AgentRoundStatus

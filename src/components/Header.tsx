@@ -220,9 +220,7 @@ export default function Header() {
                 <HistoryModal onClose={() => setShowHistoryModal(false)} ignoreOutsideClickRef={historyButtonRef} />
               )}
             </div>}
-          </div>
-          {appMode === 'agent' && activeConversation && (
-            <div className="pointer-events-none absolute left-1/2 top-1/2 z-0 hidden w-[28vw] max-w-md min-w-0 -translate-x-1/2 -translate-y-1/2 justify-center overflow-hidden lg:flex xl:max-w-lg">
+            {appMode === 'agent' && activeConversation && (
               <button
                 type="button"
                 title={activeConversation.title || 'Agent'}
@@ -233,12 +231,12 @@ export default function Header() {
                     useStore.getState().setAgentEditingConversationId(activeConversation.id)
                   }, 0)
                 }}
-                className="pointer-events-auto min-w-0 max-w-full truncate px-2 py-1 text-sm font-semibold text-gray-700 transition-colors hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-white/[0.04] rounded"
+                className="hidden min-w-0 max-w-xl flex-1 truncate rounded px-2 py-1 text-center text-sm font-semibold text-gray-700 transition-colors hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-white/[0.04] sm:block"
               >
                 {activeConversation.title || 'Agent'}
               </button>
-            </div>
-          )}
+            )}
+          </div>
           {showFavoriteCollectionTitle && (
             <div className="pointer-events-none absolute left-1/2 top-1/2 z-0 hidden max-w-[30%] -translate-x-1/2 -translate-y-1/2 sm:flex">
               <div className="truncate rounded px-2 py-1 text-sm font-semibold text-gray-700 dark:text-gray-300" title={favoriteCollectionTitle}>

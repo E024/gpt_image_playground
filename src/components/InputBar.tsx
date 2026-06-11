@@ -456,6 +456,9 @@ export default function InputBar() {
   const favoriteCollections = useStore((s) => s.favoriteCollections)
   const agentConversations = useStore((s) => s.agentConversations)
   const activeAgentConversationId = useStore((s) => s.activeAgentConversationId)
+  const authSession = useStore((s) => s.authSession)
+  const users = useStore((s) => s.users)
+  const plans = useStore((s) => s.plans)
   const filterStatus = useStore((s) => s.filterStatus)
   const filterFavorite = useStore((s) => s.filterFavorite)
   const activeFavoriteCollectionId = useStore((s) => s.activeFavoriteCollectionId)
@@ -744,6 +747,12 @@ export default function InputBar() {
     ? agentConversations.find((conversation) => conversation.id === activeAgentConversationId) ?? null
     : null
   const activeAgentIsRunning = Boolean(activeAgentConversation?.rounds.some((round) => round.status === 'running'))
+  const currentUser = useMemo(() => (
+    authSession ? users.find((user) => user.id === authSession.userId) ?? null : null
+  ), [authSession, users])
+  const currentPlan = useMemo(() => (
+    currentUser ? plans.find((plan) => plan.id === currentUser.planId) ?? null : null
+  ), [currentUser, plans])
   const effectiveSettings = useMemo(() => (
     activeProfile.id === currentActiveProfile.id
       ? settings
@@ -798,6 +807,24 @@ export default function InputBar() {
   const displaySize = isFalTextToImage && params.size === 'auto'
     ? DEFAULT_FAL_IMAGE_SIZE
     : normalizeImageSize(params.size) || DEFAULT_PARAMS.size
+  const quotaChargePreview = useMemo(() => {
+    if (!authSession || activeAgentIsRunning || (appMode !== 'gallery' && appMode !== 'agent')) return null
+    if (!currentPlan) {
+      return {
+        tone: 'warning' as const,
+        primary: '套餐未分配',
+        detail: '无法预估扣点',
+      }
+    }
+    const units = appMode === 'agent' ? 1 : Math.max(1, params.n)
+    const unitCost = appMode === 'agent' ? currentPlan.agentTurnCost : currentPlan.galleryUnitCost
+    const amount = units * unitCost
+    return {
+      tone: 'default' as const,
+      primary: `预计扣 ${amount} 点`,
+      detail: appMode === 'agent' ? `Agent 对话 · 1 轮 × ${unitCost}` : `画廊生成 · ${units} 张 × ${unitCost}`,
+    }
+  }, [activeAgentIsRunning, appMode, authSession, currentPlan, params.n])
 
   const qualityOptions = isFalProvider
     ? [
@@ -2127,6 +2154,21 @@ export default function InputBar() {
     </div>
   )
 
+  const renderQuotaChargePreview = (compact = false) => {
+    if (!quotaChargePreview) return null
+    const toneClass = quotaChargePreview.tone === 'warning'
+      ? 'border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-500/20 dark:bg-amber-500/10 dark:text-amber-100'
+      : 'border-cyan-200 bg-cyan-50 text-cyan-900 dark:border-cyan-500/20 dark:bg-cyan-500/10 dark:text-cyan-100'
+    return (
+      <div className={`${compact ? 'w-full justify-between px-3 py-2' : 'max-w-[190px] px-2.5 py-1.5'} flex items-center gap-2 rounded-xl border text-xs shadow-sm ${toneClass}`}>
+        <div className="min-w-0">
+          <div className="truncate font-black">{quotaChargePreview.primary}</div>
+          <div className="truncate text-[11px] opacity-70">{quotaChargePreview.detail}</div>
+        </div>
+      </div>
+    )
+  }
+
   const showFavoriteCollectionBatchBar = inCollectionOverview && selectedFavoriteCollectionIds.length > 0
   const showTaskBatchBar = !showFavoriteCollectionBatchBar && selectedTaskIds.length > 0
 
@@ -2443,7 +2485,8 @@ export default function InputBar() {
             <div className="hidden sm:flex items-end justify-between gap-3">
               {renderParams('grid-cols-6')}
 
-              <div className="flex gap-2 flex-shrink-0 mb-0.5">
+              <div className="flex items-center gap-2 flex-shrink-0 mb-0.5">
+                {renderQuotaChargePreview()}
                 <div
                   className="relative"
                   onMouseEnter={() => setAttachHover(true)}
@@ -2504,6 +2547,8 @@ export default function InputBar() {
                   <div className="h-2" />
                 </div>
               </div>
+
+              {renderQuotaChargePreview(true)}
 
               <div className="flex items-center gap-2">
                 <div

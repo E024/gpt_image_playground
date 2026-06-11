@@ -308,6 +308,10 @@ function getLedgerAmountLabel(entry: BillingLedgerEntry) {
   return `${entry.type === 'debit' ? '-' : '+'}${entry.amount} 点`
 }
 
+function getLedgerTypeLabel(entry: BillingLedgerEntry) {
+  return entry.refundOfLedgerId ? '退款' : ledgerTypeLabels[entry.type]
+}
+
 function NumberField({
   label,
   value,
@@ -1313,6 +1317,10 @@ export default function AdminDashboard() {
                             <span>{plan.monthlyQuota} 点/月</span>
                             <span>{isAdmin ? `${getGroupName(plan.groupId)} · ${inUseCount} 位用户` : '当前套餐'}</span>
                           </div>
+                          <div className="mt-2 flex flex-wrap gap-1.5 text-[11px] font-bold text-gray-500 dark:text-gray-400">
+                            <span className="rounded-md bg-gray-100 px-1.5 py-1 dark:bg-white/[0.06]">画廊 {plan.galleryUnitCost} 点/张</span>
+                            <span className="rounded-md bg-gray-100 px-1.5 py-1 dark:bg-white/[0.06]">Agent {plan.agentTurnCost} 点/轮</span>
+                          </div>
                         </button>
                       )
                     })}
@@ -1382,8 +1390,19 @@ export default function AdminDashboard() {
                       </label>
                       <NumberField label="月费" value={selectedDraft.monthlyPrice} disabled={!canEditPlans} onChange={(value) => updateSelectedDraft({ monthlyPrice: value })} onBlur={commitSelectedDraft} />
                       <NumberField label="个人月额度" value={selectedDraft.monthlyQuota} min={1} disabled={!canEditPlans} onChange={(value) => updateSelectedDraft({ monthlyQuota: value })} onBlur={commitSelectedDraft} />
-                      <NumberField label="画廊扣费 / 张" value={selectedDraft.galleryUnitCost} min={1} disabled={!canEditPlans} onChange={(value) => updateSelectedDraft({ galleryUnitCost: value })} onBlur={commitSelectedDraft} />
-                      <NumberField label="Agent 扣费 / 轮" value={selectedDraft.agentTurnCost} min={1} disabled={!canEditPlans} onChange={(value) => updateSelectedDraft({ agentTurnCost: value })} onBlur={commitSelectedDraft} />
+                      <div className="rounded-lg border border-cyan-200 bg-cyan-50/70 p-4 dark:border-cyan-500/20 dark:bg-cyan-500/10 lg:col-span-2">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div>
+                            <div className="text-sm font-black text-gray-900 dark:text-gray-100">功能扣点</div>
+                            <p className="mt-1 text-xs leading-5 text-cyan-900/70 dark:text-cyan-100/70">画廊按输出张数扣费，Agent 按提交轮次扣费。任务最终失败时会自动退回本次扣点。</p>
+                          </div>
+                          <AccentBadge accent={selectedDraft.accent} label="按套餐生效" />
+                        </div>
+                        <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                          <NumberField label="画廊扣费 / 张" value={selectedDraft.galleryUnitCost} min={1} disabled={!canEditPlans} onChange={(value) => updateSelectedDraft({ galleryUnitCost: value })} onBlur={commitSelectedDraft} />
+                          <NumberField label="Agent 扣费 / 轮" value={selectedDraft.agentTurnCost} min={1} disabled={!canEditPlans} onChange={(value) => updateSelectedDraft({ agentTurnCost: value })} onBlur={commitSelectedDraft} />
+                        </div>
+                      </div>
                     </div>
                   ) : (
                     <div className="p-6 text-sm text-gray-500">暂无套餐。</div>
@@ -1842,8 +1861,8 @@ export default function AdminDashboard() {
                       <h2 className="text-sm font-black">统一 API 配置</h2>
                       <p className="mt-1 text-xs text-gray-500">所有用户生成请求都会经由后台代理使用这组配置。</p>
                     </div>
-                    <button onClick={commitApiSettings} className="rounded-md bg-gray-900 px-3 py-2 text-xs font-bold text-white transition hover:bg-gray-700 dark:bg-white dark:text-gray-950">
-                      保存配置
+                    <button onClick={commitApiSettings} className="shrink-0 rounded-md bg-gray-900 px-3 py-2 text-xs font-bold text-white transition hover:bg-gray-700 dark:bg-white dark:text-gray-950">
+                      保存 API 与 Agent 配置
                     </button>
                   </div>
                   <div className="grid gap-4 p-4 lg:grid-cols-2">
@@ -2059,9 +2078,6 @@ export default function AdminDashboard() {
                         <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${apiDraft.agentWebSearch ? 'translate-x-4' : 'translate-x-0.5'}`} />
                       </button>
                     </label>
-                    <button onClick={commitApiSettings} className="w-full rounded-md bg-cyan-600 px-3 py-2 text-sm font-bold text-white transition hover:bg-cyan-500">
-                      保存 Agent 配置
-                    </button>
                   </div>
                 </div>
               </div>
@@ -2889,7 +2905,10 @@ export default function AdminDashboard() {
                             <div className="min-w-0">
                               <div className="flex flex-wrap items-center gap-2">
                                 <span className="rounded-md bg-gray-900 px-2 py-1 text-xs font-black text-white dark:bg-white dark:text-gray-950">{ledgerSourceLabels[entry.source]}</span>
-                                <span className="rounded-md bg-gray-100 px-2 py-1 text-xs font-bold text-gray-600 dark:bg-white/[0.06] dark:text-gray-300">{ledgerTypeLabels[entry.type]}</span>
+                                <span className="rounded-md bg-gray-100 px-2 py-1 text-xs font-bold text-gray-600 dark:bg-white/[0.06] dark:text-gray-300">{getLedgerTypeLabel(entry)}</span>
+                                {entry.refundOfLedgerId && (
+                                  <span className="rounded-md bg-emerald-50 px-2 py-1 text-xs font-bold text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300">退回 #{entry.refundOfLedgerId.slice(0, 8)}</span>
+                                )}
                                 <span className="font-mono text-xs text-gray-400">#{entry.id.slice(0, 8)}</span>
                               </div>
                               <h3 className="mt-2 truncate text-base font-black">{entry.note || ledgerSourceLabels[entry.source]}</h3>
