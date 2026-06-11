@@ -8,19 +8,26 @@ import { installMobileViewportGuards } from './lib/viewport'
 
 installMobileViewportGuards()
 
-if ('serviceWorker' in navigator) {
-  if (import.meta.env.PROD) {
-    window.addEventListener('load', () => {
-      navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`).catch((error) => {
-        console.error('Service worker registration failed:', error)
-      })
-    })
-  } else {
-    navigator.serviceWorker.getRegistrations().then((registrations) => {
-      registrations.forEach((registration) => registration.unregister())
-    })
+async function removeLegacyServiceWorkers() {
+  if ('serviceWorker' in navigator) {
+    const registrations = await navigator.serviceWorker.getRegistrations()
+    await Promise.all(registrations.map((registration) => registration.unregister()))
+  }
+  if ('caches' in window) {
+    const keys = await caches.keys()
+    await Promise.all(
+      keys
+        .filter((key) => key.startsWith('gpt-image-playground-') || key.startsWith('zaoxiangtai-'))
+        .map((key) => caches.delete(key)),
+    )
   }
 }
+
+window.addEventListener('load', () => {
+  removeLegacyServiceWorkers().catch((error) => {
+    console.warn('Failed to remove legacy service workers:', error)
+  })
+})
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

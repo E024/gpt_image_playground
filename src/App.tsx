@@ -1,11 +1,11 @@
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { canManagedUserUseAgent, initStore, isAgentFeatureEnabled } from './store'
 import { useStore } from './store'
 import { buildSettingsFromUrlParams, clearUrlSettingParams, hasUrlSettingParams } from './lib/urlSettings'
 import { mergeImportedSettings } from './lib/apiProfiles'
 import { getCustomProviderConfigUrl, loadCustomProviderSettingsFromUrl } from './lib/customProviderConfigUrl'
 import { useDockerApiUrlMigrationNotice } from './hooks/useDockerApiUrlMigrationNotice'
-import { getAppModeFromPath, getRoutedUrl } from './lib/appRoutes'
+import { getAppModeFromPath, getCurrentUrlForRedirect, getLoginRedirectFromSearch, getLoginUrl, getRoutedUrl, isLoginPath } from './lib/appRoutes'
 import Header from './components/Header'
 import AuthLanding from './components/AuthLanding'
 import AdminDashboard from './components/AdminDashboard'
@@ -27,6 +27,7 @@ import { useGlobalClickSuppression } from './lib/clickSuppression'
 let customProviderConfigUrlImportStarted = false
 
 export default function App() {
+  const routeModeRestorePendingRef = useRef(false)
   const setSettings = useStore((s) => s.setSettings)
   const syncBackendState = useStore((s) => s.syncBackendState)
   const appMode = useStore((s) => s.appMode)
@@ -93,11 +94,29 @@ export default function App() {
   }, [agentEnabled, appMode, currentUser, setAppMode])
 
   useEffect(() => {
+    if (!authReady || authSession) return
+    if (isLoginPath(window.location.pathname)) return
+    window.history.replaceState(null, '', getLoginUrl(getCurrentUrlForRedirect()))
+  }, [authReady, authSession])
+
+  useEffect(() => {
+    if (!authReady || !authSession || !isLoginPath(window.location.pathname)) return
+    const redirectUrl = getLoginRedirectFromSearch(window.location.search, appMode)
+    const redirectMode = getAppModeFromPath(new URL(redirectUrl, window.location.origin).pathname)
+    if (redirectMode && redirectMode !== useStore.getState().appMode) {
+      routeModeRestorePendingRef.current = true
+      useStore.getState().setAppMode(redirectMode)
+    }
+    window.history.replaceState(null, '', redirectUrl)
+  }, [appMode, authReady, authSession])
+
+  useEffect(() => {
     if (!authReady || !authSession) return
 
     const applyRouteMode = () => {
       const routeMode = getAppModeFromPath(window.location.pathname)
       if (routeMode && routeMode !== useStore.getState().appMode) {
+        routeModeRestorePendingRef.current = true
         useStore.getState().setAppMode(routeMode)
       }
     }
@@ -114,6 +133,10 @@ export default function App() {
     if (currentUrl === nextUrl) return
 
     const routeMode = getAppModeFromPath(window.location.pathname)
+    if (routeModeRestorePendingRef.current) {
+      if (routeMode && routeMode !== appMode) return
+      routeModeRestorePendingRef.current = false
+    }
     const method = routeMode ? 'pushState' : 'replaceState'
     window.history[method](null, '', nextUrl)
   }, [appMode, authReady, authSession])
