@@ -162,7 +162,7 @@ export default function Header() {
     <>
       <header data-no-drag-select className={`safe-area-top fixed top-0 left-0 right-0 z-40 bg-white/80 dark:bg-gray-950/80 backdrop-blur border-b border-gray-200 dark:border-white/[0.08] transition-transform duration-300 ease-in-out ${appMode === 'agent' && !agentMobileHeaderVisible ? '-translate-y-full sm:translate-y-0' : 'translate-y-0'}`}>
         <div className="safe-area-x safe-header-inner max-w-7xl mx-auto flex items-center justify-between relative">
-          <div className="flex-1 min-w-0 pr-2 flex items-center gap-2">
+          <div className="relative z-10 flex-1 min-w-0 pr-2 flex items-center gap-2">
             <h1 className="inline-flex min-w-0 items-start relative mr-2">
               {showFavoriteCollectionTitle ? (
                 <>
@@ -222,9 +222,10 @@ export default function Header() {
             </div>}
           </div>
           {appMode === 'agent' && activeConversation && (
-            <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 hidden sm:flex max-w-[30%]">
+            <div className="pointer-events-none absolute left-1/2 top-1/2 z-0 hidden w-[28vw] max-w-md min-w-0 -translate-x-1/2 -translate-y-1/2 justify-center overflow-hidden lg:flex xl:max-w-lg">
               <button
                 type="button"
+                title={activeConversation.title || 'Agent'}
                 onClick={() => {
                   setShowHistoryModal(true)
                   // Use setTimeout to ensure HistoryModal is mounted before setting editing id
@@ -232,20 +233,20 @@ export default function Header() {
                     useStore.getState().setAgentEditingConversationId(activeConversation.id)
                   }, 0)
                 }}
-                className="text-sm font-semibold text-gray-700 dark:text-gray-300 truncate hover:bg-gray-100 dark:hover:bg-white/[0.04] px-2 py-1 rounded transition-colors"
+                className="pointer-events-auto min-w-0 max-w-full truncate px-2 py-1 text-sm font-semibold text-gray-700 transition-colors hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-white/[0.04] rounded"
               >
                 {activeConversation.title || 'Agent'}
               </button>
             </div>
           )}
           {showFavoriteCollectionTitle && (
-            <div className="absolute left-1/2 top-1/2 hidden max-w-[30%] -translate-x-1/2 -translate-y-1/2 sm:flex">
+            <div className="pointer-events-none absolute left-1/2 top-1/2 z-0 hidden max-w-[30%] -translate-x-1/2 -translate-y-1/2 sm:flex">
               <div className="truncate rounded px-2 py-1 text-sm font-semibold text-gray-700 dark:text-gray-300" title={favoriteCollectionTitle}>
                 {favoriteCollectionTitle}
               </div>
             </div>
           )}
-          <div className="hidden sm:flex items-center gap-1 rounded-xl border border-gray-200 dark:border-white/[0.08] bg-gray-100/70 dark:bg-white/[0.04] p-1 mr-4">
+          <div className="relative z-10 hidden sm:flex items-center gap-1 rounded-xl border border-gray-200 dark:border-white/[0.08] bg-gray-100/70 dark:bg-white/[0.04] p-1 mr-4">
             <button
               type="button"
               onClick={() => setAppMode('gallery')}
@@ -272,7 +273,7 @@ export default function Header() {
               </button>
             )}
           </div>
-          <div className="flex items-center gap-1 shrink-0">
+          <div className="relative z-10 flex items-center gap-1 shrink-0">
             {currentUser && (
               <div className="hidden md:flex items-center gap-2 rounded-lg border border-gray-200 bg-white/70 px-2.5 py-1.5 text-xs dark:border-white/[0.08] dark:bg-white/[0.04]">
                 <div className="min-w-0">
