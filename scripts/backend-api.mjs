@@ -38,7 +38,19 @@ const EMAIL_SETTINGS_KEY = 'email_settings'
 const SYSTEM_SETTINGS_KEY = 'system_settings'
 const STORAGE_SETTINGS_KEY = 'storage_settings'
 const DEFAULT_SITE_NAME = '造像台'
-const DEFAULT_AGENT_USER_AGENT = 'codex-tui/0.139.0 (Windows 10.0.19045; x86_64) WindowsTerminal (codex-tui; 0.139.0)'
+// User-Agent / originator must match what real Codex CLI emits — gateways like anyrouter.top
+// reject Responses-API calls whose signature doesn't look like Codex CLI ("invalid codex request").
+// The format is `{originator}/{version} ({os}; {arch}) {terminal} ({originator}; {version})` and
+// the originator token uses underscores (`codex_cli_rs`), NOT hyphens (`codex-tui`).
+const CODEX_CLI_VERSION = '0.139.0'
+const CODEX_CLI_ORIGINATOR = 'codex_cli_rs'
+const CODEX_CLI_PLATFORM = process.platform === 'win32'
+  ? 'Windows 10.0.19045; x86_64'
+  : process.platform === 'darwin'
+    ? 'macOS 14.0; arm64'
+    : 'Linux 5.15.0; x86_64'
+const CODEX_CLI_TERMINAL = process.platform === 'win32' ? 'WindowsTerminal' : 'Terminal'
+const DEFAULT_AGENT_USER_AGENT = `${CODEX_CLI_ORIGINATOR}/${CODEX_CLI_VERSION} (${CODEX_CLI_PLATFORM}) ${CODEX_CLI_TERMINAL} (${CODEX_CLI_ORIGINATOR}; ${CODEX_CLI_VERSION})`
 const CONTENT_AUDIT_METADATA_MAX_LENGTH = 250_000
 const DEFAULT_EMAIL_VERIFICATION_EXPIRES_MINUTES = 30
 const EMAIL_VERIFICATION_CODE_LENGTH = 6
@@ -1039,6 +1051,36 @@ async function getUpstreamErrorPayload(response, upstreamUrl, includeDiagnostics
   }
 }
 
+function extractCodexSessionId(rawBody) {
+  if (!rawBody || !rawBody.length) return null
+  try {
+    const parsed = JSON.parse(rawBody.toString('utf8'))
+    if (!isRecord(parsed)) return null
+    const cacheKey = typeof parsed.prompt_cache_key === 'string' ? parsed.prompt_cache_key.trim() : ''
+    if (cacheKey) return cacheKey
+    if (isRecord(parsed.client_metadata)) {
+      const windowId = parsed.client_metadata['x-codex-window-id']
+      if (typeof windowId === 'string' && windowId.includes(':')) {
+        return windowId.split(':')[0] || null
+      }
+    }
+  } catch {
+    // body isn't JSON; fall through and synthesise an ID
+  }
+  return null
+}
+
+function injectCodexCliHeaders(headers, sessionId) {
+  // Mirror the real Codex CLI 0.139.0 request signature so strict gateways
+  // (anyrouter.top, etc.) don't reject the call as "invalid codex request".
+  headers.set('originator', CODEX_CLI_ORIGINATOR)
+  headers.set('session-id', sessionId)
+  headers.set('thread-id', sessionId)
+  headers.set('x-client-request-id', sessionId)
+  headers.set('x-codex-window-id', `${sessionId}:0`)
+  headers.set('x-codex-beta-features', 'terminal_resize_reflow')
+}
+
 async function proxyUpstream(req, res, actor, upstreamPath, search) {
   const settings = getApiSettings()
   const profile = getActiveProfile(settings)
@@ -1064,6 +1106,12 @@ async function proxyUpstream(req, res, actor, upstreamPath, search) {
 
   const method = req.method || 'GET'
   const body = method === 'GET' || method === 'HEAD' ? undefined : await readRawBody(req)
+
+  if (profile.codexCli && endpointPath.startsWith('responses')) {
+    const sessionId = extractCodexSessionId(body) || (globalThis.crypto?.randomUUID?.() ?? `zxt-session-${Date.now().toString(36)}`)
+    injectCodexCliHeaders(headers, sessionId)
+  }
+
   const upstreamUrl = buildUpstreamUrl(profile, upstreamPath, search)
   let upstreamResponse
   try {
